@@ -90,9 +90,462 @@ from tensorly.decomposition import robust_pca as robust_tensor_pca
 from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
 from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
 
+from pathlib import Path
 from typing import Union, Sequence, Tuple
 
 _SCALE_UNSET = object()
+_HYPERDATA_HDF5_FORMAT = '4denoise.hyperdata'
+_HYPERDATA_HDF5_VERSION = '1.0'
+
+
+def _normalize_unit_mode(unit_mode, label='axis_units'):
+    """Normalize a unit-selection mode used by plotting/selection helpers."""
+    if unit_mode is None:
+        unit_mode = 'auto'
+    if not isinstance(unit_mode, str):
+        raise ValueError(f"{label} must be 'auto', 'pixels', or 'calibrated'.")
+
+    normalized = unit_mode.strip().lower().replace('_', '-')
+    if normalized in {'auto', 'default'}:
+        return 'auto'
+    if normalized in {'pixel', 'pixels', 'px'}:
+        return 'pixels'
+    if normalized in {'calibrated', 'calibration', 'physical', 'data', 'units'}:
+        return 'calibrated'
+    raise ValueError(f"{label} must be 'auto', 'pixels', or 'calibrated'.")
+
+
+def _resolve_unit_mode(unit_mode, units, conv_factor, label='axis_units'):
+    """
+    Resolve a unit mode to an actual units/conversion pair.
+
+    ``auto`` uses the stored calibration when both parts exist and otherwise
+    falls back to pixels. ``calibrated`` requires a complete calibration.
+    """
+    mode = _normalize_unit_mode(unit_mode, label=label)
+    if mode == 'pixels':
+        return None, None, 'pixels'
+
+    has_units = units is not None
+    has_factor = conv_factor is not None
+    if has_units != has_factor:
+        raise ValueError(
+            f"{label} cannot use a partial calibration. Define both units and "
+            "conv_factor, or clear both."
+        )
+
+    if not has_units:
+        if mode == 'calibrated':
+            raise ValueError(
+                f"{label}='calibrated' requires stored units and conv_factor."
+            )
+        return None, None, 'pixels'
+
+    if not np.isscalar(conv_factor) or conv_factor <= 0:
+        raise ValueError("conv_factor must be a positive scalar.")
+    return str(units).strip(), float(conv_factor), 'calibrated'
+
+
+def _center_to_calibrated(center_px, shape, conv_factor):
+    """
+    Convert pixel ``(ky, kx)`` coordinates to calibrated reciprocal coords.
+
+    Calibrated reciprocal coordinates are relative to the diffraction origin,
+    with positive ``ky`` upward and positive ``kx`` to the right.
+    """
+    center_y, center_x = tuple(float(v) for v in center_px)
+    origin_y = (int(shape[0]) - 1) / 2.0
+    origin_x = (int(shape[1]) - 1) / 2.0
+    return (
+        (origin_y - center_y) * float(conv_factor),
+        (center_x - origin_x) * float(conv_factor),
+    )
+
+
+def _calibrated_center_to_pixels(center, conv_factor, shape):
+    """
+    Convert calibrated reciprocal ``(ky, kx)`` coordinates to pixel coords.
+    """
+    center = np.asarray(center, dtype=float)
+    origin_y = (int(shape[0]) - 1) / 2.0
+    origin_x = (int(shape[1]) - 1) / 2.0
+    return (
+        origin_y - center[0] / float(conv_factor),
+        origin_x + center[1] / float(conv_factor),
+    )
+
+
+def _center_beam_metadata_from_pixels(radius_px, center_px, shape, *,
+                                      units=None, conv_factor=None,
+                                      **extra_metadata):
+    """Build direct-beam metadata from pixel-space beam parameters."""
+    shape = tuple(int(v) for v in shape)
+    if len(shape) != 2:
+        raise ValueError("Direct-beam metadata requires a 2D reciprocal shape.")
+
+    radius_px = float(radius_px)
+    center_px = tuple(float(v) for v in center_px)
+    if not np.isfinite(radius_px) or radius_px <= 0:
+        raise ValueError("Direct-beam radius must be positive and finite.")
+    if len(center_px) != 2 or not np.all(np.isfinite(center_px)):
+        raise ValueError("Direct-beam center must contain two finite values.")
+
+    metadata = {
+        'radius_px': radius_px,
+        'center_px': center_px,
+        'shape': shape,
+        'coordinate_convention': (
+            "center_px is an array-coordinate (ky, kx) pair. "
+            "center_calibrated, when present, is relative to the diffraction "
+            "origin with positive ky upward and positive kx to the right."
+        ),
+    }
+
+    has_units = units is not None
+    has_factor = conv_factor is not None
+    if has_units != has_factor:
+        raise ValueError(
+            "Direct-beam metadata cannot use a partial reciprocal-space "
+            "calibration. Define both units and conv_factor, or clear both."
+        )
+    if has_units:
+        if not np.isscalar(conv_factor) or conv_factor <= 0:
+            raise ValueError("conv_factor must be a positive scalar.")
+        metadata.update({
+            'calibrated_units': str(units).strip(),
+            'conv_factor': float(conv_factor),
+            'radius_calibrated': radius_px * float(conv_factor),
+            'center_calibrated': _center_to_calibrated(
+                center_px,
+                shape,
+                conv_factor,
+            ),
+        })
+
+    for key, value in extra_metadata.items():
+        if value is not None:
+            metadata[key] = deepcopy(value)
+
+    return metadata
+
+
+def _validate_center_pair(value, name):
+    """Return a finite ``(ky, kx)`` pair as floats."""
+    arr = np.asarray(value, dtype=float)
+    if arr.shape != (2,) or not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain exactly two finite values.")
+    return (float(arr[0]), float(arr[1]))
+
+
+def _resolve_center_beam_parameters(shape, metadata=None, *, radius=None,
+                                    center=None, units=None, conv_factor=None,
+                                    beam_units='auto'):
+    """
+    Resolve direct-beam center and radius to pixel coordinates.
+
+    Explicit ``radius`` and ``center`` values take precedence over metadata.
+    Missing centers fall back to metadata and then the geometric midpoint.
+    """
+    shape = tuple(int(v) for v in shape)
+    if len(shape) != 2:
+        raise ValueError("Direct-beam operations require 2D reciprocal axes.")
+    metadata = deepcopy(metadata) if metadata is not None else {}
+    if not isinstance(metadata, dict):
+        raise ValueError("center_beam_metadata must be a dictionary or None.")
+
+    _, factor, unit_mode = _resolve_unit_mode(
+        beam_units,
+        units,
+        conv_factor,
+        label='beam_units',
+    )
+
+    radius_source = 'explicit'
+    if radius is None:
+        radius_source = 'metadata'
+        if 'radius_px' in metadata:
+            radius_px = float(metadata['radius_px'])
+        elif 'radius_calibrated' in metadata:
+            metadata_factor = metadata.get('conv_factor', factor)
+            if metadata_factor is None:
+                raise ValueError(
+                    "center_beam_metadata stores radius_calibrated but no "
+                    "conv_factor, and this object has no reciprocal-space "
+                    "calibration."
+                )
+            radius_px = float(metadata['radius_calibrated']) / float(metadata_factor)
+        else:
+            raise ValueError(
+                "No direct-beam radius was provided and no "
+                "center_beam_metadata['radius_px'] is available. Provide "
+                "radius=... or run alignment(...) first."
+            )
+    else:
+        radius_px = float(radius)
+        if unit_mode == 'calibrated':
+            radius_px /= float(factor)
+
+    if not np.isfinite(radius_px) or radius_px <= 0:
+        raise ValueError("Direct-beam radius must be positive and finite.")
+
+    center_source = 'explicit'
+    if center is None:
+        center_source = 'metadata'
+        if 'center_px' in metadata:
+            center_px = _validate_center_pair(metadata['center_px'], 'center_px')
+        elif 'center_calibrated' in metadata:
+            metadata_factor = metadata.get('conv_factor', factor)
+            if metadata_factor is None:
+                raise ValueError(
+                    "center_beam_metadata stores center_calibrated but no "
+                    "conv_factor, and this object has no reciprocal-space "
+                    "calibration."
+                )
+            center_px = _calibrated_center_to_pixels(
+                metadata['center_calibrated'],
+                metadata_factor,
+                shape,
+            )
+        else:
+            center_source = 'geometric_center'
+            center_px = ((shape[0] - 1) / 2.0, (shape[1] - 1) / 2.0)
+    else:
+        center_pair = _validate_center_pair(center, 'center')
+        if unit_mode == 'calibrated':
+            center_px = _calibrated_center_to_pixels(
+                center_pair,
+                factor,
+                shape,
+            )
+        else:
+            center_px = center_pair
+
+    if not np.all(np.isfinite(center_px)):
+        raise ValueError("Direct-beam center could not be resolved to pixels.")
+
+    resolved_metadata = _center_beam_metadata_from_pixels(
+        radius_px,
+        center_px,
+        shape,
+        units=units,
+        conv_factor=conv_factor,
+        resolution={
+            'radius_source': radius_source,
+            'center_source': center_source,
+            'beam_units': beam_units,
+            'beam_unit_mode': unit_mode,
+        },
+    )
+    return center_px, radius_px, resolved_metadata
+
+
+def _decode_hdf5_value(value):
+    """Convert HDF5 byte strings and NumPy scalars to Python values."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8')
+    if isinstance(value, np.ndarray) and value.dtype.kind == 'S':
+        return value.astype(str)
+    if isinstance(value, np.ndarray) and value.dtype == object:
+        flat_values = value.ravel()
+        if all(isinstance(item, (bytes, str)) for item in flat_values):
+            decoded = [
+                item.decode('utf-8') if isinstance(item, bytes) else item
+                for item in flat_values
+            ]
+            return np.array(decoded, dtype=str).reshape(value.shape)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _hdf5_dataset_kwargs(value, compression, compression_opts):
+    """Return compression kwargs only when HDF5 supports them for the value."""
+    array = np.asarray(value)
+    if compression is None or array.shape == ():
+        return {}
+    kwargs = {'compression': compression}
+    if compression_opts is not None:
+        kwargs['compression_opts'] = compression_opts
+    return kwargs
+
+
+def _write_hdf5_value(parent, name, value, compression=None,
+                      compression_opts=None):
+    """Recursively write a Python metadata value into an HDF5 group."""
+    if value is None:
+        group = parent.create_group(name)
+        group.attrs['kind'] = 'none'
+        return
+
+    if isinstance(value, dict):
+        group = parent.create_group(name)
+        group.attrs['kind'] = 'dict'
+        for key, item in value.items():
+            key_name = str(key)
+            if '/' in key_name:
+                raise ValueError(
+                    "Metadata dictionary keys cannot contain '/'. "
+                    f"Got key {key_name!r}."
+                )
+            _write_hdf5_value(
+                group,
+                key_name,
+                item,
+                compression=compression,
+                compression_opts=compression_opts,
+            )
+        return
+
+    if isinstance(value, (list, tuple)):
+        group = parent.create_group(name)
+        group.attrs['kind'] = 'tuple' if isinstance(value, tuple) else 'list'
+        group.attrs['length'] = len(value)
+        for idx, item in enumerate(value):
+            _write_hdf5_value(
+                group,
+                f'item_{idx:08d}',
+                item,
+                compression=compression,
+                compression_opts=compression_opts,
+            )
+        return
+
+    if isinstance(value, str):
+        dtype = h5py.string_dtype(encoding='utf-8')
+        dataset = parent.create_dataset(name, data=value, dtype=dtype)
+        dataset.attrs['kind'] = 'str'
+        return
+
+    if isinstance(value, bytes):
+        dtype = h5py.string_dtype(encoding='utf-8')
+        dataset = parent.create_dataset(
+            name,
+            data=value.decode('utf-8'),
+            dtype=dtype,
+        )
+        dataset.attrs['kind'] = 'str'
+        return
+
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            group = parent.create_group(name)
+            group.attrs['kind'] = 'ndarray-object'
+            group.attrs['shape'] = value.shape
+            flat_values = value.ravel()
+            group.attrs['length'] = flat_values.size
+            for idx, item in enumerate(flat_values):
+                _write_hdf5_value(
+                    group,
+                    f'item_{idx:08d}',
+                    item,
+                    compression=compression,
+                    compression_opts=compression_opts,
+                )
+            return
+
+        if value.dtype.kind in {'U', 'S'}:
+            dtype = h5py.string_dtype(encoding='utf-8')
+            dataset = parent.create_dataset(
+                name,
+                data=value.astype(str),
+                dtype=dtype,
+            )
+        else:
+            dataset = parent.create_dataset(
+                name,
+                data=value,
+                **_hdf5_dataset_kwargs(value, compression, compression_opts),
+            )
+        dataset.attrs['kind'] = 'ndarray'
+        return
+
+    if np.isscalar(value):
+        dataset = parent.create_dataset(name, data=value)
+        dataset.attrs['kind'] = 'scalar'
+        return
+
+    raise TypeError(
+        f"Cannot save metadata value {name!r} with unsupported type "
+        f"{type(value).__name__}."
+    )
+
+
+def _read_hdf5_value(parent, name):
+    """Recursively read a Python metadata value from an HDF5 group."""
+    obj = parent[name]
+    kind = _decode_hdf5_value(obj.attrs.get('kind', 'ndarray'))
+
+    if kind == 'none':
+        return None
+
+    if isinstance(obj, h5py.Dataset):
+        value = obj[()]
+        return _decode_hdf5_value(value)
+
+    if kind == 'dict':
+        return {
+            key: _read_hdf5_value(obj, key)
+            for key in obj.keys()
+        }
+
+    if kind in {'list', 'tuple'}:
+        length = int(obj.attrs.get('length', len(obj.keys())))
+        values = [
+            _read_hdf5_value(obj, f'item_{idx:08d}')
+            for idx in range(length)
+        ]
+        return tuple(values) if kind == 'tuple' else values
+
+    if kind == 'ndarray-object':
+        shape = tuple(int(v) for v in obj.attrs['shape'])
+        length = int(obj.attrs.get('length', np.prod(shape)))
+        values = [
+            _read_hdf5_value(obj, f'item_{idx:08d}')
+            for idx in range(length)
+        ]
+        return np.array(values, dtype=object).reshape(shape)
+
+    raise ValueError(f"Unsupported HDF5 metadata kind {kind!r}.")
+
+
+def _is_hyperdata_hdf5_file(filename):
+    """Return True if filename is a 4Denoise HyperData HDF5 file."""
+    path = Path(filename).expanduser()
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        with h5py.File(path, 'r') as file:
+            file_format = _decode_hdf5_value(
+                file.attrs.get('fourdenoise_format', None)
+            )
+            return file_format == _HYPERDATA_HDF5_FORMAT and 'array' in file
+    except OSError:
+        return False
+
+
+def _load_hyperdata_hdf5(filename):
+    """Load array and metadata from a 4Denoise HyperData HDF5 file."""
+    path = Path(filename).expanduser()
+    with h5py.File(path, 'r') as file:
+        file_format = _decode_hdf5_value(
+            file.attrs.get('fourdenoise_format', None)
+        )
+        if file_format != _HYPERDATA_HDF5_FORMAT:
+            raise ValueError(
+                f"'{path}' is not a 4Denoise HyperData file."
+            )
+        if 'array' not in file:
+            raise ValueError(f"'{path}' does not contain a saved data array.")
+
+        array = file['array'][()]
+        metadata = {}
+        if 'metadata' in file:
+            metadata_group = file['metadata']
+            metadata = {
+                key: _read_hdf5_value(metadata_group, key)
+                for key in metadata_group.keys()
+            }
+    return array, metadata
     
 #%%
 
@@ -2569,53 +3022,131 @@ def plotHist_andClusters(data, clusters, cluster_indices, bins=100, xrange=None,
     # plt.legend()
     plt.show()
 
-def inpaint_diffraction(image, centers, radius=6):
+def inpaint_background(image, centers=None, radius=6, mask=None,
+                       method='biharmonic', split_into_regions=False):
     """
-    Use biharmonic equations to interpolate gap regions of a 2D array.
+    Estimate a smooth background by inpainting selected diffraction features.
+
+    The inpainted region can be defined by one or more circular spot masks,
+    an explicit Boolean mask, or the union of both. The default biharmonic
+    method is useful for filling Bragg disks/spots with a locally smooth
+    background estimate.
 
     Parameters
     ----------
     image : ndarray
-        Input image.
-    centers : list of tuples
-        List of center coordinates for the circles to mask.
-    radius : int, optional
-        Radius of circular regions to mask.
+        Two-dimensional diffraction pattern or image to inpaint.
+    centers : array-like or None, optional
+        One ``(ky, kx)`` center or an ``(N, 2)`` array of centers. Each center
+        defines a circular region to inpaint. Required when ``mask`` is not
+        provided.
+    radius : float or array-like of floats, optional
+        Radius, in pixels, of the circular region around each center. A scalar
+        radius is applied to every center; otherwise provide one radius per
+        center. Defaults to 6.
+    mask : ndarray of bool or None, optional
+        Explicit mask with the same shape as ``image``. True-valued pixels are
+        inpainted. If both ``mask`` and circular regions are provided, their
+        union is used.
+    method : {'biharmonic'}, optional
+        Inpainting method. 
+    split_into_regions : bool, optional
+        Passed to ``skimage.restoration.inpaint_biharmonic``. Splitting can be
+        faster for disconnected masks, while ``False`` preserves the previous
+        4Denoise behavior.
 
     Returns
     -------
-    predicted_background : ndarray
-        Image with masked pixels inpainted.
+    ndarray
+        Image with selected pixels replaced by inpainted background values.
     """
     from skimage.restoration import inpaint_biharmonic
-    
-    def create_circular_mask(h, w, centers, radius):
-        """
-        This function creates a circular mask for a 2D array.
-        """
-        mask = np.zeros((h, w), dtype=np.uint8)
-        for center_idx, center in enumerate(centers):
-            
-            y, x = center
-            
-            if type(radius) == np.ndarray:
-                radius = radius[center_idx]
-                
-            for i in range(h):
-                for j in range(w):
-                    if np.sqrt((i - y)**2 + (j - x)**2) <= radius:
-                        mask[i, j] = 1
-        return mask
 
-    # Generate mask for the image
-    masked_image = image.copy()
-    h, w = image.shape[:2]
-    mask = create_circular_mask(h, w, centers, radius)
+    image = np.asarray(image)
+    if image.ndim != 2:
+        raise ValueError(
+            f"inpaint_background requires a 2D image; got shape {image.shape}."
+        )
+    if np.iscomplexobj(image):
+        raise TypeError("inpaint_background requires a real-valued image.")
+    if not np.all(np.isfinite(image)):
+        raise ValueError("image must contain only finite values.")
 
-    # Apply biharmonic inpainting
-    inpainted_image = inpaint_biharmonic(masked_image, mask, split_into_regions=False)
+    if not isinstance(method, str):
+        raise ValueError("method must be 'biharmonic'.")
+    normalized_method = method.strip().lower().replace('-', '_')
+    if normalized_method not in {'biharmonic', 'biharmonic_inpaint'}:
+        raise NotImplementedError(
+            "Only method='biharmonic' is currently implemented for "
+            "inpaint_background."
+        )
+    if not isinstance(split_into_regions, (bool, np.bool_)):
+        raise ValueError("split_into_regions must be a boolean.")
 
-    return inpainted_image
+    h, w = image.shape
+    inpaint_mask = np.zeros((h, w), dtype=bool)
+
+    if mask is not None:
+        explicit_mask = np.asarray(mask, dtype=bool)
+        if explicit_mask.shape != image.shape:
+            raise ValueError(
+                f"mask must have shape {image.shape}; got "
+                f"{explicit_mask.shape}."
+            )
+        inpaint_mask |= explicit_mask
+
+    if centers is not None:
+        center_values = np.asarray(centers, dtype=float)
+        if center_values.shape == (2,):
+            center_values = center_values.reshape(1, 2)
+        elif center_values.ndim != 2 or center_values.shape[1] != 2:
+            raise ValueError(
+                "centers must be one (ky, kx) pair or an (N, 2) array."
+            )
+        if center_values.shape[0] == 0:
+            raise ValueError("centers must contain at least one center.")
+        if not np.all(np.isfinite(center_values)):
+            raise ValueError("centers must contain only finite values.")
+
+        radius_values = np.asarray(radius, dtype=float)
+        if radius_values.ndim == 0:
+            radius_values = np.full(
+                center_values.shape[0],
+                float(radius_values),
+            )
+        elif (
+            radius_values.ndim == 1
+            and radius_values.size == center_values.shape[0]
+        ):
+            pass
+        else:
+            raise ValueError(
+                "radius must be a scalar or contain one value per center."
+            )
+        if (
+            not np.all(np.isfinite(radius_values))
+            or np.any(radius_values <= 0)
+        ):
+            raise ValueError("All radii must be positive and finite.")
+
+        y_grid, x_grid = np.ogrid[:h, :w]
+        for (center_y, center_x), spot_radius in zip(center_values, radius_values):
+            dist_sq = (y_grid - center_y) ** 2 + (x_grid - center_x) ** 2
+            inpaint_mask |= dist_sq <= float(spot_radius) ** 2
+
+    if centers is None and mask is None:
+        raise ValueError("Provide centers/radius, an explicit mask, or both.")
+    if not np.any(inpaint_mask):
+        raise ValueError("The inpainting mask selects no pixels.")
+    if np.all(inpaint_mask):
+        raise ValueError("The inpainting mask cannot cover the entire image.")
+
+    inpaint_input = image.astype(np.result_type(image.dtype, np.float32), copy=True)
+    return inpaint_biharmonic(
+        inpaint_input,
+        inpaint_mask,
+        split_into_regions=bool(split_into_regions),
+    )
 
 def sort_peaks(peak_centers, center, order_length=None):
     """
@@ -3920,7 +4451,7 @@ def combine_strain_maps(strain_maps: np.ndarray,
 
     return final_strain_maps
 
-#%% The main 4D-STEM object
+    #%% The main 4D-STEM object
 
 class HyperData:
     
@@ -3929,12 +4460,44 @@ class HyperData:
                  real_conv_factor: float = None,
                  reciprocal_units: str = None,
                  reciprocal_conv_factor: float = None,
-                 polar_metadata: dict = None):
-        
-        # Read dataset from file path if input object is string
-        if type(data) == str:
-            data = read_4D(data)
-        
+                 polar_metadata: dict = None,
+                 center_beam_metadata: dict = None):
+        loaded_metadata = {}
+
+        # Read dataset from file path if input object is string/path-like.
+        if isinstance(data, (str, Path)):
+            data_path = Path(data).expanduser()
+            if _is_hyperdata_hdf5_file(data_path):
+                data, loaded_metadata = _load_hyperdata_hdf5(data_path)
+            elif data_path.suffix.lower() == '.4denoise':
+                if not data_path.exists():
+                    raise FileNotFoundError(f"'{data_path}' does not exist.")
+                raise ValueError(
+                    f"'{data_path}' has a .4denoise extension but is not a "
+                    "valid 4Denoise HyperData save file."
+                )
+            else:
+                data = read_4D(str(data_path))
+
+        if (
+            real_units is None
+            and real_conv_factor is None
+            and loaded_metadata
+        ):
+            real_units = loaded_metadata.get('real_units')
+            real_conv_factor = loaded_metadata.get('real_conv_factor')
+        if (
+            reciprocal_units is None
+            and reciprocal_conv_factor is None
+            and loaded_metadata
+        ):
+            reciprocal_units = loaded_metadata.get('reciprocal_units')
+            reciprocal_conv_factor = loaded_metadata.get('reciprocal_conv_factor')
+        if polar_metadata is None and loaded_metadata:
+            polar_metadata = loaded_metadata.get('polar_metadata')
+        if center_beam_metadata is None and loaded_metadata:
+            center_beam_metadata = loaded_metadata.get('center_beam_metadata')
+
         self.array = data
         self.ndim = data.ndim
         self.shape = data.shape
@@ -3946,8 +4509,17 @@ class HyperData:
         self.real_conv_factor = None
         self.reciprocal_units = None
         self.reciprocal_conv_factor = None
-        self.unfold_metadata = None
+        self.unfold_metadata = deepcopy(
+            loaded_metadata.get('unfold_metadata')
+            if loaded_metadata
+            else None
+        )
         self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+        self.center_beam_metadata = (
+            deepcopy(center_beam_metadata)
+            if center_beam_metadata is not None
+            else None
+        )
 
         if real_units is not None or real_conv_factor is not None:
             self.set_real_scale(real_units, real_conv_factor)
@@ -4004,12 +4576,108 @@ class HyperData:
         self.reciprocal_conv_factor = None
         return self
 
+    def save(self, filename, overwrite=False, compression='gzip',
+             compression_opts=4):
+        """
+        Save this HyperData object with its metadata.
+
+        The saved file can be loaded directly with ``HyperData(filename)``.
+        The recommended extension is ``.4denoise``; ``.h5`` and ``.hdf5`` are
+        also accepted.
+
+        Parameters
+        ----------
+        filename : str or pathlib.Path
+            Output filename. If no extension is supplied, ``.4denoise`` is
+            appended.
+        overwrite : bool, optional
+            If False, raise an error when the output file already exists.
+        compression : str or None, optional
+            HDF5 compression filter for array-like datasets. Default is
+            ``'gzip'``. Use ``None`` to save without compression.
+        compression_opts : int or None, optional
+            Compression level/options passed to HDF5. For gzip, values usually
+            range from 0 to 9.
+
+        Returns
+        -------
+        str
+            The saved file path.
+
+        Examples
+        --------
+        >>> data.save('experiment.4denoise')
+        >>> loaded = HyperData('experiment.4denoise')
+        """
+        path = Path(filename).expanduser()
+        if path.suffix == '':
+            path = path.with_suffix('.4denoise')
+
+        valid_suffixes = {'.4denoise', '.h5', '.hdf5'}
+        if path.suffix.lower() not in valid_suffixes:
+            raise ValueError(
+                "HyperData.save supports '.4denoise', '.h5', and '.hdf5' "
+                f"files; got '{path.suffix}'."
+            )
+        if path.exists() and not overwrite:
+            raise FileExistsError(
+                f"'{path}' already exists. Use overwrite=True to replace it."
+            )
+        if path.parent and not path.parent.exists():
+            raise FileNotFoundError(
+                f"Output directory '{path.parent}' does not exist."
+            )
+        if not isinstance(overwrite, (bool, np.bool_)):
+            raise ValueError("overwrite must be a boolean.")
+        if compression is not None and not isinstance(compression, str):
+            raise ValueError("compression must be a string or None.")
+
+        metadata = {
+            'real_units': self.real_units,
+            'real_conv_factor': self.real_conv_factor,
+            'reciprocal_units': self.reciprocal_units,
+            'reciprocal_conv_factor': self.reciprocal_conv_factor,
+            'polar_metadata': deepcopy(self.polar_metadata),
+            'unfold_metadata': deepcopy(self.unfold_metadata),
+            'center_beam_metadata': deepcopy(self.center_beam_metadata),
+        }
+
+        with h5py.File(path, 'w') as file:
+            file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
+            file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
+            file.attrs['saved_class'] = 'HyperData'
+            file.attrs['array_ndim'] = self.ndim
+            file.attrs['array_dtype'] = str(self.dtype)
+
+            file.create_dataset(
+                'array',
+                data=self.array,
+                **_hdf5_dataset_kwargs(
+                    self.array,
+                    compression,
+                    compression_opts,
+                ),
+            )
+            metadata_group = file.create_group('metadata')
+            metadata_group.attrs['kind'] = 'dict'
+            for key, value in metadata.items():
+                _write_hdf5_value(
+                    metadata_group,
+                    key,
+                    value,
+                    compression=compression,
+                    compression_opts=compression_opts,
+                )
+
+        return str(path)
+
     def _spawn(self, data,
                real_units=_SCALE_UNSET,
                real_conv_factor=_SCALE_UNSET,
                reciprocal_units=_SCALE_UNSET,
                reciprocal_conv_factor=_SCALE_UNSET,
-               polar_metadata=_SCALE_UNSET):
+               polar_metadata=_SCALE_UNSET,
+               center_beam_metadata=_SCALE_UNSET):
         """Create a new HyperData object while preserving calibration."""
         if real_units is _SCALE_UNSET:
             real_units = self.real_units
@@ -4021,6 +4689,8 @@ class HyperData:
             reciprocal_conv_factor = self.reciprocal_conv_factor
         if polar_metadata is _SCALE_UNSET:
             polar_metadata = self.polar_metadata
+        if center_beam_metadata is _SCALE_UNSET:
+            center_beam_metadata = self.center_beam_metadata
 
         return HyperData(
             data,
@@ -4029,11 +4699,17 @@ class HyperData:
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            center_beam_metadata=(
+                deepcopy(center_beam_metadata)
+                if center_beam_metadata is not None
+                else None
+            ),
         )
 
     def _spawn_reciprocal(self, data, units=_SCALE_UNSET,
                           conv_factor=_SCALE_UNSET,
-                          polar_metadata=_SCALE_UNSET):
+                          polar_metadata=_SCALE_UNSET,
+                          center_beam_metadata=_SCALE_UNSET):
         """Create a ReciprocalSpace object using this dataset's calibration."""
         if units is _SCALE_UNSET:
             units = self.reciprocal_units
@@ -4041,11 +4717,18 @@ class HyperData:
             conv_factor = self.reciprocal_conv_factor
         if polar_metadata is _SCALE_UNSET:
             polar_metadata = self.polar_metadata
+        if center_beam_metadata is _SCALE_UNSET:
+            center_beam_metadata = self.center_beam_metadata
         return ReciprocalSpace(
             data,
             units=units,
             conv_factor=conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            center_beam_metadata=(
+                deepcopy(center_beam_metadata)
+                if center_beam_metadata is not None
+                else None
+            ),
         )
 
     def _spawn_real(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET):
@@ -4055,6 +4738,142 @@ class HyperData:
         if conv_factor is _SCALE_UNSET:
             conv_factor = self.real_conv_factor
         return RealSpace(data, units=units, conv_factor=conv_factor)
+
+    def copy(self):
+        """
+        Return an independent copy of this HyperData object.
+
+        The numerical array is copied, and metadata such as calibration,
+        polar-transform metadata, and unfolding metadata are copied so changes
+        to the returned object do not mutate this object.
+        """
+        copied = self._spawn(np.array(self.array, copy=True))
+        copied.unfold_metadata = deepcopy(self.unfold_metadata)
+        return copied
+
+    def _resolve_real_selection_units(self, selection_units):
+        """Resolve how real-space selections passed to get_dp are interpreted."""
+        return _resolve_unit_mode(
+            selection_units,
+            self.real_units,
+            self.real_conv_factor,
+            label='selection_units',
+        )
+
+    def _resolve_reciprocal_detector_units(self, detector_units):
+        """Resolve how Cartesian reciprocal detector inputs are interpreted."""
+        return _resolve_unit_mode(
+            detector_units,
+            self.reciprocal_units,
+            self.reciprocal_conv_factor,
+            label='detector_units',
+        )
+
+    def _resolve_polar_radius_units(self, detector_units):
+        """
+        Resolve units for radial detector inputs on polar data.
+
+        The radial axis stores both original Cartesian-pixel radii and, when
+        available, calibrated reciprocal radii. ``auto`` follows the calibrated
+        path only if the source Cartesian calibration exists.
+        """
+        metadata = self.polar_metadata or {}
+        mode = _normalize_unit_mode(detector_units, label='detector_units')
+        units = metadata.get('cartesian_reciprocal_units')
+        conv_factor = metadata.get('cartesian_reciprocal_conv_factor')
+
+        if mode == 'pixels':
+            return None, None, 'pixels'
+        if units is None or conv_factor is None:
+            if mode == 'calibrated':
+                raise ValueError(
+                    "detector_units='calibrated' requires polar metadata with "
+                    "the original reciprocal-space calibration."
+                )
+            return None, None, 'pixels'
+        if not np.isscalar(conv_factor) or conv_factor <= 0:
+            raise ValueError(
+                "polar_metadata['cartesian_reciprocal_conv_factor'] must be "
+                "a positive scalar."
+            )
+        return str(units).strip(), float(conv_factor), 'calibrated'
+
+    @staticmethod
+    def _scale_values_to_pixels(values, conv_factor):
+        """Convert calibrated distances to pixel distances."""
+        return np.asarray(values, dtype=float) / float(conv_factor)
+
+    @staticmethod
+    def _calibrated_centers_to_pixels(centers, conv_factor, shape):
+        """
+        Convert calibrated ``(ky, kx)`` coordinates to pixel coordinates.
+
+        Calibrated reciprocal coordinates are centered at the diffraction
+        origin, with positive ``kx`` to the right and positive ``ky`` upward.
+        """
+        centers = np.asarray(centers, dtype=float)
+        center_y = (shape[0] - 1) / 2.0
+        center_x = (shape[1] - 1) / 2.0
+        return np.column_stack((
+            center_y - centers[:, 0] / float(conv_factor),
+            center_x + centers[:, 1] / float(conv_factor),
+        ))
+
+    @staticmethod
+    def _parse_real_selection(value, max_len, name, mode, conv_factor):
+        """Parse scalar/range real-space selections into half-open pixel slices."""
+        if value is None:
+            return 0, max_len, 'all'
+
+        is_pair = (
+            isinstance(value, (tuple, list, np.ndarray))
+            and np.asarray(value).shape == (2,)
+        )
+        if is_pair:
+            a, b = np.asarray(value, dtype=float)
+            if not np.all(np.isfinite((a, b))):
+                raise ValueError(f"{name} range must contain finite values.")
+            if mode == 'calibrated':
+                a = a / conv_factor
+                b = b / conv_factor
+                start = int(np.floor(a))
+                stop = int(np.ceil(b))
+            else:
+                if not float(a).is_integer() or not float(b).is_integer():
+                    raise ValueError(
+                        f"{name} range must contain integer pixel indices when "
+                        "selection_units='pixels'."
+                    )
+                start = int(a)
+                stop = int(b)
+            if not (0 <= start < stop <= max_len):
+                raise ValueError(
+                    f"Invalid {name} range ({value[0]}, {value[1]}) for "
+                    f"length {max_len} using {mode} units."
+                )
+            return start, stop, 'range'
+
+        if np.isscalar(value):
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"{name} index must be finite.")
+            if mode == 'calibrated':
+                index = int(np.rint(value / conv_factor))
+            else:
+                if not value.is_integer():
+                    raise ValueError(
+                        f"{name} index must be an integer when "
+                        "selection_units='pixels'."
+                    )
+                index = int(value)
+            if not (0 <= index < max_len):
+                raise ValueError(
+                    f"{name} index {value:g} out of bounds for length "
+                    f"{max_len} using {mode} units."
+                )
+            return index, index + 1, 'index'
+
+        raise ValueError(f"{name} must be a scalar, a length-2 range, or None.")
 
 
     @property
@@ -4785,7 +5604,10 @@ class HyperData:
     def alignment(self, r_center=5, iterations=1, returnStats=False,
                   center=None, method='com', search_radius=None,
                   enforce_square=False, fit_radius=False, radius_range=None,
-                  radius_step=1, radius_operation='mean'):
+                  radius_step=1, radius_operation='mean',
+                  radius_reference_dp=None, template='disk',
+                  trench_width=1.0, kernel_amp=1.0, trench_amp=-0.5,
+                  gaussian_sigma=None):
         """
         Align the diffraction patterns through the Center of mass of the center beam
 
@@ -4809,6 +5631,11 @@ class HyperData:
             ``'com'`` uses the original center-of-mass workflow. ``'disk'`` or
             ``'template'`` uses circular template matching, centered cropping,
             and a final affine subpixel shift.
+        template : {'disk', 'negative_trench', 'gaussian'}
+            Template used by the template-matching workflow. ``'disk'`` is the
+            historical behavior: a filled circular disk, mean-subtracted and
+            normalized. ``'negative_trench'`` uses a positive disk surrounded
+            by a negative ring. ``'gaussian'`` uses a centered 2D Gaussian.
         search_radius : float or None
             Maximum disk-center translation, in pixels, around the current
             reference center. During reference fitting, the search is centered
@@ -4832,7 +5659,34 @@ class HyperData:
             Step size for two-value ``radius_range`` searches.
         radius_operation : str
             Operation passed to ``get_dp(operation=...)`` to build the
-            representative diffraction pattern used for radius fitting.
+            representative diffraction pattern used for radius fitting when
+            ``radius_reference_dp`` is not provided.
+        radius_reference_dp : array-like or data object, optional
+            Direct 2D diffraction pattern used as the representative pattern
+            for disk-radius fitting. This can be a plain ``ndarray`` or an
+            object with an ``.array`` attribute, such as ``ReciprocalSpace``.
+            The shape must match the reciprocal-space shape ``(ky, kx)``.
+            Providing this parameter implies radius fitting and bypasses
+            ``radius_operation`` for the reference pattern.
+        trench_width : float
+            Width of the negative ring used by ``template='negative_trench'``.
+        kernel_amp : float
+            Amplitude of the positive disk for ``template='negative_trench'``.
+        trench_amp : float
+            Amplitude of the surrounding trench for
+            ``template='negative_trench'``. Negative values are usually useful.
+        gaussian_sigma : float or None
+            Standard deviation for ``template='gaussian'``. If None, defaults
+            to ``r_center / 2`` for each tested radius.
+
+        Notes
+        -----
+        ``method='com'`` is useful when the center beam is compact, bright,
+        roughly isolated, and its center of mass is a stable estimate. Gaussian
+        template matching is useful when the central beam is more peak-like or
+        blobby than disk-like. Negative trench template matching is better when
+        the central beam is disk-like with a clear edge, especially when the
+        local background is sloped or slowly varying.
         """
 
         if self.ndim != 4:
@@ -4847,6 +5701,11 @@ class HyperData:
             method = 'disk'
         if method not in ('com', 'disk'):
             raise ValueError("method must be 'com', 'disk', or 'template'.")
+        if radius_reference_dp is not None and method != 'disk':
+            raise ValueError(
+                "radius_reference_dp is only valid with method='disk' or "
+                "method='template'."
+            )
 
         y, x, ky, kx = self.shape
         if center is None:
@@ -4855,19 +5714,97 @@ class HyperData:
         if search_radius is not None and float(search_radius) < 0:
             raise ValueError("search_radius must be non-negative or None.")
 
-        def _disk_template(radius):
+        def _normalize_alignment_template_name(template_name):
+            if not isinstance(template_name, str):
+                raise ValueError(
+                    "template must be 'disk', 'negative_trench', or 'gaussian'."
+                )
+            normalized = template_name.strip().lower().replace('-', '_')
+            if normalized in ('disk', 'circle', 'filled_disk'):
+                return 'disk'
+            if normalized in (
+                'negative_trench',
+                'neg_trench',
+                'disk_trench',
+                'trench',
+            ):
+                return 'negative_trench'
+            if normalized in ('gaussian', 'gauss'):
+                return 'gaussian'
+            raise ValueError(
+                "template must be 'disk', 'negative_trench', or 'gaussian'."
+            )
+
+        template = _normalize_alignment_template_name(template)
+        if method == 'com' and template != 'disk':
+            raise ValueError(
+                "template is only used with method='disk' or method='template'."
+            )
+        if (
+            not np.isscalar(trench_width)
+            or not np.isfinite(trench_width)
+            or float(trench_width) <= 0
+        ):
+            raise ValueError("trench_width must be a positive finite scalar.")
+        if not np.isscalar(kernel_amp) or not np.isfinite(kernel_amp):
+            raise ValueError("kernel_amp must be a finite scalar.")
+        if not np.isscalar(trench_amp) or not np.isfinite(trench_amp):
+            raise ValueError("trench_amp must be a finite scalar.")
+        if gaussian_sigma is not None and (
+            not np.isscalar(gaussian_sigma)
+            or not np.isfinite(gaussian_sigma)
+            or float(gaussian_sigma) <= 0
+        ):
+            raise ValueError("gaussian_sigma must be positive, finite, or None.")
+
+        def _normalize_template_kernel(kernel):
+            kernel = np.asarray(kernel, dtype=float)
+            kernel -= np.mean(kernel)
+            norm = np.linalg.norm(kernel)
+            if norm <= 0:
+                raise ValueError(
+                    "The selected alignment template has zero contrast after "
+                    "normalization. Adjust r_center or template parameters."
+                )
+            return kernel / norm
+
+        def _alignment_template(radius):
             radius = float(radius)
             if radius <= 0:
                 raise ValueError("r_center must be positive.")
             half_size = int(np.ceil(radius))
+            if template == 'negative_trench':
+                half_size = int(np.ceil(radius + float(trench_width)))
+            elif template == 'gaussian':
+                sigma = (
+                    float(gaussian_sigma)
+                    if gaussian_sigma is not None
+                    else max(float(radius) / 2.0, 1e-6)
+                )
+                half_size = max(1, int(np.ceil(3 * sigma)))
+
             coords = np.arange(-half_size, half_size + 1)
             yy, xx = np.meshgrid(coords, coords, indexing='ij')
-            disk = (yy**2 + xx**2 <= radius**2).astype(float)
-            disk -= np.mean(disk)
-            norm = np.linalg.norm(disk)
-            if norm > 0:
-                disk /= norm
-            return disk
+            rr = np.hypot(yy, xx)
+
+            if template == 'disk':
+                kernel = (rr <= radius).astype(float)
+            elif template == 'negative_trench':
+                kernel = np.zeros_like(rr, dtype=float)
+                kernel[rr <= radius] = float(kernel_amp)
+                trench_mask = (rr > radius) & (
+                    rr <= radius + float(trench_width)
+                )
+                kernel[trench_mask] = float(trench_amp)
+            else:
+                sigma = (
+                    float(gaussian_sigma)
+                    if gaussian_sigma is not None
+                    else max(float(radius) / 2.0, 1e-6)
+                )
+                kernel = np.exp(-(rr**2) / (2 * sigma**2))
+
+            return _normalize_template_kernel(kernel)
 
         def _candidate_template_radii():
             step = float(radius_step)
@@ -4932,12 +5869,13 @@ class HyperData:
                 center_value = (center_y, center_x)
 
             if template is None:
-                template = _disk_template(radius)
+                template = _alignment_template(radius)
+            template_extent = (max(template.shape) - 1) / 2.0
 
             y0, y1, x0, x1 = _search_bounds(
                 center_value,
                 search_radius_value,
-                radius,
+                template_extent,
             )
             dp_region = np.asarray(dp[y0:y1, x0:x1], dtype=float)
             corr_region = _normalized_template_correlation(dp_region, template)
@@ -4965,14 +5903,42 @@ class HyperData:
             corr[y0:y1, x0:x1] = corr_region
             return corr, max_idx, corr[max_idx]
 
-        def _fit_template_radius():
-            representative = self.get_dp(operation=radius_operation)
+        def _resolve_radius_reference_dp():
+            if radius_reference_dp is None:
+                representative = self.get_dp(operation=radius_operation)
+                source_label = f"operation='{radius_operation}'"
+            else:
+                representative = radius_reference_dp
+                source_label = 'radius_reference_dp'
+
             representative_dp = (
                 representative.array
                 if hasattr(representative, 'array')
                 else np.asarray(representative)
             )
-            representative_dp = np.asarray(representative_dp, dtype=float)
+            representative_dp = np.asarray(representative_dp)
+            if representative_dp.shape != (ky, kx):
+                raise ValueError(
+                    f"The radius-fitting reference from {source_label} must "
+                    "be a single 2D diffraction "
+                    f"pattern with shape {(ky, kx)}; got "
+                    f"{representative_dp.shape}."
+                )
+            if np.iscomplexobj(representative_dp):
+                raise TypeError(
+                    f"The radius-fitting reference from {source_label} must "
+                    "be real-valued; complex diffraction patterns are not "
+                    "supported for radius fitting."
+                )
+            if not np.all(np.isfinite(representative_dp)):
+                raise ValueError(
+                    f"The radius-fitting reference from {source_label} must "
+                    "contain only finite values."
+                )
+            return representative_dp.astype(float, copy=False), source_label
+
+        def _fit_template_radius():
+            representative_dp, source_label = _resolve_radius_reference_dp()
             radii = _candidate_template_radii()
 
             best_radius = float(radii[0])
@@ -4990,16 +5956,16 @@ class HyperData:
                     best_radius = float(candidate_radius)
                     best_center = match_center
 
-            return best_radius, best_center, best_score
+            return best_radius, best_center, best_score, source_label
 
         def _fit_disk_centers(array, reference_center):
             fit_y = np.zeros((y, x), dtype=float)
             fit_x = np.zeros_like(fit_y)
 
             pattern_search_radius = search_radius
-            template = _disk_template(effective_r_center)
+            center_template = _alignment_template(effective_r_center)
 
-            for i in tqdm(range(y), desc='Template-matching disk centers'):
+            for i in tqdm(range(y), desc=f"Template-matching {template} centers"):
                 for j in range(x):
                     dp = np.asarray(array[i, j], dtype=float)
                     corr, max_idx, _ = _integer_template_match(
@@ -5007,7 +5973,7 @@ class HyperData:
                         effective_r_center,
                         search_radius_value=pattern_search_radius,
                         center_value=reference_center,
-                        template=template,
+                        template=center_template,
                     )
 
                     refine_radius = max(2, int(np.ceil(effective_r_center / 4)))
@@ -5073,17 +6039,26 @@ class HyperData:
                 start = axis_size - output_size
             return int(start), int(end)
 
-        radius_fit_requested = bool(fit_radius or radius_range is not None)
+        radius_fit_requested = bool(
+            fit_radius
+            or radius_range is not None
+            or radius_reference_dp is not None
+        )
         effective_r_center = float(r_center)
         reference_center = (center_y, center_x)
         radius_score = None
 
         if method == 'disk':
             if radius_fit_requested:
-                effective_r_center, reference_center, radius_score = _fit_template_radius()
+                (
+                    effective_r_center,
+                    reference_center,
+                    radius_score,
+                    radius_source_label,
+                ) = _fit_template_radius()
                 print(
-                    "Selected disk-template reference from "
-                    f"operation='{radius_operation}': radius={effective_r_center:.4f}, "
+                    f"Selected {template} template reference from "
+                    f"{radius_source_label}: radius={effective_r_center:.4f}, "
                     f"center=({reference_center[0]:.4f}, {reference_center[1]:.4f}) "
                     f"(score={radius_score:.4g})."
                 )
@@ -5126,6 +6101,30 @@ class HyperData:
                 reciprocal_units=self.reciprocal_units,
                 reciprocal_conv_factor=self.reciprocal_conv_factor,
             )
+            aligned_obj.center_beam_metadata = _center_beam_metadata_from_pixels(
+                effective_r_center,
+                (target_y, target_x),
+                (out_ky, out_kx),
+                units=self.reciprocal_units,
+                conv_factor=self.reciprocal_conv_factor,
+                source='alignment',
+                alignment_method='disk',
+                template=template,
+                radius_fit_requested=radius_fit_requested,
+                radius_score=radius_score,
+                reference_center_px=reference_center,
+                mean_fit_center_px=mean_center,
+                std_fit_center_px=std_center,
+                original_reciprocal_shape=(ky, kx),
+                output_reciprocal_shape=(out_ky, out_kx),
+                search_radius_px=search_radius,
+                radius_range=(
+                    np.asarray(radius_range, dtype=float).tolist()
+                    if radius_range is not None
+                    else None
+                ),
+                radius_step=radius_step,
+            )
 
             if returnStats:
                 return aligned_obj, mean_center, std_center
@@ -5133,6 +6132,7 @@ class HyperData:
 
         com_y, com_x = self._quickCOM(r_mask=r_center, center=center) 
         cbed_tran = np.copy(self.array)
+        cbed_tran_Obj = self._spawn(cbed_tran)
         std_com = (np.std(com_y), np.std(com_x))
         mean_com = (np.mean(com_y), np.mean(com_x))
         
@@ -5166,6 +6166,19 @@ class HyperData:
             
             print(f'Standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
             print(f'COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+
+        cbed_tran_Obj.center_beam_metadata = _center_beam_metadata_from_pixels(
+            r_center,
+            (center_y, center_x),
+            (ky, kx),
+            units=self.reciprocal_units,
+            conv_factor=self.reciprocal_conv_factor,
+            source='alignment',
+            alignment_method='com',
+            iterations=iterations,
+            mean_fit_center_px=mean_com,
+            std_fit_center_px=std_com,
+        )
         
         if returnStats:
             return cbed_tran_Obj, mean_com, std_com
@@ -5480,13 +6493,72 @@ class HyperData:
         return self._spawn(normalized_tensor)
 
     
-    def clip(self, a_min=1, a_max=None):
+    def _resolve_clip_mask(self, mask):
         """
-        Clip data values in the 4D dataset to the interval [a_min, a_max].
+        Expand a Boolean clipping mask to the complete data shape.
+
+        For data with diffraction dimensions on the last two axes, a mask
+        matching the leading dimensions selects complete diffraction patterns,
+        while a mask matching the final two dimensions selects reciprocal-space
+        pixels in every pattern. Other masks must broadcast directly to the
+        complete array shape.
+        """
+        if hasattr(mask, 'array'):
+            mask = mask.array
+        mask = np.asarray(mask)
+
+        if not np.issubdtype(mask.dtype, np.bool_):
+            raise TypeError("mask must contain Boolean values.")
+        if mask.shape == self.shape:
+            return mask
+
+        candidates = []
+        if self.ndim >= 3:
+            leading_shape = self.shape[:-2]
+            reciprocal_shape = self.shape[-2:]
+
+            if mask.shape == leading_shape:
+                expanded = mask.reshape(leading_shape + (1, 1))
+                candidates.append(
+                    ('leading', np.broadcast_to(expanded, self.shape))
+                )
+            if mask.shape == reciprocal_shape:
+                expanded = mask.reshape(
+                    (1,) * (self.ndim - 2) + reciprocal_shape
+                )
+                candidates.append(
+                    ('reciprocal', np.broadcast_to(expanded, self.shape))
+                )
+
+        if len(candidates) > 1:
+            raise ValueError(
+                f"mask shape {mask.shape} matches both the leading and "
+                "reciprocal dimensions. Make the intended domain explicit "
+                "with singleton axes, for example mask[..., None, None] for "
+                "scan positions or mask[None, None, ...] for reciprocal "
+                "pixels in 4D data."
+            )
+        if candidates:
+            return candidates[0][1]
+
+        try:
+            return np.broadcast_to(mask, self.shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"mask with shape {mask.shape} cannot be applied to data with "
+                f"shape {self.shape}. Provide a full-shape mask, a mask for "
+                "the leading scan/stack dimensions, a reciprocal-space mask, "
+                "or an explicitly broadcastable Boolean mask."
+            ) from exc
+
+    def clip(self, a_min=1, a_max=None, mask=None):
+        """
+        Clip all or selected data values to the interval [a_min, a_max].
     
         Values smaller than `a_min` are set to `a_min`; values larger than `a_max`
         are set to `a_max`. If `a_min` or `a_max` is None, clipping on that side
-        is skipped.
+        is skipped. When ``mask`` is provided, values outside the mask are
+        copied without modification.
     
         Parameters
         ----------
@@ -5496,17 +6568,155 @@ class HyperData:
         a_max : float or None, optional
             Upper bound for clipping. If None, no upper clipping is applied.
             Default is None.
+        mask : array-like of bool or data object, optional
+            Region where clipping is applied. A full-shape mask selects
+            individual values. For 4D data, a ``(Ry, Rx)`` mask selects whole
+            diffraction patterns and a ``(Ky, Kx)`` mask selects reciprocal
+            pixels across every pattern. For 3D data, a ``(N,)`` mask selects
+            complete patterns. Explicitly broadcastable masks are also
+            accepted. If omitted, the complete array is clipped.
     
         Returns
         -------
         HyperData
-            New HyperData instance with clipped data values.
+            New HyperData instance with clipped data and preserved metadata.
+
+        Examples
+        --------
+        Clip the complete dataset:
+
+        >>> clipped = data.clip(a_min=0, a_max=100)
+
+        Clip only selected scan positions in a 4D dataset:
+
+        >>> scan_mask = np.zeros(data.shape[:2], dtype=bool)
+        >>> scan_mask[10:20, 15:25] = True
+        >>> clipped = data.clip(a_min=1, mask=scan_mask)
+
+        Clip selected reciprocal-space pixels in every diffraction pattern:
+
+        >>> k_mask = np.zeros(data.shape[-2:], dtype=bool)
+        >>> k_mask[30:90, 30:90] = True
+        >>> clipped = data.clip(a_max=500, mask=k_mask)
+
+        Notes
+        -----
+        This method does not mutate ``self.array``.
         """
-        return self._spawn(clip_values(self.array, a_min, a_max))
+        if mask is None:
+            return self._spawn(clip_values(self.array, a_min, a_max))
+
+        resolved_mask = self._resolve_clip_mask(mask)
+        selected_values = clip_values(
+            self.array[resolved_mask],
+            a_min,
+            a_max,
+        )
+        output_dtype = np.result_type(
+            self.array.dtype,
+            selected_values.dtype,
+        )
+        clipped = self.array.astype(output_dtype, copy=True)
+        clipped[resolved_mask] = selected_values
+        return self._spawn(clipped)
+
+    def block_direct_beam(self, radius=None, center=None, beam_units='auto',
+                          fill_value=1, return_mask=False):
+        """
+        Block the central/direct beam in every diffraction pattern.
+
+        This method masks a circular disk on the last two reciprocal-space
+        axes and replaces the selected direct-beam pixels with ``fill_value``.
+        It supports 3D stacks ``(N, Ky, Kx)`` and 4D-STEM datasets
+        ``(Ry, Rx, Ky, Kx)``. The operation never mutates ``self.array``.
+
+        Parameters
+        ----------
+        radius : float or None, optional
+            Direct-beam radius. Explicit values take precedence over stored
+            ``center_beam_metadata``. If omitted, the method uses
+            ``center_beam_metadata['radius_px']`` from alignment.
+        center : array-like of two floats or None, optional
+            Direct-beam center as ``(ky, kx)``. Explicit values take precedence
+            over metadata. If omitted, the method uses metadata when available
+            and otherwise falls back to the geometric diffraction-pattern
+            center.
+        beam_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system for explicit ``radius`` and ``center``. ``'auto'``
+            uses reciprocal-space calibration when available and otherwise
+            falls back to pixels. Calibrated centers are reciprocal coordinates
+            relative to the diffraction origin, with positive ``ky`` upward
+            and positive ``kx`` to the right.
+        fill_value : scalar, optional
+            Value assigned to blocked direct-beam pixels. Defaults to 1.
+        return_mask : bool, optional
+            If True, return ``(blocked_data, beam_mask)`` where
+            ``beam_mask`` is True for blocked pixels.
+
+        Returns
+        -------
+        HyperData or tuple
+            New HyperData object with direct-beam pixels blocked, optionally
+            followed by the 2D beam mask.
+
+        Notes
+        -----
+        ``block_direct_beam`` is the preferred name. ``remove_center_beam`` is
+        kept as an alias for older notebook wording.
+        """
+        if self.ndim not in (3, 4):
+            raise ValueError(
+                "block_direct_beam requires a 3D stack of diffraction "
+                "patterns or a 4D-STEM dataset."
+            )
+        if self.is_polar:
+            raise ValueError(
+                "block_direct_beam currently expects Cartesian reciprocal "
+                "axes. Apply it before to_polar(), or use an explicit polar "
+                "mask on polar data."
+            )
+        if not np.isscalar(fill_value):
+            raise ValueError("fill_value must be a scalar.")
+
+        ky, kx = self.shape[-2:]
+        center_px, radius_px, resolved_metadata = _resolve_center_beam_parameters(
+            (ky, kx),
+            metadata=self.center_beam_metadata,
+            radius=radius,
+            center=center,
+            units=self.reciprocal_units,
+            conv_factor=self.reciprocal_conv_factor,
+            beam_units=beam_units,
+        )
+        beam_mask = make_mask(center_px, radius_px, mask_dim=(ky, kx))
+        if not np.any(beam_mask):
+            raise ValueError(
+                "The resolved direct-beam mask selects no pixels. Check "
+                "radius, center, and beam_units."
+            )
+
+        output_dtype = np.result_type(self.array.dtype, np.asarray(fill_value).dtype)
+        blocked = self.array.astype(output_dtype, copy=True)
+        blocked[..., beam_mask] = fill_value
+
+        result = self._spawn(blocked)
+        resolved_metadata.update({
+            'source': 'block_direct_beam',
+            'fill_value': fill_value,
+            'previous_metadata': deepcopy(self.center_beam_metadata),
+        })
+        result.center_beam_metadata = resolved_metadata
+
+        if return_mask:
+            return result, beam_mask
+        return result
+
+    remove_center_beam = block_direct_beam
 
     
     def crop(self, ylim=None, xlim=None, kylim=None, kxlim=None,
-             kshape=None, rshape=None):
+             kshape=None, rshape=None, real_limit_units='auto',
+             reciprocal_limit_units='auto'):
         """
         Crop a 4D dataset either in the real or the reciprocal domain,
         with optional subpixel cropping and enforced resizing in both
@@ -5515,13 +6725,21 @@ class HyperData:
         Parameters
         ----------
         ylim : int or tuple, optional
-            Real-space vertical limits.
+            Real-space vertical limits. Interpreted according to
+            ``real_limit_units``.
         xlim : int or tuple, optional
-            Real-space horizontal limits.
+            Real-space horizontal limits. Interpreted according to
+            ``real_limit_units``.
         kylim : int or tuple of (float or int), optional
-            Reciprocal-space vertical limits. Can be float for subpixel cropping.
+            Reciprocal-space vertical limits. Interpreted according to
+            ``reciprocal_limit_units``. Pixel-space values can be floats for
+            subpixel cropping. Calibrated reciprocal limits use coordinates
+            relative to the diffraction origin, with positive ky upward.
         kxlim : int or tuple of (float or int), optional
-            Reciprocal-space horizontal limits. Can be float for subpixel cropping.
+            Reciprocal-space horizontal limits. Interpreted according to
+            ``reciprocal_limit_units``. Pixel-space values can be floats for
+            subpixel cropping. Calibrated reciprocal limits use coordinates
+            relative to the diffraction origin, with positive kx to the right.
         kshape : tuple of (int, int), optional
             Shape (A, B) to resize cropped diffraction patterns to.
             If not provided, it is inferred from the cropped reciprocal region
@@ -5531,27 +6749,115 @@ class HyperData:
             - If rshape divides the current real-space shape, block-averaging
               (binning) is used.
             - Otherwise, bilinear interpolation is used along the real-space axes.
+        real_limit_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for ``ylim`` and ``xlim``. ``'auto'`` uses stored
+            real-space calibration when available and otherwise falls back to
+            pixels.
+        reciprocal_limit_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for ``kylim`` and ``kxlim``. ``'auto'`` uses
+            stored reciprocal-space calibration when available and otherwise
+            falls back to pixels.
+
+        Examples
+        --------
+        Crop with pixel limits:
+
+        >>> cropped = data.crop(
+        ...     ylim=(10, 40),
+        ...     xlim=(20, 60),
+        ...     kylim=(30, 90),
+        ...     kxlim=(28, 92),
+        ...     real_limit_units='pixels',
+        ...     reciprocal_limit_units='pixels',
+        ... )
+
+        Crop using stored calibrated units:
+
+        >>> cropped = data.crop(
+        ...     ylim=(0.0, 5.0),
+        ...     xlim=(0.0, 5.0),
+        ...     kylim=(-0.6, 0.6),
+        ...     kxlim=(-0.6, 0.6),
+        ...     real_limit_units='calibrated',
+        ...     reciprocal_limit_units='calibrated',
+        ... )
         """
+
+        if self.ndim != 4:
+            raise ValueError("crop currently requires a 4D HyperData object.")
+
+        _, real_factor, real_mode = _resolve_unit_mode(
+            real_limit_units,
+            self.real_units,
+            self.real_conv_factor,
+            label='real_limit_units',
+        )
+        _, reciprocal_factor, reciprocal_mode = _resolve_unit_mode(
+            reciprocal_limit_units,
+            self.reciprocal_units,
+            self.reciprocal_conv_factor,
+            label='reciprocal_limit_units',
+        )
     
-        def parse_limits(limits, max_length, allow_float=False, name="limits"):
+        def parse_limits(limits, max_length, allow_float=False, name="limits",
+                         unit_mode='pixels', conv_factor=None, axis='real'):
             """Return (start, end) within [0, max_length]."""
             if limits is None:
                 return (0, max_length)
+
+            def calibrated_to_pixel(value):
+                if unit_mode != 'calibrated':
+                    return float(value)
+                if axis == 'real':
+                    return float(value) / conv_factor
+                axis_center = (max_length - 1) / 2.0
+                if axis == 'reciprocal_y':
+                    return axis_center - float(value) / conv_factor
+                if axis == 'reciprocal_x':
+                    return axis_center + float(value) / conv_factor
+                raise ValueError(f"Unknown crop axis {axis!r}.")
     
             # Single index
-            if isinstance(limits, (Integral, np.integer)):
-                idx = int(limits)
+            if np.isscalar(limits):
+                value = float(limits)
+                if not np.isfinite(value):
+                    raise ValueError(f"{name}: index must be finite.")
+                if unit_mode == 'calibrated':
+                    idx = int(np.rint(calibrated_to_pixel(value)))
+                else:
+                    if not value.is_integer():
+                        raise ValueError(
+                            f"{name}: single-index limits must be integer "
+                            "when using pixel units."
+                        )
+                    idx = int(value)
                 if idx < 0 or idx >= max_length:
                     raise ValueError(f"{name}: index {idx} out of bounds for axis length {max_length}")
                 return (idx, idx + 1)
     
             # Two-element sequence
-            if isinstance(limits, (tuple, list)) and len(limits) == 2:
-                start, end = limits
+            is_pair = (
+                isinstance(limits, (tuple, list, np.ndarray))
+                and np.asarray(limits).shape == (2,)
+            )
+            if is_pair:
+                start, end = np.asarray(limits, dtype=float)
+                if not np.all(np.isfinite((start, end))):
+                    raise ValueError(f"{name}: range limits must be finite.")
     
-                if not allow_float:
+                if unit_mode == 'calibrated':
+                    start_px = calibrated_to_pixel(start)
+                    end_px = calibrated_to_pixel(end)
+                    if axis.startswith('reciprocal_'):
+                        start, end = sorted((start_px, end_px))
+                    else:
+                        start, end = start_px, end_px
+                    if not allow_float:
+                        start = int(np.floor(start))
+                        end = int(np.ceil(end))
+                elif not allow_float:
                     # Real-space indices must be integers
-                    if isinstance(start, float) or isinstance(end, float):
+                    if not float(start).is_integer() or not float(end).is_integer():
                         raise ValueError(f"{name}: real-space limits must be integers")
                     start = int(start)
                     end = int(end)
@@ -5562,6 +6868,9 @@ class HyperData:
                     )
                 if end <= start:
                     raise ValueError(f"{name}: end ({end}) must be greater than start ({start})")
+                if allow_float and np.isclose(start, np.rint(start)) and np.isclose(end, np.rint(end)):
+                    start = int(np.rint(start))
+                    end = int(np.rint(end))
                 return (start, end)
     
             raise ValueError(f"{name}: limits must be int, tuple, list, or None")
@@ -5569,8 +6878,24 @@ class HyperData:
         Ny, Nx, Ky, Kx = self.shape
     
         # --- Real-space limits ---
-        ylim_range = parse_limits(ylim, Ny, allow_float=False, name="ylim")
-        xlim_range = parse_limits(xlim, Nx, allow_float=False, name="xlim")
+        ylim_range = parse_limits(
+            ylim,
+            Ny,
+            allow_float=False,
+            name="ylim",
+            unit_mode=real_mode,
+            conv_factor=real_factor,
+            axis='real',
+        )
+        xlim_range = parse_limits(
+            xlim,
+            Nx,
+            allow_float=False,
+            name="xlim",
+            unit_mode=real_mode,
+            conv_factor=real_factor,
+            axis='real',
+        )
     
         # Fast path: only real-space crop, no k-space crop or resizing, no r-resize
         if kylim is None and kxlim is None and kshape is None and rshape is None:
@@ -5579,8 +6904,24 @@ class HyperData:
             return self._spawn(self.array[y0r:y1r, x0r:x1r])
     
         # --- Reciprocal-space limits (allow floats for subpixel cropping) ---
-        kylim_range = parse_limits(kylim, Ky, allow_float=True, name="kylim")
-        kxlim_range = parse_limits(kxlim, Kx, allow_float=True, name="kxlim")
+        kylim_range = parse_limits(
+            kylim,
+            Ky,
+            allow_float=True,
+            name="kylim",
+            unit_mode=reciprocal_mode,
+            conv_factor=reciprocal_factor,
+            axis='reciprocal_y',
+        )
+        kxlim_range = parse_limits(
+            kxlim,
+            Kx,
+            allow_float=True,
+            name="kxlim",
+            unit_mode=reciprocal_mode,
+            conv_factor=reciprocal_factor,
+            axis='reciprocal_x',
+        )
     
         # Integer boundaries for actual array slicing (pad around subpixel ROI)
         y0 = int(np.floor(kylim_range[0]))
@@ -6079,7 +7420,7 @@ class HyperData:
                   power=1, title='Diffraction-Pattern Montage',
                   log_scale=True, axes=True, vmin=None, vmax=None,
                   figsize=None, aspect=None, cmap='turbo',
-                  units=None, conv_factor=None):
+                  axis_units='auto'):
         """
         Display a reduced 4D dataset as a two-dimensional diffraction montage.
 
@@ -6119,12 +7460,10 @@ class HyperData:
             Aspect ratio forwarded to the montage axes.
         cmap : str, optional
             Matplotlib colormap used for every diffraction pattern.
-        units : str or None, optional
-            Reciprocal-space units reported in the per-tile calibration note.
-            Stored dataset calibration is used when omitted.
-        conv_factor : float or None, optional
-            Reciprocal-space units per pixel reported in the per-tile
-            calibration note. Stored dataset calibration is used when omitted.
+        axis_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for the displayed real-space scan axes and the
+            per-tile reciprocal-space calibration note. ``'auto'`` uses stored
+            calibration when available and otherwise falls back to pixels.
 
         Returns
         -------
@@ -6244,18 +7583,20 @@ class HyperData:
 
         representative_dp = self._spawn_reciprocal(reduced[0, 0])
         if representative_dp.is_polar:
-            polar_metadata = representative_dp.polar_metadata or {}
-            radius_units = polar_metadata.get('radius_units', 'pixels')
-            theta_units = polar_metadata.get('theta_units', 'deg')
+            _, theta_units, radius_units, _, _ = representative_dp._polar_axis_info(
+                axis_units=axis_units
+            )
             tile_description = (
                 f"Each tile: {ky} radial x {kx} angular samples "
                 f"({radius_units}, {theta_units})"
             )
         else:
-            reciprocal_units, reciprocal_factor = (
-                representative_dp._resolve_scale(
-                    units=units,
-                    conv_factor=conv_factor,
+            reciprocal_units, reciprocal_factor, _ = (
+                _resolve_unit_mode(
+                    axis_units,
+                    representative_dp.units,
+                    representative_dp.conv_factor,
+                    label='axis_units',
                 )
             )
             unit_text = representative_dp._format_unit_text(reciprocal_units)
@@ -6288,23 +7629,34 @@ class HyperData:
             x_positions, x_centers = _scan_ticks(nx, kx, rx)
             y_positions, y_centers = _scan_ticks(ny, ky, ry)
 
-            real_scale = (
-                1.0 if self.real_conv_factor is None
-                else self.real_conv_factor
+            real_units, real_scale, _ = _resolve_unit_mode(
+                axis_units,
+                self.real_units,
+                self.real_conv_factor,
+                label='axis_units',
             )
+            real_scale = 1.0 if real_scale is None else real_scale
             x_labels = x_centers * real_scale
             y_labels = y_centers * real_scale
             real_units = (
-                'scan px' if self.real_units is None
+                'scan px' if real_units is None
                 else self._spawn_real(
                     np.empty((1, 1))
-                )._format_unit_text(self.real_units)
+                )._format_unit_text(real_units)
             )
+
+            def _format_axis_tick(value):
+                label = f"{value:.1f}"
+                if label in {"-0.0", "+0.0"}:
+                    label = "0.0"
+                if label.endswith(".0"):
+                    return label[:-2]
+                return label
 
             ax.set_xticks(x_positions)
             ax.set_yticks(y_positions)
-            ax.set_xticklabels([f"{value:g}" for value in x_labels])
-            ax.set_yticklabels([f"{value:g}" for value in y_labels])
+            ax.set_xticklabels([_format_axis_tick(value) for value in x_labels])
+            ax.set_yticklabels([_format_axis_tick(value) for value in y_labels])
             ax.set_xlabel(f"Real-space x ({real_units})", fontsize=14)
             ax.set_ylabel(f"Real-space y ({real_units})", fontsize=14)
             ax.set_title(f"{title}\n{tile_description}", fontsize=16)
@@ -6332,26 +7684,25 @@ class HyperData:
         plt.show()
         return fig, ax
 
-    def get_dp(self, y=None, x=None, mask=None, operation=None, **flat_kwargs):
+    def get_dp(self, y=None, x=None, mask=None, operation=None,
+               selection_units='auto', **flat_kwargs):
         """
         Obtain a diffraction pattern from a 3D/4D dataset, either at a
         specific point, averaged over a specified region, or via a special operation.
     
         Parameters
         ----------
-        y : int | tuple[int, int] | None
+        y : int, float, tuple, list, ndarray, or None
             If tuple (ymin, ymax), averages over rows [ymin:ymax];
-            if int, a single row; if None, ignored.
-        x : int | tuple[int, int] | None
+            if scalar, selects a single row; if None, ignored.
+        x : int, float, tuple, list, ndarray, or None
             If tuple (xmin, xmax), averages over cols [xmin:xmax];
-            if int, a single column; if None, ignored.
+            if scalar, selects a single column; if None, ignored.
         mask : ndarray[bool] | None
             Shape (A, B). If provided and operation in
             {'mean','median','max','min','std'}, returns aggregation over all
             True pixels. If operation == 'random', picks a random True pixel
             and returns its DP.
-        reciprocal_mask : ndarray[bool] | None
-            Shape (C, D). Currently only supports mean over masked k-space (legacy).
         operation : {'mean','median','max','min','std','random','flat_mean'} | None
             Operation to apply. Defaults to 'mean' if None.
             - 'mean','median','max','min','std' : aggregate over the selected
@@ -6359,27 +7710,15 @@ class HyperData:
             - 'random' : return a single randomly selected diffraction pattern.
             - 'flat_mean' : special two-step operation based on radial masking
               and a flat-field style threshold (see implementation).
+        selection_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used to interpret ``y`` and ``x`` for 4D data.
+            ``'auto'`` uses the stored real-space calibration when available
+            and otherwise falls back to pixel indices.
     
         Returns
         -------
         ReciprocalSpace or ndarray
         """
-    
-        # Helper to parse ranges given int/tuple/None
-        def _parse_range(val, max_len, name):
-            if isinstance(val, tuple):
-                a, b = val
-                if not (0 <= a < b <= max_len):
-                    raise ValueError(f"Invalid {name} range ({a}, {b}) for length {max_len}.")
-                return a, b
-            elif isinstance(val, int):
-                if not (0 <= val < max_len):
-                    raise ValueError(f"{name} index {val} out of bounds for length {max_len}.")
-                return val, val + 1
-            elif val is None:
-                return 0, max_len
-            else:
-                raise ValueError(f"{name} must be int, tuple, or None.")
     
         operations = {
             'mean':   np.mean,
@@ -6398,6 +7737,21 @@ class HyperData:
         if operation not in operations:
             valid_ops = ', '.join(f"'{op}'" for op in operations.keys())
             raise ValueError(f"'operation' must be one of: {valid_ops}.")
+
+        selection_mode = _normalize_unit_mode(
+            selection_units,
+            label='selection_units',
+        )
+        selection_factor = None
+        if self.ndim == 4:
+            _, selection_factor, selection_mode = self._resolve_real_selection_units(
+                selection_units
+            )
+        elif selection_mode == 'calibrated':
+            raise ValueError(
+                "selection_units='calibrated' is only supported for 4D data, "
+                "where y and x are real-space scan coordinates."
+            )
     
         # Selecting a random diffraction pattern
         if operation == 'random':
@@ -6419,18 +7773,23 @@ class HyperData:
                 print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) using mask...\n")
                 return self._spawn_reciprocal(self.array[y_pos, x_pos])
     
-            # (1) region via y/x, at least one must be a tuple (4D only)
-            if self.ndim == 4 and (isinstance(y, tuple) or isinstance(x, tuple)):
+            # Region via y/x. Units are resolved before random sampling.
+            if self.ndim == 4 and (y is not None or x is not None):
                 A, B = self.shape[0], self.shape[1]
-                y0, y1 = _parse_range(y, A, 'y')
-                x0, x1 = _parse_range(x, B, 'x')
-    
-                if not (isinstance(y, tuple) or isinstance(x, tuple)):
-                    raise ValueError("When constraining random by region, at least one of y or x must be a tuple.")
-    
-                if (y1 - y0) <= 0 or (x1 - x0) <= 0:
-                    raise ValueError("Empty region for random selection.")
-    
+                y0, y1, _ = self._parse_real_selection(
+                    y,
+                    A,
+                    'y',
+                    selection_mode,
+                    selection_factor,
+                )
+                x0, x1, _ = self._parse_real_selection(
+                    x,
+                    B,
+                    'x',
+                    selection_mode,
+                    selection_factor,
+                )
                 y_pos = rng.randint(y0, y1)
                 x_pos = rng.randint(x0, x1)
                 print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) within specified region...\n")
@@ -6481,66 +7840,34 @@ class HyperData:
         if y is not None or x is not None:
             if self.ndim == 4:
                 A, B = self.shape[0], self.shape[1]
-    
-                # Convenience: map to same forms as original code
-                if isinstance(y, tuple) and isinstance(x, tuple):
-                    ymin, ymax = y
-                    xmin, xmax = x
-                    sub = self.array[ymin:ymax, xmin:xmax, :, :]
-                    result = agg_func(sub, axis=(0, 1))
-                    return self._spawn_reciprocal(result)
-    
-                elif isinstance(y, tuple) and isinstance(x, int):
-                    ymin, ymax = y
-                    sub = self.array[ymin:ymax, x, :, :]
-                    result = agg_func(sub, axis=0)
-                    return self._spawn_reciprocal(result)
-    
-                elif isinstance(y, int) and isinstance(x, tuple):
-                    xmin, xmax = x
-                    sub = self.array[y, xmin:xmax, :, :]
-                    result = agg_func(sub, axis=0)
-                    return self._spawn_reciprocal(result)
-    
-                elif isinstance(y, int) and isinstance(x, int):
-                    # Single DP; operation degenerates to identity
-                    return self._spawn_reciprocal(self.array[y, x])
-    
-                elif isinstance(y, tuple) and x is None:
-                    ymin, ymax = y
-                    sub = self.array[ymin:ymax, :, :, :]
-                    result = agg_func(sub, axis=(0, 1))
-                    return self._spawn_reciprocal(result)
-    
-                elif isinstance(y, int) and x is None:
-                    # Aggregate along x with chosen operation
-                    sub = self.array[y, :, :, :]
-                    result = agg_func(sub, axis=0)
-                    return self._spawn_reciprocal(result)
-    
-                elif y is None and isinstance(x, tuple):
-                    xmin, xmax = x
-                    sub = self.array[:, xmin:xmax, :, :]
-                    result = agg_func(sub, axis=(0, 1))
-                    return self._spawn_reciprocal(result)
-    
-                elif y is None and isinstance(x, int):
-                    sub = self.array[:, x, :, :]
-                    result = agg_func(sub, axis=0)
-                    return self._spawn_reciprocal(result)
-    
-                else:
-                    raise ValueError(
-                        "y and x must be either both tuples, both integers, "
-                        "one tuple-one integer, or one integer-one None."
-                    )
+                y0, y1, y_kind = self._parse_real_selection(
+                    y,
+                    A,
+                    'y',
+                    selection_mode,
+                    selection_factor,
+                )
+                x0, x1, x_kind = self._parse_real_selection(
+                    x,
+                    B,
+                    'x',
+                    selection_mode,
+                    selection_factor,
+                )
+
+                if y_kind == 'index' and x_kind == 'index':
+                    return self._spawn_reciprocal(self.array[y0, x0])
+
+                sub = self.array[y0:y1, x0:x1, :, :]
+                result = agg_func(sub, axis=(0, 1))
+                return self._spawn_reciprocal(result)
     
             elif self.ndim == 3:
                 # For 3D: only support picking by index, as before
-                if isinstance(y, int) and x is None:
-                    return self._spawn_reciprocal(self.array[y, :, :])
-                if y is None and isinstance(x, int):
-                    return self._spawn_reciprocal(self.array[x, :, :])
+                if isinstance(y, (Integral, np.integer)) and x is None:
+                    return self._spawn_reciprocal(self.array[int(y), :, :])
+                if y is None and isinstance(x, (Integral, np.integer)):
+                    return self._spawn_reciprocal(self.array[int(x), :, :])
                 raise ValueError("Region-based (tuple) selection currently only supported for 4D arrays.")
     
         # Global Operation
@@ -6807,7 +8134,8 @@ class HyperData:
         return self.resize(output_shape, domain=domain, method='area')
     
     def virtual_image(self, annulus=None, *, radius=None, centers=None,
-                      mask=None, theta_range=None, vmin=None, vmax=None,
+                      mask=None, theta_range=None, detector_units='auto',
+                      axis_units='auto', vmin=None, vmax=None,
                       grid=True, num_div=10, plot_mask=False,
                       grid_color='black', axes=True,
                       return_detector=False):
@@ -6823,15 +8151,20 @@ class HyperData:
         Parameters
         ----------
         annulus : array-like of two floats or None, optional
-            Inner and outer detector radii in reciprocal-space pixels. For
-            Cartesian data the annulus is centered at the diffraction origin.
-            For polar data it selects a radial ``kr`` interval.
+            Inner and outer detector radii. Interpreted according to
+            ``detector_units``. For Cartesian data the annulus is centered at
+            the diffraction origin. For polar data it selects a radial ``kr``
+            interval.
         radius : float or array-like of floats or None, optional
-            Radius of each Cartesian circular detector in pixels. A scalar is
-            applied to every center; otherwise provide one radius per center.
+            Radius of each Cartesian circular detector. Interpreted according
+            to ``detector_units``. A scalar is applied to every center;
+            otherwise provide one radius per center.
         centers : array-like or None, optional
             One ``(ky, kx)`` center or an ``(N, 2)`` array of centers. Multiple
-            circles are combined as a union. Only valid for Cartesian data.
+            circles are combined as a union. Pixel centers are array
+            coordinates. Calibrated centers are reciprocal coordinates relative
+            to the diffraction origin, with positive ``ky`` upward and positive
+            ``kx`` to the right. Only valid for Cartesian data.
         mask : ndarray or None, optional
             Arbitrary detector with shape matching the last two data axes.
             Boolean masks select pixels. Numeric masks act as detector weights
@@ -6840,6 +8173,14 @@ class HyperData:
             Angular interval in degrees for a polar annular detector. A wrapped
             interval such as ``(330, 30)`` is supported. This parameter is only
             valid with ``annulus`` on polar data.
+        detector_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for ``annulus``, ``radius``, and ``centers``.
+            ``'auto'`` uses reciprocal calibration when available and otherwise
+            falls back to pixels.
+        axis_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for the displayed real-space virtual image axes.
+            ``'auto'`` uses real-space calibration when available and otherwise
+            falls back to pixels.
         vmin, vmax : float or None, optional
             Display range passed to the real-space visualization.
         grid : bool, optional
@@ -6864,8 +8205,8 @@ class HyperData:
 
         Examples
         --------
-        >>> image = data.virtual_image(annulus=(10, 35))
-        >>> image = data.virtual_image(radius=5, centers=(62, 74))
+        >>> image = data.virtual_image(annulus=(10, 35), detector_units='pixels')
+        >>> image = data.virtual_image(radius=5, centers=(62, 74), detector_units='pixels')
         >>> image = data.virtual_image(
         ...     radius=[4, 5],
         ...     centers=[(62, 74), (51, 43)],
@@ -6891,8 +8232,26 @@ class HyperData:
                 "Specify exactly one detector: annulus, radius with centers, "
                 "or mask."
             )
+        if has_disk_input and self.is_polar:
+            raise ValueError(
+                "radius and centers define Cartesian (ky, kx) circles and "
+                "cannot be applied after to_polar(). Use annulus or mask."
+            )
 
         ky, kx = self.shape[-2:]
+        if has_annulus or has_disk_input:
+            if self.is_polar:
+                _, detector_factor, detector_mode = self._resolve_polar_radius_units(
+                    detector_units
+                )
+            else:
+                _, detector_factor, detector_mode = self._resolve_reciprocal_detector_units(
+                    detector_units
+                )
+        else:
+            _normalize_unit_mode(detector_units, label='detector_units')
+            detector_factor = None
+            detector_mode = 'pixels'
 
         if has_mask:
             if theta_range is not None:
@@ -6930,6 +8289,11 @@ class HyperData:
                 )
             if not np.all(np.isfinite(annulus_values)):
                 raise ValueError("annulus radii must be finite.")
+            if detector_mode == 'calibrated':
+                annulus_values = self._scale_values_to_pixels(
+                    annulus_values,
+                    detector_factor,
+                )
             inner_radius, outer_radius = annulus_values
             if inner_radius < 0 or outer_radius <= inner_radius:
                 raise ValueError(
@@ -6994,11 +8358,6 @@ class HyperData:
                 ).astype(np.float32)
 
         else:
-            if self.is_polar:
-                raise ValueError(
-                    "radius and centers define Cartesian (ky, kx) circles and "
-                    "cannot be applied after to_polar(). Use annulus or mask."
-                )
             if theta_range is not None:
                 raise ValueError(
                     "theta_range is only valid with annulus on polar data."
@@ -7015,6 +8374,12 @@ class HyperData:
                 raise ValueError("centers must contain at least one center.")
             if not np.all(np.isfinite(center_values)):
                 raise ValueError("centers must contain only finite values.")
+            if detector_mode == 'calibrated':
+                center_values = self._calibrated_centers_to_pixels(
+                    center_values,
+                    detector_factor,
+                    (ky, kx),
+                )
 
             radius_values = np.asarray(radius, dtype=float)
             if radius_values.ndim == 0:
@@ -7036,6 +8401,11 @@ class HyperData:
                 or np.any(radius_values <= 0)
             ):
                 raise ValueError("All detector radii must be positive and finite.")
+            if detector_mode == 'calibrated':
+                radius_values = self._scale_values_to_pixels(
+                    radius_values,
+                    detector_factor,
+                )
 
             detector_weights = np.zeros((ky, kx), dtype=np.float32)
             for center, disk_radius in zip(center_values, radius_values):
@@ -7089,15 +8459,32 @@ class HyperData:
             grid=grid,
             num_div=num_div,
             gridColor=grid_color,
+            axis_units=axis_units,
         )
 
         if plot_mask and self.is_polar:
             metadata = self.polar_metadata or {}
-            radius_min, radius_max = metadata.get(
-                'radius_display_range',
-                (0.0, float(ky - 1)),
-            )
-            radius_units = metadata.get('radius_units', 'pixels')
+            if detector_mode == 'calibrated':
+                radius_min, radius_max = metadata.get(
+                    'radius_display_range',
+                    (
+                        0.0,
+                        metadata.get(
+                            'radius_range_pixels',
+                            (0.0, float(ky - 1)),
+                        )[1] * detector_factor,
+                    ),
+                )
+                radius_units = metadata.get(
+                    'cartesian_reciprocal_units',
+                    metadata.get('radius_units', 'pixels'),
+                )
+            else:
+                radius_min, radius_max = metadata.get(
+                    'radius_range_pixels',
+                    (0.0, float(ky - 1)),
+                )
+                radius_units = 'pixels'
             theta_min, theta_max = metadata.get(
                 'theta_range',
                 (0.0, 360.0),
@@ -7120,6 +8507,7 @@ class HyperData:
                 title='Virtual Detector Response',
                 cmap='coolwarm' if has_negative_weights else 'turbo',
                 logScale=not has_negative_weights,
+                axis_units=detector_units,
             )
 
         if return_detector:
@@ -8143,9 +9531,9 @@ class HyperData:
             residual_bg = self.get_residualBg(**resBg_kwargs)
             return self._spawn(
                 self.array[:,:] - background*bg_frac - residual_bg*residual_bg_frac
-            ).clip()
+            )
         else:
-            return self._spawn(self.array[:,:] - background*bg_frac).clip()
+            return self._spawn(self.array[:,:] - background*bg_frac)
 
     def to_polar(self,
                  center: Tuple[float, float] = None,
@@ -8797,13 +10185,19 @@ class ReciprocalSpace:
     """
 
     def __init__(self, data, units: str = None, conv_factor: float = None,
-                 polar_metadata: dict = None):
+                 polar_metadata: dict = None,
+                 center_beam_metadata: dict = None):
         self.array = data
         self.shape = data.shape
         self._denoise_engine = _DenoiseEngine(data)
         self.units = None
         self.conv_factor = None
         self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+        self.center_beam_metadata = (
+            deepcopy(center_beam_metadata)
+            if center_beam_metadata is not None
+            else None
+        )
 
         if units is not None or conv_factor is not None:
             self.set_scale(units=units, conv_factor=conv_factor)
@@ -8888,26 +10282,67 @@ class ReciprocalSpace:
         half_x = kx / 2.0
         return (-half_x * scale, half_x * scale, half_y * scale, -half_y * scale)
 
-    def _polar_axis_info(self):
+    def _polar_axis_info(self, axis_units='auto'):
         """Return imshow extent and labels for polar ``(kr, ktheta)`` data."""
         metadata = self.polar_metadata or {}
         n_r, n_theta = self.shape
-
-        radius_min, radius_max = metadata.get(
-            'radius_display_range',
-            metadata.get('radius_range_pixels', (0.0, float(n_r))),
+        mode = _normalize_unit_mode(axis_units, label='axis_units')
+        radius_range_pixels = metadata.get(
+            'radius_range_pixels',
+            (0.0, float(n_r - 1)),
         )
+        source_units = metadata.get('cartesian_reciprocal_units')
+        source_factor = metadata.get('cartesian_reciprocal_conv_factor')
+
+        if mode == 'pixels':
+            radius_min, radius_max = radius_range_pixels
+            radius_units = 'pixels'
+            radius_sample_step = metadata.get(
+                'radius_sample_step_pixels',
+                metadata.get('radius_step_pixels', 1.0),
+            )
+        elif source_units is None or source_factor is None:
+            if mode == 'calibrated':
+                raise ValueError(
+                    "axis_units='calibrated' requires polar metadata with "
+                    "the original reciprocal-space calibration."
+                )
+            radius_min, radius_max = radius_range_pixels
+            radius_units = 'pixels'
+            radius_sample_step = metadata.get(
+                'radius_sample_step_pixels',
+                metadata.get('radius_step_pixels', 1.0),
+            )
+        else:
+            if not np.isscalar(source_factor) or source_factor <= 0:
+                raise ValueError(
+                    "polar_metadata['cartesian_reciprocal_conv_factor'] must "
+                    "be a positive scalar."
+                )
+            radius_min, radius_max = metadata.get(
+                'radius_display_range',
+                (
+                    radius_range_pixels[0] * source_factor,
+                    radius_range_pixels[1] * source_factor,
+                ),
+            )
+            radius_units = source_units
+            radius_sample_step = metadata.get(
+                'radius_sample_step',
+                metadata.get('radius_step', source_factor),
+            )
+
         theta_min, theta_max = metadata.get('theta_range', (0.0, 360.0))
-        radius_units = metadata.get('radius_units', 'pixels')
         theta_units = metadata.get('theta_units', 'deg')
 
         radius_unit_text = self._format_unit_text(radius_units)
         theta_unit_text = self._format_unit_text(theta_units)
         extent = (theta_min, theta_max, radius_max, radius_min)
-        return extent, theta_unit_text, radius_unit_text
+        return extent, theta_unit_text, radius_unit_text, radius_min, radius_sample_step
 
     def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET,
-               polar_metadata=_SCALE_UNSET):
+               polar_metadata=_SCALE_UNSET,
+               center_beam_metadata=_SCALE_UNSET):
         """Create a new ReciprocalSpace object while preserving calibration."""
         if units is _SCALE_UNSET:
             units = self.units
@@ -8915,12 +10350,28 @@ class ReciprocalSpace:
             conv_factor = self.conv_factor
         if polar_metadata is _SCALE_UNSET:
             polar_metadata = self.polar_metadata
+        if center_beam_metadata is _SCALE_UNSET:
+            center_beam_metadata = self.center_beam_metadata
         return ReciprocalSpace(
             data,
             units=units,
             conv_factor=conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            center_beam_metadata=(
+                deepcopy(center_beam_metadata)
+                if center_beam_metadata is not None
+                else None
+            ),
         )
+
+    def copy(self):
+        """
+        Return an independent copy of this ReciprocalSpace object.
+
+        The image array, calibration, and polar metadata are copied so the
+        returned object can be edited without changing this object.
+        """
+        return self._spawn(np.array(self.array, copy=True))
     
     def show(self,
              power: float = 1,
@@ -8933,8 +10384,7 @@ class ReciprocalSpace:
              aspect=None,
              cmap: str = 'turbo',
              coords: np.ndarray | None = None,
-             units: str = None,
-             conv_factor: float = None,
+             axis_units='auto',
              **scatter_kwargs):
         """
         Visualize the diffraction pattern stored in this ReciprocalSpace object.
@@ -8974,14 +10424,11 @@ class ReciprocalSpace:
             Optional array of peak coordinates to overlay as scatter points.
             Each row should be `[y, x]`. When provided, points are plotted at
             `x = coords[:, 1]` and `y = coords[:, 0]` on top of the image.
-        units : str or None, optional
-            Physical units for the reciprocal-space axes. If omitted, the
-            method uses the units previously assigned to this object via
-            ``set_scale``. If no calibration exists, the axes are shown in
-            pixels.
-        conv_factor : float or None, optional
-            Conversion factor in ``units / pixel``. If omitted, the stored
-            object calibration is used when available.
+        axis_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for the displayed axes. ``'auto'`` uses stored
+            reciprocal-space calibration when available and otherwise falls
+            back to pixels. For polar data, calibrated display uses ``kr`` in
+            the source reciprocal units and ``ktheta`` in degrees.
         **scatter_kwargs :
             Additional keyword arguments forwarded to `plt.scatter(...)` for
             the overlay points (e.g., `c='r'`, `s=20`, `marker='x'`, etc.).
@@ -8993,11 +10440,28 @@ class ReciprocalSpace:
           `-inf` or `nan` in the log; it is recommended to use background-
           subtracted and strictly positive data when using log scaling.
         """
+        if 'units' in scatter_kwargs or 'conv_factor' in scatter_kwargs:
+            raise TypeError(
+                "ReciprocalSpace.show uses axis_units='auto', 'pixels', or "
+                "'calibrated'. Set the object scale with set_scale() instead "
+                "of passing units/conv_factor to show()."
+            )
         if self.is_polar:
-            extent, theta_unit_text, radius_unit_text = self._polar_axis_info()
+            (
+                extent,
+                theta_unit_text,
+                radius_unit_text,
+                radius_axis_start,
+                radius_sample_step,
+            ) = self._polar_axis_info(axis_units=axis_units)
             conv_factor = None
         else:
-            units, conv_factor = self._resolve_scale(units=units, conv_factor=conv_factor)
+            units, conv_factor, _ = _resolve_unit_mode(
+                axis_units,
+                self.units,
+                self.conv_factor,
+                label='axis_units',
+            )
             axis_unit_text = self._format_unit_text(units)
             extent = self._axis_extent(conv_factor=conv_factor)
     
@@ -9039,17 +10503,13 @@ class ReciprocalSpace:
             if coords.size > 0:
                 if self.is_polar:
                     metadata = self.polar_metadata or {}
-                    radius_step = metadata.get(
-                        'radius_sample_step',
-                        metadata.get('radius_step', 1.0),
-                    )
                     theta_step = metadata.get(
                         'theta_step',
                         360.0 / self.shape[1],
                     )
                     theta_min = metadata.get('theta_range', (0.0, 360.0))[0]
                     x_coords = theta_min + coords[:, 1] * theta_step
-                    y_coords = coords[:, 0] * radius_step
+                    y_coords = radius_axis_start + coords[:, 0] * radius_sample_step
                 else:
                     plot_scale = 1.0 if conv_factor is None else conv_factor
                     ky, kx = self.shape
@@ -9091,14 +10551,97 @@ class ReciprocalSpace:
             plt.axis('off')
     
         plt.show()
-
     
-    #TODO: how to call method from HyperData?
-    # def remove_center_beam(self):
-    #     """
-        
-    #     """
-    #     return ReciprocalSpace(annular)
+    def block_direct_beam(self, radius=None, center=None, beam_units='auto',
+                          fill_value=1, return_mask=False):
+        """
+        Block the central/direct beam in this diffraction pattern.
+
+        The selected circular beam region is replaced with ``fill_value``.
+        Explicit ``radius`` and ``center`` values take precedence over stored
+        ``center_beam_metadata`` from alignment. If ``radius`` is omitted, the
+        method uses metadata and raises a helpful error if no stored direct-
+        beam radius is available.
+
+        Parameters
+        ----------
+        radius : float or None, optional
+            Direct-beam radius. Interpreted according to ``beam_units`` when
+            provided explicitly.
+        center : array-like of two floats or None, optional
+            Direct-beam center as ``(ky, kx)``. Pixel centers are array
+            coordinates. Calibrated centers are reciprocal coordinates
+            relative to the diffraction origin, with positive ``ky`` upward
+            and positive ``kx`` to the right.
+        beam_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system for explicit ``radius`` and ``center``. ``'auto'``
+            uses this object's calibration when available and otherwise falls
+            back to pixels.
+        fill_value : scalar, optional
+            Value assigned to blocked direct-beam pixels. Defaults to 1.
+        return_mask : bool, optional
+            If True, return ``(blocked_pattern, beam_mask)`` where
+            ``beam_mask`` is True for blocked pixels.
+
+        Returns
+        -------
+        ReciprocalSpace or tuple
+            New diffraction-pattern object with the direct beam blocked,
+            optionally followed by the 2D beam mask.
+
+        Notes
+        -----
+        ``block_direct_beam`` is the preferred name. ``remove_center_beam`` is
+        kept as an alias for older notebook wording.
+        """
+        if self.array.ndim != 2:
+            raise ValueError(
+                "ReciprocalSpace.block_direct_beam requires a single 2D "
+                "diffraction pattern."
+            )
+        if self.is_polar:
+            raise ValueError(
+                "block_direct_beam currently expects Cartesian reciprocal "
+                "axes. Apply it before converting to polar coordinates, or "
+                "use an explicit polar mask."
+            )
+        if not np.isscalar(fill_value):
+            raise ValueError("fill_value must be a scalar.")
+
+        ky, kx = self.shape
+        center_px, radius_px, resolved_metadata = _resolve_center_beam_parameters(
+            (ky, kx),
+            metadata=self.center_beam_metadata,
+            radius=radius,
+            center=center,
+            units=self.units,
+            conv_factor=self.conv_factor,
+            beam_units=beam_units,
+        )
+        beam_mask = make_mask(center_px, radius_px, mask_dim=(ky, kx))
+        if not np.any(beam_mask):
+            raise ValueError(
+                "The resolved direct-beam mask selects no pixels. Check "
+                "radius, center, and beam_units."
+            )
+
+        output_dtype = np.result_type(self.array.dtype, np.asarray(fill_value).dtype)
+        blocked = self.array.astype(output_dtype, copy=True)
+        blocked[beam_mask] = fill_value
+
+        result = self._spawn(blocked)
+        resolved_metadata.update({
+            'source': 'block_direct_beam',
+            'fill_value': fill_value,
+            'previous_metadata': deepcopy(self.center_beam_metadata),
+        })
+        result.center_beam_metadata = resolved_metadata
+
+        if return_mask:
+            return result, beam_mask
+        return result
+
+    remove_center_beam = block_direct_beam
     
     def crop(self, kylim=None, kxlim=None, kshape=None):
         """
@@ -10026,20 +11569,76 @@ class ReciprocalSpace:
         
         return coords
 
-    #TODO: add docstring
     def clip(self, a_min=1, a_max=None):
         """
-        
+        Clip diffraction-pattern intensities to a specified range.
+
+        Values below ``a_min`` are set to ``a_min`` and values above
+        ``a_max`` are set to ``a_max``. If either bound is ``None``, clipping
+        on that side is skipped. The original object is not modified.
+
+        Parameters
+        ----------
+        a_min : float or None, optional
+            Lower clipping bound. Defaults to 1. Use ``None`` to disable lower
+            clipping.
+        a_max : float or None, optional
+            Upper clipping bound. Defaults to None, meaning no upper clipping
+            is applied.
+
+        Returns
+        -------
+        ReciprocalSpace
+            New diffraction-pattern object with clipped intensities and
+            preserved calibration/metadata.
         """
         
         return self._spawn(clip_values(self.array, a_min, a_max))
     
-    #TODO: add docstring
-    def get_bg(self, centers, radius,):
-                           
-        return self._spawn(inpaint_diffraction(self.array, centers=centers, radius=radius,))
-    
-    
+    def inpaint_background(self, centers=None, radius=6, mask=None,
+                           method='biharmonic', split_into_regions=False):
+        """
+        Estimate a local background by inpainting selected diffraction spots.
+
+        Circular regions centered at ``centers`` with radius ``radius`` are
+        treated as spots to remove. An explicit Boolean ``mask`` can also be
+        provided, and is combined with any circular regions. The missing
+        regions are filled by ``inpaint_background`` to produce a smooth
+        background estimate. The original diffraction pattern is not modified.
+
+        Parameters
+        ----------
+        centers : array-like or None, optional
+            One ``(ky, kx)`` center or a sequence of centers identifying spots
+            to inpaint. Required when ``mask`` is not provided.
+        radius : float or array-like of floats, optional
+            Radius, in pixels, around each center to inpaint. Defaults to 6.
+        mask : ndarray of bool or None, optional
+            Explicit inpainting mask with the same shape as this diffraction
+            pattern. True-valued pixels are inpainted.
+        method : {'biharmonic'}, optional
+            Inpainting method. Currently only ``'biharmonic'`` is implemented.
+        split_into_regions : bool, optional
+            Passed to ``skimage.restoration.inpaint_biharmonic``.
+
+        Returns
+        -------
+        ReciprocalSpace
+            New diffraction-pattern object containing the estimated
+            background and preserved calibration/metadata.
+        """
+
+        return self._spawn(
+            inpaint_background(
+                self.array,
+                centers=centers,
+                radius=radius,
+                mask=mask,
+                method=method,
+                split_into_regions=split_into_regions,
+            )
+        )
+
     def remove_bg(self, background, bg_frac=1, a_min=1):
     
         """
@@ -10360,6 +11959,15 @@ class RealSpace:
             conv_factor = self.conv_factor
         return RealSpace(data, units=units, conv_factor=conv_factor)
 
+    def copy(self):
+        """
+        Return an independent copy of this RealSpace object.
+
+        The image array and calibration metadata are copied so the returned
+        object can be edited without changing this object.
+        """
+        return self._spawn(np.array(self.array, copy=True))
+
     def show(self,
              title: str = 'Real-Space Image',
              axes: bool = True,
@@ -10372,13 +11980,30 @@ class RealSpace:
              aspect=None,
              cmap: str = 'gray',
              coords: np.ndarray | None = None,
-             units: str = None,
-             conv_factor: float = None,
+             axis_units='auto',
              **scatter_kwargs):
         """
         Visualize the real-space image stored in this object.
+
+        Parameters
+        ----------
+        axis_units : {'auto', 'pixels', 'calibrated'}, optional
+            Unit system used for the displayed axes. ``'auto'`` uses stored
+            real-space calibration when available and otherwise falls back to
+            pixels.
         """
-        units, conv_factor = self._resolve_scale(units=units, conv_factor=conv_factor)
+        if 'units' in scatter_kwargs or 'conv_factor' in scatter_kwargs:
+            raise TypeError(
+                "RealSpace.show uses axis_units='auto', 'pixels', or "
+                "'calibrated'. Set the object scale with set_scale() instead "
+                "of passing units/conv_factor to show()."
+            )
+        units, conv_factor, _ = _resolve_unit_mode(
+            axis_units,
+            self.units,
+            self.conv_factor,
+            label='axis_units',
+        )
         axis_unit_text = self._format_unit_text(units)
         extent = self._axis_extent(conv_factor=conv_factor)
         scale = 1.0 if conv_factor is None else conv_factor
@@ -10675,6 +12300,249 @@ class _DenoisingMethods:
         patch_kw = dict(patch_size=patch_size, patch_distance=patch_distance, )
         
         return denoise_nl_means(target_data, h=h*sigma_est, fast_mode=fast_mode, **patch_kw)
+
+
+    @staticmethod
+    def _estimate_noise_sigma(image):
+        """Estimate scalar Gaussian noise level for a 2D image or 3D volume."""
+        try:
+            sigma_est = estimate_sigma(image, channel_axis=None)
+        except TypeError:
+            sigma_est = estimate_sigma(image, multichannel=False)
+        return float(np.mean(sigma_est))
+
+    @staticmethod
+    def _resolve_bm_stage(module, stage, enum_name):
+        """Resolve user-friendly BM3D/BM4D stage names to package enums."""
+        if stage is None:
+            stage = 'all'
+        if not isinstance(stage, str):
+            return stage
+
+        normalized = stage.strip().lower().replace('-', '_')
+        stage_enum = getattr(module, enum_name, None)
+        if stage_enum is None:
+            return stage
+
+        aliases = {
+            'all': 'ALL_STAGES',
+            'both': 'ALL_STAGES',
+            'all_stages': 'ALL_STAGES',
+            'full': 'ALL_STAGES',
+            'hard': 'HARD_THRESHOLDING',
+            'ht': 'HARD_THRESHOLDING',
+            'hard_thresholding': 'HARD_THRESHOLDING',
+            'wiener': 'WIENER_FILTERING',
+            'wf': 'WIENER_FILTERING',
+            'wiener_filtering': 'WIENER_FILTERING',
+        }
+        if normalized not in aliases:
+            valid = ', '.join(sorted(aliases))
+            raise ValueError(f"stage must be one of: {valid}, or a {enum_name} value.")
+        return getattr(stage_enum, aliases[normalized])
+
+    def bm3d(self, target_data, sigma_psd=None, stage='all', profile='np',
+             clip_output=False, **kwargs):
+        """
+        Denoise 2D images with BM3D block matching and 3D filtering.
+
+        BM3D normally takes a 2D image as input. The "3D" in BM3D refers to
+        the internal grouping/filtering of similar 2D patches. For a 3D stack
+        with shape ``(N, Y, X)``, this wrapper applies BM3D independently to
+        each 2D image along the first axis.
+
+        Parameters
+        ----------
+        target_data : ndarray
+            Two-dimensional image or three-dimensional image stack to denoise.
+        sigma_psd : float, ndarray, or sequence, optional
+            Noise standard deviation or noise power spectral density passed to
+            ``bm3d.bm3d``. If omitted, a scalar Gaussian noise level is
+            estimated from each image. For 3D stacks, a 1D sequence with
+            length ``N`` is interpreted as one scalar noise level per image.
+        stage : {'all', 'hard', 'wiener'} or BM3DStages value, optional
+            BM3D stage to run.
+        profile : str or BM3DProfile, optional
+            BM3D profile passed through to the external package.
+        clip_output : bool, optional
+            If True, clip each denoised image to the min/max range of the
+            corresponding input image.
+        **kwargs
+            Additional keyword arguments passed to ``bm3d.bm3d``.
+
+        Returns
+        -------
+        ndarray
+            Denoised image or image stack with the same shape as the input.
+        """
+        try:
+            import bm3d as bm3d_module
+        except ImportError as exc:
+            raise ImportError(
+                "The BM3D denoising method requires the optional 'bm3d' "
+                "package. Install it with `pip install bm3d` in the active "
+                "environment, then rerun denoise(method='bm3d', ...)."
+            ) from exc
+
+        data = np.asarray(target_data)
+        if data.ndim not in (2, 3):
+            raise ValueError(
+                "bm3d expects a 2D image or a 3D stack with shape "
+                f"(N, Y, X); got shape {data.shape}."
+            )
+        if np.iscomplexobj(data):
+            raise TypeError("bm3d requires real-valued data.")
+        if not np.all(np.isfinite(data)):
+            raise ValueError("bm3d requires finite input values.")
+        if not isinstance(clip_output, (bool, np.bool_)):
+            raise ValueError("clip_output must be a boolean.")
+
+        stage_arg = self._resolve_bm_stage(
+            bm3d_module,
+            stage,
+            'BM3DStages',
+        )
+
+        def _denoise_image(image, image_sigma):
+            image = np.asarray(image)
+            if image_sigma is None:
+                image_sigma = self._estimate_noise_sigma(image)
+            result = bm3d_module.bm3d(
+                image.astype(np.result_type(image.dtype, np.float32), copy=False),
+                sigma_psd=image_sigma,
+                profile=profile,
+                stage_arg=stage_arg,
+                **kwargs,
+            )
+            if isinstance(result, tuple):
+                result = result[0]
+            result = np.asarray(result)
+            if result.shape != image.shape:
+                raise ValueError(
+                    "bm3d changed image shape from "
+                    f"{image.shape} to {result.shape}; 4Denoise expects "
+                    "shape-preserving denoising methods."
+                )
+            if clip_output:
+                result = np.clip(result, np.min(image), np.max(image))
+            return result
+
+        if data.ndim == 2:
+            return _denoise_image(data, sigma_psd)
+
+        per_image_sigma = None
+        shared_sigma = sigma_psd
+        if sigma_psd is not None:
+            sigma_array = np.asarray(sigma_psd)
+            if sigma_array.ndim == 1 and sigma_array.size == data.shape[0]:
+                per_image_sigma = sigma_array
+                shared_sigma = None
+
+        first_result = _denoise_image(
+            data[0],
+            per_image_sigma[0] if per_image_sigma is not None else shared_sigma,
+        )
+        denoised = np.empty(
+            (data.shape[0],) + first_result.shape,
+            dtype=first_result.dtype,
+        )
+        denoised[0] = first_result
+        for idx in range(1, data.shape[0]):
+            image_sigma = (
+                per_image_sigma[idx]
+                if per_image_sigma is not None
+                else shared_sigma
+            )
+            denoised[idx] = _denoise_image(data[idx], image_sigma)
+
+        return denoised
+
+    def bm4d(self, target_data, sigma_psd=None, stage='all', profile='np',
+             clip_output=False, **kwargs):
+        """
+        Denoise a 3D volume with BM4D block matching and 4D filtering.
+
+        BM4D is the volumetric counterpart to BM3D and expects a single 3D
+        volume. To apply BM4D to 4D-STEM data, unfold the 4D tensor to a 3D
+        representation with ``HyperData.denoise(..., unfold_domain=...)``.
+
+        Parameters
+        ----------
+        target_data : ndarray
+            Three-dimensional volume to denoise.
+        sigma_psd : float or ndarray, optional
+            Noise standard deviation or noise power spectral density passed to
+            ``bm4d.bm4d``. If omitted, a scalar Gaussian noise level is
+            estimated from the volume.
+        stage : {'all', 'hard', 'wiener'} or BM4DStages value, optional
+            BM4D stage to run.
+        profile : str or BM4DProfile, optional
+            BM4D profile passed through to the external package.
+        clip_output : bool, optional
+            If True, clip the denoised volume to the min/max range of the
+            input volume.
+        **kwargs
+            Additional keyword arguments passed to ``bm4d.bm4d``.
+
+        Returns
+        -------
+        ndarray
+            Denoised volume with the same shape as the input.
+        """
+        try:
+            import bm4d as bm4d_module
+        except ImportError as exc:
+            raise ImportError(
+                "The BM4D denoising method requires the optional 'bm4d' "
+                "package. Install it with `pip install bm4d` in the active "
+                "environment, then rerun denoise(method='bm4d', ...)."
+            ) from exc
+
+        data = np.asarray(target_data)
+        if data.ndim != 3:
+            raise ValueError(
+                "bm4d expects a single 3D volume. For 4D-STEM data, use "
+                "unfold_domain to convert the tensor to 3D before denoising. "
+                f"Got shape {data.shape}."
+            )
+        if np.iscomplexobj(data):
+            raise TypeError("bm4d requires real-valued data.")
+        if not np.all(np.isfinite(data)):
+            raise ValueError("bm4d requires finite input values.")
+        if not isinstance(clip_output, (bool, np.bool_)):
+            raise ValueError("clip_output must be a boolean.")
+
+        stage_arg = self._resolve_bm_stage(
+            bm4d_module,
+            stage,
+            'BM4DStages',
+        )
+        volume_sigma = (
+            self._estimate_noise_sigma(data)
+            if sigma_psd is None
+            else sigma_psd
+        )
+
+        result = bm4d_module.bm4d(
+            data.astype(np.result_type(data.dtype, np.float32), copy=False),
+            volume_sigma,
+            profile=profile,
+            stage_arg=stage_arg,
+            **kwargs,
+        )
+        if isinstance(result, tuple):
+            result = result[0]
+        result = np.asarray(result)
+        if result.shape != data.shape:
+            raise ValueError(
+                "bm4d changed volume shape from "
+                f"{data.shape} to {result.shape}; 4Denoise expects "
+                "shape-preserving denoising methods."
+            )
+        if clip_output:
+            result = np.clip(result, np.min(data), np.max(data))
+
+        return result
 
 
     # Successfully tested on 2D data
@@ -12981,19 +14849,7 @@ class _DenoisingMethods:
     #     """
         
     #     return clip_values(filtered_data) 
-    
-    # # 
-    # def block_matching(self, other):
-    #     """
-    #     Block-matching and 3D/4D Filtering (BM3D or BM4D)
-        
-    #     Input data must be two- or three-dimensional.
-        
-    #     Based on [reference]
-    #     """
-        
-    #     return filtered_data
-        
+            
 #%%
 
 class _DenoiseEngine:
