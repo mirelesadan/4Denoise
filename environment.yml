@@ -18,8 +18,8 @@ dependencies:
   - pip:
       # Headless OpenCV avoids Qt/X11 dependencies on compute nodes.
       - opencv-python-headless==4.10.*
-      - tensorly==0.9.*
       - py4dstem==0.14.18
       - ncempy==1.11.1
       - emdfile==0.0.16
       - matplotlib-scalebar==0.9.0
+      - tensorly==0.9.*
