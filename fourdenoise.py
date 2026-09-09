@@ -60,6 +60,7 @@ from skimage import feature
 from skimage.restoration import denoise_nl_means, estimate_sigma, denoise_tv_chambolle
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
 
 import cv2
 import inspect
@@ -5231,10 +5232,12 @@ class HyperData:
         method : str
             Name of a method available in ``available_denoising_methods``.
         domain : {'real', 'reciprocal'} or None, optional
-            Coordinate domain used for slice-wise denoising of 4D data.
-            ``'real'`` applies the method to each real-space image and
-            ``'reciprocal'`` applies it to each diffraction pattern. Use
-            ``domain=None`` to apply the method directly to the whole array.
+            Coordinate domain used for denoising 4D data. ``'real'`` selects
+            axes 0 and 1, while ``'reciprocal'`` selects axes 2 and 3.
+            Axis-aware methods such as ``median`` operate on those axes in one
+            whole-array call; methods that require individual 2D images remain
+            slice-wise. Use ``domain=None`` to apply a method directly to the
+            whole array.
             For 2D and 3D data, methods are applied directly to the whole
             array regardless of domain.
         unfold_domain : {'real', 'reciprocal', 'both'} or None, optional
@@ -5601,7 +5604,7 @@ class HyperData:
         )
     
     
-    def alignment(self, r_center=5, iterations=1, returnStats=False,
+    def alignment(self, r_center=5, iterations=1,
                   center=None, method='com', search_radius=None,
                   enforce_square=False, fit_radius=False, radius_range=None,
                   radius_step=1, radius_operation='mean',
@@ -5616,11 +5619,10 @@ class HyperData:
         r_center : float
             Radius of the central peak or disk in pixels.
         iterations : int
-            Number of iterations for the center-of-mass method. Ignored for
-            the disk-template method.
-        returnStats : bool
-            If True, return the aligned dataset, mean center, and center
-            standard deviation.
+            Number of alignment refinement passes. For ``method='disk'`` or
+            ``method='template'``, the first pass crops and aligns to a common
+            output shape; additional passes re-fit the center on the aligned
+            stack and apply residual subpixel shifts.
         center : tuple or None
             Approximate reference disk center ``(ky, kx)``. Defaults to the
             geometric k-space center ``((ky - 1)/2, (kx - 1)/2)``. When
@@ -5706,6 +5708,12 @@ class HyperData:
                 "radius_reference_dp is only valid with method='disk' or "
                 "method='template'."
             )
+        try:
+            iterations = int(iterations)
+        except (TypeError, ValueError):
+            raise ValueError("iterations must be a positive integer.")
+        if iterations < 1:
+            raise ValueError("iterations must be a positive integer.")
 
         y, x, ky, kx = self.shape
         if center is None:
@@ -5829,16 +5837,19 @@ class HyperData:
                 raise ValueError("radius_range must contain positive radii.")
             return radii
 
-        def _search_bounds(center_value, search_radius_value, radius):
+        def _search_bounds(center_value, search_radius_value, radius, shape=None):
+            if shape is None:
+                shape = (ky, kx)
+            shape_y, shape_x = tuple(int(v) for v in shape)
             if search_radius_value is None:
-                return 0, ky, 0, kx
+                return 0, shape_y, 0, shape_x
 
             cy, cx = tuple(float(v) for v in center_value)
             search_extent = float(search_radius_value) + int(np.ceil(radius)) + 2
             y0 = max(0, int(np.floor(cy - search_extent)))
-            y1 = min(ky, int(np.ceil(cy + search_extent)) + 1)
+            y1 = min(shape_y, int(np.ceil(cy + search_extent)) + 1)
             x0 = max(0, int(np.floor(cx - search_extent)))
-            x1 = min(kx, int(np.ceil(cx + search_extent)) + 1)
+            x1 = min(shape_x, int(np.ceil(cx + search_extent)) + 1)
 
             if y0 >= y1 or x0 >= x1:
                 raise ValueError(
@@ -5867,6 +5878,10 @@ class HyperData:
                                     center_value=None, template=None):
             if center_value is None:
                 center_value = (center_y, center_x)
+            dp = np.asarray(dp)
+            if dp.ndim != 2:
+                raise ValueError("Template matching requires a 2D diffraction pattern.")
+            pattern_ky, pattern_kx = dp.shape
 
             if template is None:
                 template = _alignment_template(radius)
@@ -5876,6 +5891,7 @@ class HyperData:
                 center_value,
                 search_radius_value,
                 template_extent,
+                shape=(pattern_ky, pattern_kx),
             )
             dp_region = np.asarray(dp[y0:y1, x0:x1], dtype=float)
             corr_region = _normalized_template_correlation(dp_region, template)
@@ -5899,7 +5915,7 @@ class HyperData:
             )
             max_idx = (local_max_idx[0] + y0, local_max_idx[1] + x0)
 
-            corr = np.full((ky, kx), -np.inf, dtype=float)
+            corr = np.full((pattern_ky, pattern_kx), -np.inf, dtype=float)
             corr[y0:y1, x0:x1] = corr_region
             return corr, max_idx, corr[max_idx]
 
@@ -5961,6 +5977,7 @@ class HyperData:
         def _fit_disk_centers(array, reference_center):
             fit_y = np.zeros((y, x), dtype=float)
             fit_x = np.zeros_like(fit_y)
+            pattern_ky, pattern_kx = array.shape[-2:]
 
             pattern_search_radius = search_radius
             center_template = _alignment_template(effective_r_center)
@@ -5978,14 +5995,14 @@ class HyperData:
 
                     refine_radius = max(2, int(np.ceil(effective_r_center / 4)))
                     y0 = max(0, max_idx[0] - refine_radius)
-                    y1 = min(ky, max_idx[0] + refine_radius + 1)
+                    y1 = min(pattern_ky, max_idx[0] + refine_radius + 1)
                     x0 = max(0, max_idx[1] - refine_radius)
-                    x1 = min(kx, max_idx[1] + refine_radius + 1)
+                    x1 = min(pattern_kx, max_idx[1] + refine_radius + 1)
                     patch = corr[y0:y1, x0:x1]
                     finite_mask = np.isfinite(patch)
                     if not np.any(finite_mask):
-                        fit_y[i, j] = np.clip(center_y, 0, ky - 1)
-                        fit_x[i, j] = np.clip(center_x, 0, kx - 1)
+                        fit_y[i, j] = np.clip(reference_center[0], 0, pattern_ky - 1)
+                        fit_x[i, j] = np.clip(reference_center[1], 0, pattern_kx - 1)
                         continue
 
                     finite_patch = np.where(finite_mask, patch, np.nan)
@@ -6039,6 +6056,29 @@ class HyperData:
                 start = axis_size - output_size
             return int(start), int(end)
 
+        def _shift_disk_centers_to_target(array, fit_y, fit_x, target_center,
+                                          desc):
+            target_y, target_x = tuple(float(v) for v in target_center)
+            pattern_ky, pattern_kx = array.shape[-2:]
+            shifted = np.zeros(
+                array.shape,
+                dtype=np.result_type(array.dtype, np.float64),
+            )
+            for i in tqdm(range(y), desc=desc):
+                for j in range(x):
+                    shift_y = target_y - fit_y[i, j]
+                    shift_x = target_x - fit_x[i, j]
+                    afine_tf = transform.AffineTransform(
+                        translation=(shift_x, shift_y)
+                    )
+                    shifted[i, j] = transform.warp(
+                        array[i, j],
+                        inverse_map=afine_tf.inverse,
+                        output_shape=(pattern_ky, pattern_kx),
+                        preserve_range=True,
+                    )
+            return shifted
+
         radius_fit_requested = bool(
             fit_radius
             or radius_range is not None
@@ -6064,10 +6104,10 @@ class HyperData:
                 )
 
             fit_y, fit_x = _fit_disk_centers(self.array, reference_center)
-            std_center = (np.std(fit_y), np.std(fit_x))
-            mean_center = (np.mean(fit_y), np.mean(fit_x))
-            print(f'Initial disk-center standard deviation (ky, kx): ({std_center[0]:.4f}, {std_center[1]:.4f})')
-            print(f'Initial disk center (ky, kx): ({mean_center[0]:.4f}, {mean_center[1]:.4f})')
+            initial_std_center = (np.std(fit_y), np.std(fit_x))
+            initial_mean_center = (np.mean(fit_y), np.mean(fit_x))
+            print(f'Initial disk-center standard deviation (ky, kx): ({initial_std_center[0]:.4f}, {initial_std_center[1]:.4f})')
+            print(f'Initial disk center (ky, kx): ({initial_mean_center[0]:.4f}, {initial_mean_center[1]:.4f})')
 
             out_ky, out_kx = _common_centered_crop_shape(fit_y, fit_x)
             target_y, target_x = (out_ky - 1) / 2, (out_kx - 1) / 2
@@ -6096,6 +6136,35 @@ class HyperData:
                         preserve_range=True,
                     )
 
+            target_center = (target_y, target_x)
+            for idx in range(1, iterations):
+                fit_y, fit_x = _fit_disk_centers(aligned, target_center)
+                iter_std_center = (np.std(fit_y), np.std(fit_x))
+                iter_mean_center = (np.mean(fit_y), np.mean(fit_x))
+                print(
+                    f'Disk-center residual before iteration ({idx+1}/{iterations}) '
+                    f'standard deviation (ky, kx): '
+                    f'({iter_std_center[0]:.4f}, {iter_std_center[1]:.4f})'
+                )
+                print(
+                    f'Disk center before iteration ({idx+1}/{iterations}) '
+                    f'(ky, kx): ({iter_mean_center[0]:.4f}, '
+                    f'{iter_mean_center[1]:.4f})'
+                )
+                aligned = _shift_disk_centers_to_target(
+                    aligned,
+                    fit_y,
+                    fit_x,
+                    target_center,
+                    desc=f'Affine-aligning disk residuals ({idx+1}/{iterations})',
+                )
+
+            final_fit_y, final_fit_x = _fit_disk_centers(aligned, target_center)
+            final_std_center = (np.std(final_fit_y), np.std(final_fit_x))
+            final_mean_center = (np.mean(final_fit_y), np.mean(final_fit_x))
+            print(f'Final disk-center standard deviation (ky, kx): ({final_std_center[0]:.4f}, {final_std_center[1]:.4f})')
+            print(f'Final disk center (ky, kx): ({final_mean_center[0]:.4f}, {final_mean_center[1]:.4f})')
+
             aligned_obj = self._spawn(
                 aligned,
                 reciprocal_units=self.reciprocal_units,
@@ -6103,18 +6172,22 @@ class HyperData:
             )
             aligned_obj.center_beam_metadata = _center_beam_metadata_from_pixels(
                 effective_r_center,
-                (target_y, target_x),
+                final_mean_center,
                 (out_ky, out_kx),
                 units=self.reciprocal_units,
                 conv_factor=self.reciprocal_conv_factor,
                 source='alignment',
                 alignment_method='disk',
                 template=template,
+                iterations=iterations,
                 radius_fit_requested=radius_fit_requested,
                 radius_score=radius_score,
                 reference_center_px=reference_center,
-                mean_fit_center_px=mean_center,
-                std_fit_center_px=std_center,
+                target_center_px=target_center,
+                initial_mean_fit_center_px=initial_mean_center,
+                initial_std_fit_center_px=initial_std_center,
+                mean_fit_center_px=final_mean_center,
+                std_fit_center_px=final_std_center,
                 original_reciprocal_shape=(ky, kx),
                 output_reciprocal_shape=(out_ky, out_kx),
                 search_radius_px=search_radius,
@@ -6126,18 +6199,18 @@ class HyperData:
                 radius_step=radius_step,
             )
 
-            if returnStats:
-                return aligned_obj, mean_center, std_center
             return aligned_obj
 
         com_y, com_x = self._quickCOM(r_mask=r_center, center=center) 
         cbed_tran = np.copy(self.array)
         cbed_tran_Obj = self._spawn(cbed_tran)
-        std_com = (np.std(com_y), np.std(com_x))
-        mean_com = (np.mean(com_y), np.mean(com_x))
+        initial_std_com = (np.std(com_y), np.std(com_x))
+        initial_mean_com = (np.mean(com_y), np.mean(com_x))
+        std_com = initial_std_com
+        mean_com = initial_mean_com
         
-        print(f'Initial standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
-        print(f'Initial COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+        print(f'Initial COM standard deviation (ky, kx): ({initial_std_com[0]:.4f}, {initial_std_com[1]:.4f})')
+        print(f'Initial COM (ky, kx): ({initial_mean_com[0]:.4f}, {initial_mean_com[1]:.4f})')
         
         for idx in range(iterations):
             print()
@@ -6164,8 +6237,11 @@ class HyperData:
             std_com = (np.std(com_y), np.std(com_x))
             mean_com = (np.mean(com_y), np.mean(com_x))
             
-            print(f'Standard deviation statistics (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
-            print(f'COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+            print(f'Iteration {idx+1} COM standard deviation (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
+            print(f'Iteration {idx+1} COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
+
+        print(f'Final COM standard deviation (ky, kx): ({std_com[0]:.4f}, {std_com[1]:.4f})')
+        print(f'Final COM (ky, kx): ({mean_com[0]:.4f}, {mean_com[1]:.4f})')
 
         cbed_tran_Obj.center_beam_metadata = _center_beam_metadata_from_pixels(
             r_center,
@@ -6176,14 +6252,13 @@ class HyperData:
             source='alignment',
             alignment_method='com',
             iterations=iterations,
+            initial_mean_fit_center_px=initial_mean_com,
+            initial_std_fit_center_px=initial_std_com,
             mean_fit_center_px=mean_com,
             std_fit_center_px=std_com,
         )
         
-        if returnStats:
-            return cbed_tran_Obj, mean_com, std_com
-        else:
-            return cbed_tran_Obj
+        return cbed_tran_Obj
     
     def rotate_dps(self, angle, units='deg', order=3):
         """
@@ -7257,7 +7332,8 @@ class HyperData:
         numpy.ndarray
             The corrected diffraction pattern.
         """
-        cols, rows = image.shape
+        # NumPy shape is (rows, cols); OpenCV points/sizes use (x, y)/(width, height).
+        rows, cols = image.shape
         
         # Points in the original image
         p1 = np.float32([
@@ -7685,7 +7761,7 @@ class HyperData:
         return fig, ax
 
     def get_dp(self, y=None, x=None, mask=None, operation=None,
-               selection_units='auto', **flat_kwargs):
+               selection_units='pixels', **flat_kwargs):
         """
         Obtain a diffraction pattern from a 3D/4D dataset, either at a
         specific point, averaged over a specified region, or via a special operation.
@@ -7710,10 +7786,11 @@ class HyperData:
             - 'random' : return a single randomly selected diffraction pattern.
             - 'flat_mean' : special two-step operation based on radial masking
               and a flat-field style threshold (see implementation).
-        selection_units : {'auto', 'pixels', 'calibrated'}, optional
+        selection_units : {'pixels', 'calibrated', 'auto'}, optional
             Unit system used to interpret ``y`` and ``x`` for 4D data.
-            ``'auto'`` uses the stored real-space calibration when available
-            and otherwise falls back to pixel indices.
+            Defaults to ``'pixels'`` so scalar calls such as ``get_dp(i, j)``
+            always select scan indices, even when real-space calibration is
+            stored. Use ``'calibrated'`` to select using real-space units.
     
         Returns
         -------
@@ -7729,6 +7806,15 @@ class HyperData:
             'random': 'random',
             'flat_mean': None,
         }
+
+        if (
+            isinstance(y, str)
+            and x is None
+            and operation is None
+            and y in operations
+        ):
+            operation = y
+            y = None
     
         # Default operation is mean
         if operation is None:
@@ -8594,7 +8680,7 @@ class HyperData:
                             row.append(c)
                             continue
     
-                        dp = self.get_dp(i, j)
+                        dp = self.get_dp(i, j, selection_units='pixels')
                         c = dp.get_centers(r=r,
                                            ref_coords=coords_ij,
                                            show=False,
@@ -8613,7 +8699,7 @@ class HyperData:
                     # If masked out, leave zeros and skip
                     if real_mask is not None and not real_mask[i, j]:
                         continue
-                    dp = self.get_dp(i, j)
+                    dp = self.get_dp(i, j, selection_units='pixels')
                     all_centers[i, j] = dp.get_centers(r=r,
                                                        ref_coords=coords,
                                                        show=False,
@@ -8772,7 +8858,7 @@ class HyperData:
                                 row_ints.append(np.zeros(dp_centers.shape[0], dtype=float))
                             continue
     
-                        dp = self.get_dp(i, j)
+                        dp = self.get_dp(i, j, selection_units='pixels')
                         row_ints.append(compute_dp_int(dp, dp_centers))
                     all_ints.append(row_ints)
                 return all_ints
@@ -8788,7 +8874,7 @@ class HyperData:
                         if real_mask is not None and not real_mask[i, j]:
                             continue
                         dp_centers = centers_arr[i, j]  # (n_peaks, 2)
-                        dp = self.get_dp(i, j)
+                        dp = self.get_dp(i, j, selection_units='pixels')
                         all_ints[i, j, :] = compute_dp_int(dp, dp_centers)
                 return all_ints
     
@@ -8843,7 +8929,7 @@ class HyperData:
         for i in tqdm(range(Ny), desc="Computing residual backgrounds"):
             for j in range(Nx):
                 
-                dp = self.get_dp(i, j)
+                dp = self.get_dp(i, j, selection_units='pixels')
                 residual_Bgs[i, j] = dp.get_residualBg(centers=centers[i,j], **resBg_kwargs)
 
                 # if compute_resBg:
@@ -8856,9 +8942,16 @@ class HyperData:
     #TODO: return as RealSpace object and add a `.show`  
     def get_strains(self, centers=None, ref_centers=None, ang=0, g_vector=None,
                     r_CoM=None, r_inner=None, r_outer=None, intensity_array=None,
-                    intensity_percentile=None, ewpc=False, match_peaks='auto',
+                    intensity_percentile=None, intensity_clip='both',
+                    real_mask=None, ewpc=False, match_peaks='auto',
                     fit_translation=False, min_peak_pairs=2,
-                    return_transform=False):
+                    return_transform=False, center=None,
+                    reject_peak_outliers=False, outlier_threshold=3.5,
+                    outlier_min_peak_pairs=None, outlier_min_peak_fraction=None,
+                    outlier_max_iterations=2,
+                    outlier_space='radial_angular',
+                    outlier_method='auto_mixture',
+                    outlier_bic_delta=0.0):
         """
         Calculate strain and rotation maps from Bragg peak centers.
 
@@ -8893,9 +8986,20 @@ class HyperData:
             peaks and used in the least-squares fit.
         intensity_percentile : float or None, optional
             If supplied with ``intensity_array``, discard measured peaks with
-            intensities below this local percentile before matching and fitting.
-            For example, ``intensity_percentile=20`` removes the weakest 20% of
-            finite measured peaks in each diffraction pattern.
+            local outlier intensities before matching and fitting. With the
+            default ``intensity_clip='both'``, the percentile is split evenly
+            between tails, so ``intensity_percentile=10`` removes the lowest
+            5% and highest 5% of finite measured peaks in each diffraction
+            pattern.
+        intensity_clip : {'both', 'lower', 'upper'}, optional
+            Which intensity tail(s) to clip when ``intensity_percentile`` is
+            supplied. ``'lower'`` clips only weak peaks, ``'upper'`` clips only
+            bright outliers, and ``'both'`` clips both tails.
+        real_mask : ndarray[bool] or None, optional
+            Only used for 4D scan-shaped centers. Boolean mask of shape
+            ``(Ry, Rx)`` defining which real-space positions should have strain
+            computed. Masked-out positions remain NaN in strain/transform maps
+            and have zero match counts.
         ewpc : bool, optional
             If True, invert the fitted reciprocal-space transform before
             extracting strain.
@@ -8903,13 +9007,63 @@ class HyperData:
             ``'auto'`` preserves peak order when both sets have the same number
             of peaks and uses nearest assignment otherwise.
         fit_translation : bool, optional
-            If True, fit and remove a translation term so detector shifts are
-            not interpreted as strain.
+            If True, fit and remove an additional translation term after
+            subtracting ``center`` so detector shifts are not interpreted as
+            strain.
         min_peak_pairs : int, optional
             Minimum number of matched peak pairs required to fit a transform.
         return_transform : bool, optional
             If True, also return fitted transforms, translations, and match
             counts.
+        center : array-like of shape (2,) or None, optional
+            Reciprocal-space origin ``(ky, kx)`` about which peak displacements
+            are measured before fitting strain. If None, this defaults to
+            ``self.center_beam_metadata['mean_fit_center_px']`` when available.
+            If that metadata is unavailable, it falls back to the finite mean
+            coordinate of ``ref_centers`` when a reference is supplied, or to
+            the finite absolute mean coordinate of all peaks in ``centers``
+            when ``ref_centers`` is None.
+        reject_peak_outliers : bool, optional
+            If True, reject matched measured peaks that are poorly explained
+            by the fitted strain transform. Rejection is performed after an
+            initial transform fit and before the final strain fit.
+        outlier_threshold : float, optional
+            Robust z-score threshold used only when
+            ``outlier_method='robust_zscore'``. With
+            ``outlier_space='radial_angular'``, radial and angular residual
+            z-scores are combined as a Euclidean score.
+        outlier_min_peak_pairs : int or None, optional
+            Minimum number of matched peak pairs required to attempt outlier
+            rejection and the minimum number of pairs that must remain after
+            rejection. If rejecting a candidate set would leave fewer pairs,
+            only the most extreme candidates are rejected. The default of 4
+            lets a six-peak pattern drop up to two outlier peaks while keeping
+            enough peaks for a stable 2D transform fit. Mutually exclusive
+            with ``outlier_min_peak_fraction``.
+        outlier_min_peak_fraction : float or None, optional
+            Alternative to ``outlier_min_peak_pairs``. If supplied, the local
+            outlier minimum is ``ceil(fraction * n_reference_peaks)`` for each
+            diffraction pattern, with a floor of 2 pairs. For example, ``0.5``
+            requires half the local reference peak count to remain.
+        outlier_max_iterations : int, optional
+            Maximum number of initial-fit/reject cycles before the final fit.
+        outlier_space : {'radial_angular', 'cartesian', 'distance'}, optional
+            Residual coordinate system used for robust z-score outlier
+            detection. The
+            ``'radial_angular'`` mode resolves residuals into radial and
+            tangential components relative to ``center`` and normalizes by
+            peak radius.
+        outlier_method : {'auto_mixture', 'robust_zscore'}, optional
+            Peak-rejection strategy. ``'auto_mixture'`` fits the strain
+            transform first, models the post-fit residual distances as either
+            one population or two populations using BIC, and rejects the
+            high-residual population only when the two-population model is
+            preferred. ``'robust_zscore'`` uses ``outlier_threshold``.
+        outlier_bic_delta : float, optional
+            Extra BIC margin required before the automatic mixture method
+            accepts a two-population residual model. The default ``0`` uses
+            the standard BIC preference. Larger values make automatic
+            rejection more conservative.
 
         Returns
         -------
@@ -8991,6 +9145,72 @@ class HyperData:
             valid = np.isfinite(peaks).all(axis=1)
             return peaks[valid], np.flatnonzero(valid)
 
+        def _mean_peak_coordinate(peak_data, mask=None):
+            coord_sets = []
+            mask_array = None if mask is None else np.asarray(mask)
+
+            if _is_sequence_of_sequences(peak_data):
+                for i, row in enumerate(peak_data):
+                    for j, peaks in enumerate(row):
+                        if (
+                            mask_array is not None
+                            and mask_array.shape == (len(peak_data), len(row))
+                            and not mask_array[i, j]
+                        ):
+                            continue
+                        clean_peaks, _ = _clean_peak_set(peaks)
+                        if clean_peaks.size:
+                            coord_sets.append(clean_peaks)
+            elif isinstance(peak_data, list):
+                for i, peaks in enumerate(peak_data):
+                    if (
+                        mask_array is not None
+                        and mask_array.shape == (len(peak_data),)
+                        and not mask_array[i]
+                    ):
+                        continue
+                    clean_peaks, _ = _clean_peak_set(peaks)
+                    if clean_peaks.size:
+                        coord_sets.append(clean_peaks)
+            else:
+                peak_array = np.asarray(peak_data, dtype=float)
+                if peak_array.size == 0:
+                    raise ValueError("Cannot infer center from an empty peak set.")
+                if peak_array.shape[-1] != 2:
+                    raise ValueError("Peak coordinates must end with a length-2 axis.")
+                if (
+                    mask_array is not None
+                    and peak_array.ndim > mask_array.ndim
+                    and peak_array.shape[:mask_array.ndim] == mask_array.shape
+                ):
+                    peak_array = peak_array[mask_array]
+                clean_peaks, _ = _clean_peak_set(peak_array)
+                if clean_peaks.size:
+                    coord_sets.append(clean_peaks)
+
+            if not coord_sets:
+                raise ValueError("Cannot infer center from non-finite or empty peaks.")
+
+            return np.mean(np.vstack(coord_sets), axis=0)
+
+        def _validate_strain_center(center_value):
+            center_array = np.asarray(center_value, dtype=float)
+            if center_array.shape != (2,) or not np.isfinite(center_array).all():
+                raise ValueError("center must be a finite coordinate pair (ky, kx).")
+            return center_array
+
+        def _metadata_strain_center():
+            metadata = self.center_beam_metadata
+            if not isinstance(metadata, dict) or 'mean_fit_center_px' not in metadata:
+                return None
+            try:
+                return _validate_strain_center(metadata['mean_fit_center_px'])
+            except ValueError as exc:
+                raise ValueError(
+                    "center_beam_metadata['mean_fit_center_px'] must be a "
+                    "finite coordinate pair (ky, kx)."
+                ) from exc
+
         def _weights_for_valid_measured(weights, meas_valid_idx):
             if weights is None:
                 return None
@@ -9005,6 +9225,26 @@ class HyperData:
                 return weights[meas_valid_idx]
             return None
 
+        def _intensity_keep_mask(weights):
+            finite_weights = np.isfinite(weights)
+            if not np.any(finite_weights):
+                return finite_weights
+
+            finite_values = weights[finite_weights]
+            if intensity_clip == 'both':
+                tail_percentile = intensity_percentile / 2.0
+                lower = np.percentile(finite_values, tail_percentile)
+                upper = np.percentile(finite_values, 100.0 - tail_percentile)
+                return finite_weights & (weights >= lower) & (weights <= upper)
+            if intensity_clip == 'lower':
+                lower = np.percentile(finite_values, intensity_percentile)
+                return finite_weights & (weights >= lower)
+            if intensity_clip == 'upper':
+                upper = np.percentile(finite_values, 100.0 - intensity_percentile)
+                return finite_weights & (weights <= upper)
+
+            raise ValueError("intensity_clip must be 'both', 'lower', or 'upper'.")
+
         def _match_peak_sets(reference, measured, weights=None):
             reference, ref_valid_idx = _clean_peak_set(reference)
             measured, meas_valid_idx = _clean_peak_set(measured)
@@ -9016,15 +9256,10 @@ class HyperData:
                         "intensity_percentile requires intensity_array values "
                         "that match the measured peaks in centers."
                     )
-                finite_weights = np.isfinite(measured_weights)
-                if not np.any(finite_weights):
+                keep = _intensity_keep_mask(measured_weights)
+                if not np.any(keep):
                     return None, None, None, None, None
 
-                threshold = np.percentile(
-                    measured_weights[finite_weights],
-                    intensity_percentile,
-                )
-                keep = finite_weights & (measured_weights >= threshold)
                 measured = measured[keep]
                 meas_valid_idx = meas_valid_idx[keep]
                 measured_weights = measured_weights[keep]
@@ -9060,7 +9295,10 @@ class HyperData:
                 meas_valid_idx[meas_idx],
             )
 
-        def _fit_peak_transform(reference, measured, weights=None):
+        def _fit_peak_transform(reference, measured, strain_center, weights=None):
+            reference = reference - strain_center
+            measured = measured - strain_center
+
             if weights is not None:
                 weights = np.asarray(weights, dtype=float)
                 weights = np.where(np.isfinite(weights), weights, 0)
@@ -9096,6 +9334,274 @@ class HyperData:
             translation = measured_origin - ref_origin @ coeffs
             return transform_matrix, translation
 
+        def _robust_zscore(values):
+            values = np.asarray(values, dtype=float)
+            z = np.full(values.shape, np.inf, dtype=float)
+            finite = np.isfinite(values)
+            if not np.any(finite):
+                return z
+
+            finite_values = values[finite]
+            median = np.median(finite_values)
+            deviation = np.abs(finite_values - median)
+            scale = 1.4826 * np.median(deviation)
+            if scale <= np.finfo(float).eps:
+                z[finite] = 0.0
+                z[np.flatnonzero(finite)[deviation > np.finfo(float).eps]] = np.inf
+                return z
+
+            z[finite] = np.abs(values[finite] - median) / scale
+            return z
+
+        def _peak_residual_vectors(reference, measured, transform_matrix,
+                                   translation, strain_center):
+            reference_centered = reference - strain_center
+            measured_centered = measured - strain_center
+            predicted = reference_centered @ transform_matrix.T + translation
+            return measured_centered - predicted
+
+        def _peak_residual_distances(reference, measured, transform_matrix,
+                                     translation, strain_center):
+            residual = _peak_residual_vectors(
+                reference,
+                measured,
+                transform_matrix,
+                translation,
+                strain_center,
+            )
+            return np.linalg.norm(residual, axis=1)
+
+        def _peak_outlier_scores(reference, measured, transform_matrix,
+                                 translation, strain_center):
+            reference_centered = reference - strain_center
+            residual = _peak_residual_vectors(
+                reference,
+                measured,
+                transform_matrix,
+                translation,
+                strain_center,
+            )
+
+            if outlier_space == 'radial_angular':
+                radii = np.linalg.norm(reference_centered, axis=1)
+                safe_radii = np.where(radii > np.finfo(float).eps, radii, 1.0)
+                radial_unit = np.divide(
+                    reference_centered,
+                    safe_radii[:, np.newaxis],
+                    out=np.zeros_like(reference_centered, dtype=float),
+                    where=safe_radii[:, np.newaxis] > 0,
+                )
+                tangential_unit = np.column_stack(
+                    (-radial_unit[:, 1], radial_unit[:, 0])
+                )
+                radial_residual = np.sum(residual * radial_unit, axis=1) / safe_radii
+                angular_residual = np.sum(residual * tangential_unit, axis=1) / safe_radii
+                radial_z = _robust_zscore(radial_residual)
+                angular_z = _robust_zscore(angular_residual)
+                score = np.hypot(radial_z, angular_z)
+            elif outlier_space == 'cartesian':
+                y_z = _robust_zscore(residual[:, 0])
+                x_z = _robust_zscore(residual[:, 1])
+                score = np.hypot(y_z, x_z)
+            elif outlier_space == 'distance':
+                score = _robust_zscore(np.linalg.norm(residual, axis=1))
+            else:
+                raise ValueError(
+                    "outlier_space must be 'radial_angular', 'cartesian', "
+                    "or 'distance'."
+                )
+
+            return score
+
+        def _auto_mixture_outlier_mask(reference, measured, transform_matrix,
+                                       translation, strain_center):
+            residual_distances = _peak_residual_distances(
+                reference,
+                measured,
+                transform_matrix,
+                translation,
+                strain_center,
+            )
+            probabilities = np.full(residual_distances.shape, np.nan, dtype=float)
+            model_info = {
+                'method': 'auto_mixture',
+                'accepted_two_component_model': False,
+                'bic_one_component': np.nan,
+                'bic_two_component': np.nan,
+                'low_residual_log_mean': np.nan,
+                'high_residual_log_mean': np.nan,
+            }
+            reject = np.zeros(residual_distances.shape, dtype=bool)
+
+            finite = np.isfinite(residual_distances)
+            if np.count_nonzero(finite) < 2:
+                return reject, residual_distances, probabilities, model_info
+
+            finite_distances = residual_distances[finite]
+            if np.ptp(finite_distances) <= np.finfo(float).eps:
+                return reject, residual_distances, probabilities, model_info
+
+            eps = max(np.finfo(float).eps, np.nanmedian(finite_distances) * 1e-12)
+            log_distances = np.log10(np.maximum(finite_distances, eps))
+            if np.unique(log_distances).size < 2:
+                return reject, residual_distances, probabilities, model_info
+
+            values = log_distances.reshape(-1, 1)
+            low_start, high_start = np.percentile(log_distances, [25, 90])
+            if high_start <= low_start:
+                low_start, high_start = np.min(log_distances), np.max(log_distances)
+
+            one_component = GaussianMixture(
+                n_components=1,
+                covariance_type='full',
+                reg_covar=1e-9,
+                random_state=0,
+                init_params='random',
+                n_init=1,
+            )
+            two_component = GaussianMixture(
+                n_components=2,
+                covariance_type='full',
+                reg_covar=1e-9,
+                random_state=0,
+                init_params='random',
+                means_init=np.array([[low_start], [high_start]]),
+                weights_init=np.array([0.8, 0.2]),
+                n_init=1,
+            )
+            try:
+                one_component.fit(values)
+                two_component.fit(values)
+            except ValueError:
+                return reject, residual_distances, probabilities, model_info
+
+            bic_one = one_component.bic(values)
+            bic_two = two_component.bic(values)
+            model_info['bic_one_component'] = float(bic_one)
+            model_info['bic_two_component'] = float(bic_two)
+            if not np.isfinite(bic_one) or not np.isfinite(bic_two):
+                return reject, residual_distances, probabilities, model_info
+            if bic_two + outlier_bic_delta >= bic_one:
+                return reject, residual_distances, probabilities, model_info
+
+            means = two_component.means_.reshape(-1)
+            high_component = int(np.argmax(means))
+            low_component = int(np.argmin(means))
+            model_info['low_residual_log_mean'] = float(means[low_component])
+            model_info['high_residual_log_mean'] = float(means[high_component])
+
+            labels = two_component.predict(values)
+            high_probabilities = two_component.predict_proba(values)[:, high_component]
+            finite_indices = np.flatnonzero(finite)
+            probabilities[finite_indices] = high_probabilities
+            reject[finite_indices] = labels == high_component
+            model_info['accepted_two_component_model'] = bool(np.any(reject))
+            return reject, residual_distances, probabilities, model_info
+
+        def _resolve_outlier_min_peak_pairs(reference_peak_count):
+            if outlier_min_peak_fraction is None:
+                return outlier_min_peak_pairs
+            return max(
+                2,
+                int(np.ceil(float(reference_peak_count) * outlier_min_peak_fraction)),
+            )
+
+        def _reject_peak_outliers(reference, measured, weights, strain_center,
+                                  local_outlier_min_peak_pairs):
+            keep = np.ones(reference.shape[0], dtype=bool)
+            residual_distances = np.full(reference.shape[0], np.nan, dtype=float)
+            probabilities = np.full(reference.shape[0], np.nan, dtype=float)
+            model_info = {
+                'method': outlier_method,
+                'accepted_two_component_model': False,
+                'bic_one_component': np.nan,
+                'bic_two_component': np.nan,
+            }
+            if (
+                not reject_peak_outliers
+                or reference.shape[0] < local_outlier_min_peak_pairs
+                or outlier_max_iterations <= 0
+            ):
+                return keep, residual_distances, probabilities, model_info
+
+            min_remaining = max(min_peak_pairs, local_outlier_min_peak_pairs)
+            for _ in range(outlier_max_iterations):
+                if np.count_nonzero(keep) < min_remaining:
+                    break
+
+                current_weights = weights[keep] if weights is not None else None
+                transform_matrix, translation = _fit_peak_transform(
+                    reference[keep],
+                    measured[keep],
+                    strain_center,
+                    weights=current_weights,
+                )
+                kept_indices = np.flatnonzero(keep)
+                if outlier_method == 'auto_mixture':
+                    (
+                        local_reject,
+                        local_residual_distances,
+                        local_probabilities,
+                        local_model_info,
+                    ) = _auto_mixture_outlier_mask(
+                        reference[keep],
+                        measured[keep],
+                        transform_matrix,
+                        translation,
+                        strain_center,
+                    )
+                    residual_distances[kept_indices] = local_residual_distances
+                    probabilities[kept_indices] = local_probabilities
+                    model_info = local_model_info
+                else:
+                    scores = _peak_outlier_scores(
+                        reference[keep],
+                        measured[keep],
+                        transform_matrix,
+                        translation,
+                        strain_center,
+                    )
+                    local_residual_distances = _peak_residual_distances(
+                        reference[keep],
+                        measured[keep],
+                        transform_matrix,
+                        translation,
+                        strain_center,
+                    )
+                    residual_distances[kept_indices] = local_residual_distances
+                    local_reject = (~np.isfinite(scores)) | (scores > outlier_threshold)
+
+                if not np.any(local_reject):
+                    break
+
+                available_rejections = np.count_nonzero(keep) - min_remaining
+                if available_rejections <= 0:
+                    break
+
+                reject_candidates = np.flatnonzero(local_reject)
+                if reject_candidates.size > available_rejections:
+                    if outlier_method == 'auto_mixture':
+                        candidate_scores = local_residual_distances[reject_candidates]
+                    else:
+                        candidate_scores = scores[reject_candidates]
+                    candidate_scores = np.where(
+                        np.isfinite(candidate_scores),
+                        candidate_scores,
+                        np.inf,
+                    )
+                    reject_candidates = reject_candidates[
+                        np.argsort(candidate_scores)[-available_rejections:]
+                    ]
+
+                candidate_keep = keep.copy()
+                candidate_keep[np.flatnonzero(keep)[reject_candidates]] = False
+                if np.array_equal(candidate_keep, keep):
+                    break
+                keep = candidate_keep
+
+            return keep, residual_distances, probabilities, model_info
+
+        ref_centers_was_none = ref_centers is None
         if ref_centers is None and centers is None:
             raise ValueError("Either 'ref_centers' or 'centers' must be defined.")
 
@@ -9109,12 +9615,116 @@ class HyperData:
             if not 0 <= intensity_percentile <= 100:
                 raise ValueError("intensity_percentile must be between 0 and 100.")
 
+        if not isinstance(intensity_clip, str):
+            raise ValueError("intensity_clip must be 'both', 'lower', or 'upper'.")
+        intensity_clip = intensity_clip.strip().lower()
+        if intensity_clip not in ('both', 'lower', 'upper'):
+            raise ValueError("intensity_clip must be 'both', 'lower', or 'upper'.")
+
+        reject_peak_outliers = bool(reject_peak_outliers)
+        if not isinstance(outlier_method, str):
+            raise ValueError(
+                "outlier_method must be 'auto_mixture' or 'robust_zscore'."
+            )
+        outlier_method = outlier_method.strip().lower().replace('-', '_')
+        if outlier_method in ('mixture', 'gmm', 'auto_gmm'):
+            outlier_method = 'auto_mixture'
+        if outlier_method in ('zscore', 'z_score', 'robust_z_score'):
+            outlier_method = 'robust_zscore'
+        if outlier_method not in ('auto_mixture', 'robust_zscore'):
+            raise ValueError(
+                "outlier_method must be 'auto_mixture' or 'robust_zscore'."
+            )
+
+        try:
+            outlier_bic_delta = float(outlier_bic_delta)
+        except (TypeError, ValueError):
+            raise ValueError("outlier_bic_delta must be a number.")
+        if not np.isfinite(outlier_bic_delta) or outlier_bic_delta < 0:
+            raise ValueError("outlier_bic_delta must be non-negative and finite.")
+
+        if outlier_method == 'robust_zscore':
+            try:
+                outlier_threshold = float(outlier_threshold)
+            except (TypeError, ValueError):
+                raise ValueError("outlier_threshold must be a number.")
+            if not np.isfinite(outlier_threshold) or outlier_threshold <= 0:
+                raise ValueError("outlier_threshold must be positive and finite.")
+
+        if (
+            outlier_min_peak_pairs is not None
+            and outlier_min_peak_fraction is not None
+        ):
+            raise ValueError(
+                "Define either outlier_min_peak_pairs or "
+                "outlier_min_peak_fraction, not both."
+            )
+
+        if outlier_min_peak_fraction is not None:
+            try:
+                outlier_min_peak_fraction = float(outlier_min_peak_fraction)
+            except (TypeError, ValueError):
+                raise ValueError("outlier_min_peak_fraction must be a number.")
+            if not 0 < outlier_min_peak_fraction <= 1:
+                raise ValueError(
+                    "outlier_min_peak_fraction must be greater than 0 and "
+                    "less than or equal to 1."
+                )
+            outlier_min_peak_mode = 'fraction'
+        else:
+            if outlier_min_peak_pairs is None:
+                outlier_min_peak_pairs = 4
+            outlier_min_peak_pairs = int(outlier_min_peak_pairs)
+            if outlier_min_peak_pairs < 2:
+                raise ValueError("outlier_min_peak_pairs must be at least 2.")
+            outlier_min_peak_mode = 'absolute'
+
+        outlier_max_iterations = int(outlier_max_iterations)
+        if outlier_max_iterations < 0:
+            raise ValueError("outlier_max_iterations must be non-negative.")
+
+        if not isinstance(outlier_space, str):
+            raise ValueError(
+                "outlier_space must be 'radial_angular', 'cartesian', or 'distance'."
+            )
+        outlier_space = outlier_space.strip().lower().replace('-', '_')
+        if outlier_space not in ('radial_angular', 'cartesian', 'distance'):
+            raise ValueError(
+                "outlier_space must be 'radial_angular', 'cartesian', or 'distance'."
+            )
+
         if centers is None:
             centers = self.get_centers(
                 r=r_CoM,
                 ref_coords=_reference_for_center_finding(ref_centers),
                 method='CoM',
+                real_mask=real_mask,
             )
+
+        ydim, xdim, squeezed_scan = _infer_scan_shape(centers)
+        if real_mask is not None:
+            if self.ndim != 4 or squeezed_scan:
+                raise ValueError(
+                    "real_mask is only supported for 4D scan-shaped centers."
+                )
+            real_mask = np.asarray(real_mask)
+            if real_mask.shape != (ydim, xdim):
+                raise ValueError(
+                    f"real_mask must have shape (Ry, Rx) = {(ydim, xdim)}, "
+                    f"got {real_mask.shape}."
+                )
+
+        if center is None:
+            center = _metadata_strain_center()
+            if center is not None:
+                center_source = 'center_beam_metadata.mean_fit_center_px'
+            else:
+                center_source = 'centers' if ref_centers_was_none else 'ref_centers'
+                center_data = centers if ref_centers_was_none else ref_centers
+                center = _mean_peak_coordinate(center_data, mask=real_mask)
+        else:
+            center_source = 'user'
+        center = _validate_strain_center(center)
 
         if ref_centers is None:
             if isinstance(centers, list):
@@ -9130,9 +9740,16 @@ class HyperData:
             mean, flat_mask = mask_and_average(reduced_data.array, return_mask=True, 
                                                function='sum_2d', threshold='upper', 
                                                percentile=5, show_mask=False)
-            ref_centers = np.mean(centers[flat_mask], axis=0)
+            reference_mask = flat_mask
+            if real_mask is not None:
+                reference_mask = reference_mask & real_mask
+            if not np.any(reference_mask):
+                raise ValueError(
+                    "No real-space positions remain for reference-center "
+                    "inference after applying real_mask."
+                )
+            ref_centers = np.mean(centers[reference_mask], axis=0)
 
-        ydim, xdim, squeezed_scan = _infer_scan_shape(centers)
         output_shape = (ydim,) if squeezed_scan else (ydim, xdim)
         ang_rad = np.radians(ang)
         R1 = np.array([[np.cos(ang_rad), np.sin(ang_rad)],
@@ -9145,23 +9762,78 @@ class HyperData:
         transforms = np.full(output_shape + (2, 2), np.nan)
         translations = np.full(output_shape + (2,), np.nan)
         match_counts = np.zeros(output_shape, dtype=int)
+        initial_match_counts = np.zeros(output_shape, dtype=int)
+        outlier_counts = np.zeros(output_shape, dtype=int)
+        resolved_outlier_min_peak_counts = np.zeros(output_shape, dtype=int)
+        peak_outlier_masks = None
+        outlier_ref_indices = None
+        outlier_measured_indices = None
+        peak_residuals = None
+        outlier_probabilities = None
+        outlier_model_info = None
+        if reject_peak_outliers:
+            peak_outlier_masks = np.empty(output_shape, dtype=object)
+            outlier_ref_indices = np.empty(output_shape, dtype=object)
+            outlier_measured_indices = np.empty(output_shape, dtype=object)
+            peak_residuals = np.empty(output_shape, dtype=object)
+            outlier_probabilities = np.empty(output_shape, dtype=object)
+            outlier_model_info = np.empty(output_shape, dtype=object)
+            peak_outlier_masks.fill(None)
+            outlier_ref_indices.fill(None)
+            outlier_measured_indices.fill(None)
+            peak_residuals.fill(None)
+            outlier_probabilities.fill(None)
+            outlier_model_info.fill(None)
 
         for i in tqdm(range(ydim), desc='Computing strain matrices'):
             for j in range(xdim):
+                if real_mask is not None and not real_mask[i, j]:
+                    continue
+
                 ref_ij = _local_peaks(ref_centers, i, j, squeezed_scan)
                 centers_ij = _local_peaks(centers, i, j, squeezed_scan)
                 weights_ij = _local_weights(intensity_array, i, j, squeezed_scan)
+                reference_peak_count = _clean_peak_set(ref_ij)[0].shape[0]
+                local_outlier_min_peak_pairs = _resolve_outlier_min_peak_pairs(
+                    reference_peak_count
+                )
 
                 matched = _match_peak_sets(ref_ij, centers_ij, weights_ij)
-                matched_ref, matched_centers, weights, _, _ = matched
+                matched_ref, matched_centers, weights, ref_idx, meas_idx = matched
                 if matched_ref is None or matched_ref.shape[0] < min_peak_pairs:
                     continue
 
+                out_idx = i if squeezed_scan else (i, j)
+                initial_match_counts[out_idx] = matched_ref.shape[0]
+                resolved_outlier_min_peak_counts[out_idx] = (
+                    local_outlier_min_peak_pairs
+                )
+
                 try:
-                    transform_matrix, translation = _fit_peak_transform(
+                    (
+                        peak_keep,
+                        residual_distances,
+                        outlier_probability,
+                        local_outlier_model_info,
+                    ) = _reject_peak_outliers(
                         matched_ref,
                         matched_centers,
-                        weights=weights,
+                        weights,
+                        center,
+                        local_outlier_min_peak_pairs,
+                    )
+                    if np.count_nonzero(peak_keep) < min_peak_pairs:
+                        continue
+
+                    fit_ref = matched_ref[peak_keep]
+                    fit_centers = matched_centers[peak_keep]
+                    fit_weights = weights[peak_keep] if weights is not None else None
+
+                    transform_matrix, translation = _fit_peak_transform(
+                        fit_ref,
+                        fit_centers,
+                        center,
+                        weights=fit_weights,
                     )
 
                     if ewpc:
@@ -9174,24 +9846,60 @@ class HyperData:
                 except np.linalg.LinAlgError:
                     continue
 
-                out_idx = i if squeezed_scan else (i, j)
+                rejected_mask = ~peak_keep
+                rejected_count = int(np.count_nonzero(rejected_mask))
                 eyy[out_idx] = 1 - U[0, 0]
                 exx[out_idx] = 1 - U[1, 1]
                 exy[out_idx] = U[1, 0]
                 erot[out_idx] = np.arctan2(R[1, 0], R[0, 0])
                 transforms[out_idx] = transform_matrix
                 translations[out_idx] = translation
-                match_counts[out_idx] = matched_ref.shape[0]
+                match_counts[out_idx] = fit_ref.shape[0]
+                outlier_counts[out_idx] = rejected_count
+                if reject_peak_outliers:
+                    peak_outlier_masks[out_idx] = rejected_mask
+                    outlier_ref_indices[out_idx] = ref_idx[rejected_mask]
+                    outlier_measured_indices[out_idx] = meas_idx[rejected_mask]
+                    peak_residuals[out_idx] = residual_distances
+                    outlier_probabilities[out_idx] = outlier_probability
+                    outlier_model_info[out_idx] = local_outlier_model_info
 
         if return_transform:
             metadata = {
                 'transforms': transforms,
                 'translations': translations,
                 'match_counts': match_counts,
+                'initial_match_counts': initial_match_counts,
+                'kept_peak_counts': match_counts,
+                'outlier_counts': outlier_counts,
                 'match_peaks': match_peaks,
                 'fit_translation': fit_translation,
+                'center': np.array(center, copy=True),
+                'center_source': center_source,
                 'min_peak_pairs': min_peak_pairs,
                 'intensity_percentile': intensity_percentile,
+                'intensity_clip': intensity_clip,
+                'reject_peak_outliers': reject_peak_outliers,
+                'outlier_threshold': outlier_threshold,
+                'outlier_min_peak_pairs': outlier_min_peak_pairs,
+                'outlier_min_peak_fraction': outlier_min_peak_fraction,
+                'outlier_min_peak_mode': outlier_min_peak_mode,
+                'resolved_outlier_min_peak_counts': resolved_outlier_min_peak_counts,
+                'outlier_max_iterations': outlier_max_iterations,
+                'outlier_space': outlier_space,
+                'outlier_method': outlier_method,
+                'outlier_bic_delta': outlier_bic_delta,
+                'peak_outlier_masks': peak_outlier_masks,
+                'outlier_ref_indices': outlier_ref_indices,
+                'outlier_measured_indices': outlier_measured_indices,
+                'peak_residuals': peak_residuals,
+                'outlier_probabilities': outlier_probabilities,
+                'outlier_model_info': outlier_model_info,
+                'real_mask': (
+                    np.array(real_mask, copy=True)
+                    if real_mask is not None
+                    else None
+                ),
                 'g_vector': g_vector,
             }
             return exx, eyy, exy, erot, metadata
@@ -12225,8 +12933,9 @@ class _DenoisingMethods:
     
     
     # Tested successfully
-    def median(self, target_data, window_size=5):
-        """Apply a median filter to 2D data.
+    def median(self, target_data, window_size=5, mode='reflect', cval=0.0,
+               origin=0, axes=None):
+        """Apply a median filter to image data.
     
         The median filter replaces each pixel value with the median value of its neighborhood,
         effectively removing salt-and-pepper noise while preserving edges.
@@ -12237,6 +12946,16 @@ class _DenoisingMethods:
             The 2D data to be denoised.
         window_size : int, optional
             The size of the window (default is 5).
+        mode : str, optional
+            Boundary-extension mode passed to ``scipy.ndimage.median_filter``.
+        cval : scalar, optional
+            Constant fill value used when ``mode='constant'``.
+        origin : int or sequence, optional
+            Placement of the filter relative to each filtered pixel.
+        axes : tuple of int or None, optional
+            Axes over which to apply the median. ``HyperData.denoise`` supplies
+            the selected real- or reciprocal-space axes for 4D data. If None,
+            preserve the historical two-dimensional image behavior.
     
         Returns
         -------
@@ -12248,7 +12967,15 @@ class _DenoisingMethods:
         The median filter is particularly effective for removing salt-and-pepper noise.
         It may be less effective for Gaussian noise.
         """
-        return median_filter(target_data, size=(window_size,window_size))
+        size = (window_size, window_size) if axes is None else window_size
+        return median_filter(
+            target_data,
+            size=size,
+            mode=mode,
+            cval=cval,
+            origin=origin,
+            axes=axes,
+        )
 
 
     # Tested successfully on (4/30/2024) for real- and reciprocal-space denoising
@@ -14857,8 +15584,9 @@ class _DenoiseEngine:
     Private dispatcher for applying denoising methods to 2D, 3D, and 4D data.
 
     ``HyperData.denoise(...)`` is the public API. This helper owns method
-    lookup, argument validation, and dimensional routing, while
-    ``_DenoisingMethods`` stores the numerical algorithms.
+    lookup, argument validation, and dimensional routing, including the
+    whole-array axis-aware median path, while ``_DenoisingMethods`` stores the
+    numerical algorithms.
 
     Attributes
     ----------
@@ -14873,16 +15601,16 @@ class _DenoiseEngine:
     denoise(method_name, target_data=None, **kwargs)
         Applies the specified denoising method to the target data using the provided parameters.
     apply(method, domain='reciprocal', **kwargs)
-        Applies a method directly to 2D/3D data, slice-wise over a selected
-        coordinate domain for 4D data, or directly to the whole array when
-        ``domain=None``.
+        Applies a method directly to 2D/3D data, over a selected coordinate
+        domain for 4D data, or directly to the whole array when ``domain=None``.
 
     Notes
     -----
     - The `denoise` method fetches the appropriate method from the _DenoisingMethods instance and applies it to 
       the data. It raises a ValueError if the specified method is not found.
-    - The `apply` method supports direct 2D/3D denoising and 4D slice-wise
-      routing through real or reciprocal coordinates.
+    - The `apply` method supports direct 2D/3D denoising and 4D routing through
+      real or reciprocal coordinates. Axis-aware median filtering uses one
+      whole-array call; other image methods retain slice-wise routing.
     """
     
     def __init__(self, target_data):
@@ -15100,6 +15828,20 @@ class _DenoiseEngine:
             return self.denoise(method, **kwargs)
 
         elif dims == 4:
+            if method == 'median':
+                if 'axes' in kwargs:
+                    raise TypeError(
+                        "For 4D median denoising, axes are selected by domain; "
+                        "do not pass axes explicitly."
+                    )
+                axes = (0, 1) if domain == 'real' else (2, 3)
+                return self.denoise(
+                    method,
+                    target_data=self.array,
+                    axes=axes,
+                    **kwargs,
+                )
+
             ry, rx, ky, kx = self.array.shape
             processed_data = np.zeros_like(self.array)
 
@@ -15125,4 +15867,3 @@ class _DenoiseEngine:
 
         else:
             raise ValueError("Unsupported image dimensionality")
-

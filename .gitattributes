@@ -1,0 +1,11 @@
+*.ipynb text eol=lf
+
+*.npy binary
+*.npz binary
+*.raw binary
+*.dm3 binary
+*.dm4 binary
+*.emd binary
+*.4denoise binary
+*.h5 binary
+*.hdf5 binary

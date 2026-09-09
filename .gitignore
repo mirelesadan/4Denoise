@@ -1,0 +1,48 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter transient state
+.ipynb_checkpoints/
+
+# Large or generated microscopy data
+*.raw
+*.dm3
+*.dm4
+*.emd
+*.4denoise
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Local experimental workspaces
+/ExperimentalData/
+/AuPrismProject/
+/auGrain_processing_nbs/
+
+# Exploratory notebooks that should be curated before publication
+/auGrain_processing.ipynb
+/auPrism-TOMO_processing.ipynb
+/auPrism_ACOM_lambda-9-30-25.ipynb
+/auPrism_ACOM_processing.ipynb
+/ripple_processing_SiNx.ipynb
+/exp_MoS2_MoSe2_processing - Copy.ipynb
+
+# Accidental local command output
+/witch -c update-fourdenoise
+
+# Operating-system files
+.DS_Store
+Thumbs.db
