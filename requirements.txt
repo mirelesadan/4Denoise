@@ -7,9 +7,10 @@ h5py==3.10.*
 tqdm==4.66.*
 ipykernel==6.29.*
 jupyterlab==4.2.*
-opencv-python==4.10.*              # or headless
+opencv-python-headless==4.10.*
 xgboost
 abtem
 ase
 tensorly==0.9.*
 numba==0.61.*
+scikit-optimize==0.10.*

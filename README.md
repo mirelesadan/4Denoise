@@ -96,3 +96,40 @@ python -m ipykernel install --user --name 4denoise-main --display-name "4denoise
 ```
 
 #### 8. We type `jupyter notebook` in the Anaconda Prompt (or select it directly in the Anaconda app) to open the Jupyter notebook application. We then open the file `DEMO_exp_4dstem_ripple_processing.ipynb`
+
+The editable install now declares the packages needed to import and use
+`fourdenoise`. Without the Conda environment, install the optional simulation
+and notebook tools with `pip install -e ".[simulation,notebook]"`. The optional
+BM3D/BM4D methods can be installed with `pip install -e ".[bm]"`.
+
+To run the local regression suite from the repository directory:
+
+```bash
+python -m unittest discover -s tests
+```
+
+`HyperData.save()` writes atomically by default: a failed write leaves an
+existing output untouched. Overwriting temporarily needs disk space for both
+the old and new files; use `atomic=False` only when that extra space is not
+available and a partial file on failure is acceptable.
+
+For a large 3D/4D HDF5 dataset, read bounded scan blocks instead of loading
+the entire array:
+
+```python
+from fourdenoise import HyperData
+
+with HyperData.open_hdf5('experiment.h5') as source:
+    pattern = source.get_dp(0, 0)  # 4D data: one scan position
+    for scan_slices, block in source.iter_chunks((16, 16)):
+        print(scan_slices, block.shape)  # each block is an in-memory HyperData
+```
+
+For 3D stacks, `get_dp` takes one index and `iter_chunks` accepts a scalar
+chunk size. Use `hdf5_dataset='/entry/data'` when a file contains multiple
+datasets. `HyperData(path)` remains eager, and methods called on a chunk do
+not automatically process the rest of the HDF5 file.
+
+`requirements.lock.txt` is a snapshot from a specific machine and contains
+local `file:///` package paths. Use `environment.yml` or the editable install
+above on another computer instead of treating that snapshot as a portable lock.

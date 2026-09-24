@@ -16,8 +16,12 @@ Date:
     April 2024
 """
 
+import os
+import tempfile
+import warnings
 import numpy as np
 import h5py
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import lru_cache
 from numbers import Integral
@@ -29,6 +33,7 @@ import scipy.stats
 from scipy.ndimage import center_of_mass
 from scipy.ndimage import median_filter
 from scipy.ndimage import gaussian_filter
+from scipy.ndimage import uniform_filter
 from scipy.ndimage import label
 from scipy.ndimage import rotate
 from scipy.ndimage import grey_erosion, grey_dilation
@@ -47,8 +52,10 @@ from scipy.spatial import ConvexHull
 
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
-from matplotlib.colors import ListedColormap, to_rgba
+from matplotlib.colors import ListedColormap, Normalize, to_rgba
 from matplotlib.cm import ScalarMappable
+from matplotlib.collections import LineCollection
+from matplotlib.patches import Rectangle
 
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from tqdm import tqdm
@@ -59,8 +66,8 @@ from skimage.feature import peak_local_max
 from skimage import transform
 from skimage import feature
 from skimage.restoration import denoise_nl_means, estimate_sigma, denoise_tv_chambolle
-from sklearn.cluster import KMeans, MiniBatchKMeans
-from sklearn.decomposition import PCA, IncrementalPCA
+from sklearn.cluster import HDBSCAN, KMeans, MiniBatchKMeans
+from sklearn.decomposition import PCA, IncrementalPCA, MiniBatchNMF
 from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
 
@@ -99,6 +106,107 @@ from typing import Union, Sequence, Tuple
 _SCALE_UNSET = object()
 _HYPERDATA_HDF5_FORMAT = '4denoise.hyperdata'
 _HYPERDATA_HDF5_VERSION = '1.0'
+
+
+def _normalize_real_spacing(spacing):
+    """Validate a scalar or ``(y, x)`` physical-unit-per-pixel spacing."""
+    if isinstance(spacing, (bool, np.bool_)):
+        raise ValueError("Real-space pixel spacing must be positive and finite.")
+    try:
+        values = np.asarray(spacing, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Real-space pixel spacing must be numeric.") from exc
+    if values.ndim == 0:
+        if not np.isfinite(values) or values <= 0:
+            raise ValueError("Real-space pixel spacing must be positive and finite.")
+        return float(values)
+    if values.shape != (2,) or not np.all(np.isfinite(values)) or np.any(values <= 0):
+        raise ValueError("Real-space pixel spacing must be a positive finite (y, x) pair.")
+    return tuple(float(value) for value in values)
+
+
+def _real_spacing_pair(spacing):
+    """Return ``(y, x)`` spacing without changing the public scalar form."""
+    if spacing is None:
+        return (1.0, 1.0)
+    return (spacing, spacing) if np.isscalar(spacing) else tuple(spacing)
+
+
+def _scaled_real_spacing(spacing, factors):
+    """Scale each pixel axis, retaining scalar form for isotropic spacing."""
+    result = tuple(
+        float(value) * float(factor)
+        for value, factor in zip(_real_spacing_pair(spacing), factors)
+    )
+    return result[0] if np.isclose(result[0], result[1]) else result
+
+
+def _normalize_real_origin(origin):
+    """Validate the physical coordinate of the first real-space pixel center."""
+    try:
+        values = np.asarray(origin, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("real_origin must be a finite (y, x) pair.") from exc
+    if values.shape != (2,) or not np.all(np.isfinite(values)):
+        raise ValueError("real_origin must be a finite (y, x) pair.")
+    return tuple(float(value) for value in values)
+
+
+def _parse_real_selection(value, max_len, name, mode, conv_factor,
+                          origin=0.0):
+    """Parse real-space scalar/range selections into half-open pixel slices."""
+    if value is None:
+        return 0, max_len, 'all'
+
+    is_pair = (
+        isinstance(value, (tuple, list, np.ndarray))
+        and np.asarray(value).shape == (2,)
+    )
+    if is_pair:
+        a, b = np.asarray(value, dtype=float)
+        if not np.all(np.isfinite((a, b))):
+            raise ValueError(f"{name} range must contain finite values.")
+        if mode == 'calibrated':
+            a = (a - origin) / conv_factor
+            b = (b - origin) / conv_factor
+            start = int(np.floor(a))
+            stop = int(np.ceil(b))
+        else:
+            if not float(a).is_integer() or not float(b).is_integer():
+                raise ValueError(
+                    f"{name} range must contain integer pixel indices when "
+                    "selection_units='pixels'."
+                )
+            start = int(a)
+            stop = int(b)
+        if not (0 <= start < stop <= max_len):
+            raise ValueError(
+                f"Invalid {name} range ({value[0]}, {value[1]}) for "
+                f"length {max_len} using {mode} units."
+            )
+        return start, stop, 'range'
+
+    if np.isscalar(value):
+        value = float(value)
+        if not np.isfinite(value):
+            raise ValueError(f"{name} index must be finite.")
+        if mode == 'calibrated':
+            index = int(np.rint((value - origin) / conv_factor))
+        else:
+            if not value.is_integer():
+                raise ValueError(
+                    f"{name} index must be an integer when "
+                    "selection_units='pixels'."
+                )
+            index = int(value)
+        if not (0 <= index < max_len):
+            raise ValueError(
+                f"{name} index {value:g} out of bounds for length "
+                f"{max_len} using {mode} units."
+            )
+        return index, index + 1, 'index'
+
+    raise ValueError(f"{name} must be a scalar, a length-2 range, or None.")
 
 
 def _normalize_unit_mode(unit_mode, label='axis_units'):
@@ -144,9 +252,8 @@ def _resolve_unit_mode(unit_mode, units, conv_factor, label='axis_units'):
             )
         return None, None, 'pixels'
 
-    if not np.isscalar(conv_factor) or conv_factor <= 0:
-        raise ValueError("conv_factor must be a positive scalar.")
-    return str(units).strip(), float(conv_factor), 'calibrated'
+    factor = _normalize_real_spacing(conv_factor)
+    return str(units).strip(), factor, 'calibrated'
 
 
 def _center_to_calibrated(center_px, shape, conv_factor):
@@ -230,6 +337,42 @@ def _center_beam_metadata_from_pixels(radius_px, center_px, shape, *,
             metadata[key] = deepcopy(value)
 
     return metadata
+
+
+def _resampled_center_beam_metadata(metadata, old_shape, new_shape, *,
+                                    crop_origin=(0, 0), crop_shape=None,
+                                    units=None, conv_factor=None):
+    """Map a circular beam through an integer crop and isotropic resampling.
+
+    Return None when the old geometry is stale, the beam center is cropped out,
+    or unequal axis scales would turn the circle into an ellipse. Historical
+    alignment coordinates are not copied because they describe the old image.
+    """
+    if metadata is None:
+        return None
+    old_shape = tuple(old_shape)
+    new_shape = tuple(new_shape)
+    crop_shape = tuple(crop_shape) if crop_shape is not None else old_shape
+    if tuple(metadata.get('shape', ())) != old_shape:
+        return None
+    if 'center_px' not in metadata or 'radius_px' not in metadata:
+        return None
+
+    scales = np.asarray(new_shape, dtype=float) / np.asarray(crop_shape, dtype=float)
+    if not np.isclose(scales[0], scales[1]):
+        return None
+    center = np.asarray(metadata['center_px'], dtype=float)
+    origin = np.asarray(crop_origin, dtype=float)
+    new_center = (center - origin + 0.5) * scales - 0.5
+    if not np.all(np.isfinite(new_center)) or np.any(new_center < 0) or np.any(
+        new_center > np.asarray(new_shape) - 1
+    ):
+        return None
+    return _center_beam_metadata_from_pixels(
+        float(metadata['radius_px']) * scales[0], new_center, new_shape,
+        units=units, conv_factor=conv_factor,
+        source='resampling', parent_source=metadata.get('source'),
+    )
 
 
 def _validate_center_pair(value, name):
@@ -563,116 +706,188 @@ def _format_hdf5_dataset_listing(dataset_info):
     )
 
 
+def _select_hdf5_dataset(file, dataset_path=None):
+    """Select a numeric dataset without loading it into memory."""
+    path = Path(file.filename)
+    dataset_info = []
+
+    def _collect_dataset(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            dataset_info.append({
+                'path': f'/{name}', 'shape': tuple(obj.shape),
+                'ndim': obj.ndim, 'dtype': str(obj.dtype),
+                'is_candidate': obj.ndim >= 2 and (
+                    np.issubdtype(obj.dtype, np.number)
+                    or np.issubdtype(obj.dtype, np.bool_)
+                ),
+            })
+
+    file.visititems(_collect_dataset)
+    if dataset_path is not None:
+        if not isinstance(dataset_path, (str, Path)):
+            raise TypeError("hdf5_dataset must be a string or pathlib.Path.")
+        selected_path = str(dataset_path).replace('\\', '/')
+        if not selected_path.startswith('/'):
+            selected_path = f'/{selected_path}'
+        try:
+            selected = file[selected_path]
+        except KeyError as exc:
+            listing = _format_hdf5_dataset_listing(dataset_info)
+            raise KeyError(
+                f"HDF5 dataset '{selected_path}' was not found in "
+                f"'{path}'.\nAvailable datasets:\n{listing}"
+            ) from exc
+        if not isinstance(selected, h5py.Dataset):
+            raise ValueError(
+                f"HDF5 path '{selected_path}' refers to a group, not a dataset."
+            )
+        if selected.ndim < 2:
+            raise ValueError(
+                f"HDF5 dataset '{selected_path}' has {selected.ndim} "
+                "dimension(s); HyperData requires at least 2."
+            )
+        if not (
+            np.issubdtype(selected.dtype, np.number)
+            or np.issubdtype(selected.dtype, np.bool_)
+        ):
+            raise TypeError(
+                f"HDF5 dataset '{selected_path}' has non-numeric dtype "
+                f"{selected.dtype}."
+            )
+        return selected
+
+    candidates = [info for info in dataset_info if info['is_candidate']]
+    if len(candidates) == 1:
+        return file[candidates[0]['path']]
+    if not candidates:
+        listing = _format_hdf5_dataset_listing(dataset_info)
+        raise ValueError(
+            f"No numeric dataset with at least 2 dimensions was found "
+            f"in '{path}'.\nAvailable datasets:\n{listing}"
+        )
+    listing = _format_hdf5_dataset_listing(candidates)
+    raise ValueError(
+        f"{len(candidates)} numeric multidimensional datasets were "
+        f"found in '{path}'. Select one with "
+        "HyperData(filename, hdf5_dataset='/path/to/dataset').\n"
+        f"Candidate datasets:\n{listing}"
+    )
+
+
 def _read_hdf5_file(filename, dataset_path=None):
-    """Read a numeric multidimensional dataset from a generic HDF5 file.
-
-    HDF5 groups are searched recursively. If exactly one numeric dataset with
-    at least two dimensions is present, it is loaded automatically. Files with
-    multiple candidate datasets require an explicit ``dataset_path`` so the
-    loader never silently chooses the wrong array.
-
-    Parameters
-    ----------
-    filename : str or pathlib.Path
-        Path to an ``.h5``, ``.hdf5``, or ``.hdf`` file.
-    dataset_path : str or None, optional
-        Absolute or relative HDF5 path of the dataset to load, for example
-        ``'/entry/data/data'``. Required when multiple candidates exist.
-
-    Returns
-    -------
-    numpy.ndarray
-        A copy of the selected HDF5 dataset in memory.
-    """
+    """Load a selected generic HDF5 dataset into a NumPy array."""
     path = Path(filename).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"'{path}' does not exist.")
     if not path.is_file():
         raise ValueError(f"'{path}' is not a file.")
-
     try:
         with h5py.File(path, 'r') as file:
-            dataset_info = []
-
-            def _collect_dataset(name, obj):
-                if isinstance(obj, h5py.Dataset):
-                    dataset_info.append(
-                        {
-                            'path': f'/{name}',
-                            'shape': tuple(obj.shape),
-                            'ndim': obj.ndim,
-                            'dtype': str(obj.dtype),
-                            'is_candidate': (
-                                obj.ndim >= 2
-                                and (
-                                    np.issubdtype(obj.dtype, np.number)
-                                    or np.issubdtype(obj.dtype, np.bool_)
-                                )
-                            ),
-                        }
-                    )
-
-            file.visititems(_collect_dataset)
-
-            if dataset_path is not None:
-                if not isinstance(dataset_path, (str, Path)):
-                    raise TypeError("hdf5_dataset must be a string or pathlib.Path.")
-
-                selected_path = str(dataset_path).replace('\\', '/')
-                if not selected_path.startswith('/'):
-                    selected_path = f'/{selected_path}'
-
-                try:
-                    selected = file[selected_path]
-                except KeyError as exc:
-                    listing = _format_hdf5_dataset_listing(dataset_info)
-                    raise KeyError(
-                        f"HDF5 dataset '{selected_path}' was not found in "
-                        f"'{path}'.\nAvailable datasets:\n{listing}"
-                    ) from exc
-
-                if not isinstance(selected, h5py.Dataset):
-                    raise ValueError(
-                        f"HDF5 path '{selected_path}' refers to a group, not "
-                        "a dataset."
-                    )
-                if selected.ndim < 2:
-                    raise ValueError(
-                        f"HDF5 dataset '{selected_path}' has {selected.ndim} "
-                        "dimension(s); HyperData requires at least 2."
-                    )
-                if not (
-                    np.issubdtype(selected.dtype, np.number)
-                    or np.issubdtype(selected.dtype, np.bool_)
-                ):
-                    raise TypeError(
-                        f"HDF5 dataset '{selected_path}' has non-numeric dtype "
-                        f"{selected.dtype}."
-                    )
-                return selected[()]
-
-            candidates = [
-                info for info in dataset_info if info['is_candidate']
-            ]
-            if len(candidates) == 1:
-                return file[candidates[0]['path']][()]
-
-            if not candidates:
-                listing = _format_hdf5_dataset_listing(dataset_info)
-                raise ValueError(
-                    f"No numeric dataset with at least 2 dimensions was found "
-                    f"in '{path}'.\nAvailable datasets:\n{listing}"
-                )
-
-            listing = _format_hdf5_dataset_listing(candidates)
-            raise ValueError(
-                f"{len(candidates)} numeric multidimensional datasets were "
-                f"found in '{path}'. Select one with "
-                "HyperData(filename, hdf5_dataset='/path/to/dataset').\n"
-                f"Candidate datasets:\n{listing}"
-            )
+            return _select_hdf5_dataset(file, dataset_path)[()]
     except OSError as exc:
         raise ValueError(f"Could not open '{path}' as an HDF5 file.") from exc
+
+
+class _HDF5ChunkReader:
+    """Read-only, bounded-memory access to 3D/4D HDF5 diffraction data."""
+
+    def __init__(self, dataset, hyperdata_type, metadata=None):
+        if dataset.ndim not in (3, 4):
+            raise ValueError(
+                "Chunked HDF5 access requires a 3D stack or 4D-STEM dataset."
+            )
+        self._dataset = dataset
+        self._hyperdata_type = hyperdata_type
+        self._metadata = metadata or {}
+        self._closed = False
+        self.shape = tuple(dataset.shape)
+        self.dtype = dataset.dtype
+        self.ndim = dataset.ndim
+
+    def _require_open(self):
+        if self._closed:
+            raise RuntimeError("The HDF5 reader is closed; use it inside the with block.")
+
+    def get_dp(self, *scan_indices):
+        """Load one diffraction pattern at a scan index without reading the stack."""
+        self._require_open()
+        expected = self.ndim - 2
+        if len(scan_indices) != expected:
+            raise ValueError(f"Expected {expected} scan index/indices.")
+        for index, size in zip(scan_indices, self.shape[:expected]):
+            if isinstance(index, (bool, np.bool_)) or not isinstance(
+                index, (Integral, np.integer)
+            ):
+                raise TypeError("Scan indices must be integers.")
+            if not 0 <= index < size:
+                raise IndexError(f"Scan index {index} is outside [0, {size}).")
+        pattern = self._dataset[scan_indices + (slice(None), slice(None))]
+        return ReciprocalSpace(
+            pattern,
+            units=self._metadata.get('reciprocal_units'),
+            conv_factor=self._metadata.get('reciprocal_conv_factor'),
+            polar_metadata=self._metadata.get('polar_metadata'),
+            center_beam_metadata=self._metadata.get('center_beam_metadata'),
+        )
+
+    def iter_chunks(self, chunk_shape=16):
+        """Yield ``(scan_slices, HyperData)`` blocks bounded by chunk_shape.
+
+        A scalar selects that many scan positions along each leading axis.
+        Pass a two-tuple for 4D data or a one-tuple for a 3D stack. Returned
+        chunks own their NumPy data and remain usable after the reader closes.
+        """
+        self._require_open()
+        n_scan_axes = self.ndim - 2
+        if isinstance(chunk_shape, (Integral, np.integer)) and not isinstance(
+            chunk_shape, (bool, np.bool_)
+        ):
+            lengths = (int(chunk_shape),) * n_scan_axes
+        else:
+            try:
+                lengths = tuple(chunk_shape)
+            except TypeError as exc:
+                raise ValueError("chunk_shape must contain positive integers.") from exc
+        if len(lengths) != n_scan_axes or any(
+            isinstance(length, (bool, np.bool_))
+            or not isinstance(length, (Integral, np.integer)) or length < 1
+            for length in lengths
+        ):
+            raise ValueError(
+                f"chunk_shape must contain {n_scan_axes} positive integer(s)."
+            )
+
+        scan_shape = self.shape[:n_scan_axes]
+        grid_shape = tuple(
+            (size + length - 1) // length
+            for size, length in zip(scan_shape, lengths)
+        )
+        for block_index in np.ndindex(*grid_shape):
+            self._require_open()
+            scan_slices = tuple(
+                slice(index * length, min((index + 1) * length, size))
+                for index, length, size in zip(block_index, lengths, scan_shape)
+            )
+            block = self._dataset[scan_slices + (slice(None), slice(None))]
+            origin = self._metadata.get('real_origin', (0.0, 0.0))
+            if self.ndim == 4:
+                real_step = _real_spacing_pair(
+                    self._metadata.get('real_conv_factor')
+                )
+                origin = tuple(
+                    value + scan_slice.start * step
+                    for value, scan_slice, step in zip(origin, scan_slices, real_step)
+                )
+            yield scan_slices, self._hyperdata_type(
+                block,
+                real_units=self._metadata.get('real_units'),
+                real_conv_factor=self._metadata.get('real_conv_factor'),
+                real_origin=origin,
+                reciprocal_units=self._metadata.get('reciprocal_units'),
+                reciprocal_conv_factor=self._metadata.get('reciprocal_conv_factor'),
+                polar_metadata=self._metadata.get('polar_metadata'),
+                center_beam_metadata=self._metadata.get('center_beam_metadata'),
+            )
     
 #%%
 
@@ -685,7 +900,7 @@ def _read_hdf5_file(filename, dataset_path=None):
 #TODO: combine with RosettaSciIO
 
 def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
-            trim_meta=True, clip=True, hdf5_dataset=None):
+            trim_meta=True, clip=False, hdf5_dataset=None, repair_nans=False):
     """
     Read array data from a .raw, .mat, .npy, .h5, .hdf5, or .hdf file.
     
@@ -704,6 +919,12 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
         HDF5 dataset path to load. Generic HDF5 files containing exactly one
         numeric multidimensional dataset are selected automatically. This
         argument is required when a file contains multiple candidates.
+    clip : bool, optional
+        Replace values below 1 with 1. Disabled by default to preserve raw
+        detector counts, including zeros and negative values.
+    repair_nans : bool, optional
+        Replace patterns containing NaNs with neighbor averages (or replace
+        NaNs with zero for 2D images). Disabled by default.
 
     Return:
         dp : numpy array
@@ -800,11 +1021,13 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
     dp = np.asarray(dp)
 
     if clip and np.issubdtype(dp.dtype, np.number):
+        dp = np.array(dp, copy=True)
         # Replace negative and near-zero pixel values with 1
         low_vals_mask = dp < 1
         dp[low_vals_mask] = 1
 
-    dp = _replace_nan_patterns(dp)
+    if repair_nans:
+        dp = _replace_nan_patterns(np.array(dp, copy=True))
 
     return dp
 
@@ -2373,6 +2596,11 @@ def _get_traversal_indices(shape, method, curve_shape_strategy='center_crop',
             _TRAVERSAL_INDEX_GENERATORS[method](grid_shape),
             dtype=int,
         )
+        if local_indices.shape != (grid_shape[0] * grid_shape[1], 2):
+            raise ValueError(
+                f"Traversal method '{method}' did not cover its selected "
+                f"{grid_shape} grid exactly once."
+            )
         indices = local_indices + np.array([y0, x0])
         indices = _validate_traversal_indices(indices, shape, method)
         traversal_metadata = {
@@ -2413,6 +2641,11 @@ def _get_traversal_indices(shape, method, curve_shape_strategy='center_crop',
             _TRAVERSAL_INDEX_GENERATORS[method]((side, side)),
             dtype=int,
         )
+        if indices.shape != (side * side, 2):
+            raise ValueError(
+                f"Traversal method '{method}' did not cover its resized "
+                f"{side}x{side} grid exactly once."
+            )
         indices = _validate_traversal_indices(indices, (side, side), method)
         return indices, {
             'curve_shape_strategy': 'resize',
@@ -2424,6 +2657,194 @@ def _get_traversal_indices(shape, method, curve_shape_strategy='center_crop',
         }
 
     raise ValueError("curve_shape_strategy must be 'center_crop' or 'resize'.")
+
+
+def plot_traversals(method='all', grid_shape=(64, 64), *, ncols=3,
+                    cmap='turbo', linewidth=1.5, show_grid=True,
+                    mark_endpoints=True, show=True):
+    """Plot one or all implemented 2D unfolding traversal paths.
+
+    ``grid_shape`` is the maximum requested grid, not a promise that every
+    method uses every cell. Full-shape methods traverse it entirely. Curve and
+    block methods traverse their largest compatible centered crop within it;
+    shaded cells are excluded. Each title shows both the used and maximum grid
+    shapes. This visualizer does not resize data or require a ``HyperData``.
+
+    Parameters
+    ----------
+    method : str, optional
+        An implemented traversal name or ``'all'``. The latter plots the ten
+        implemented canonical methods in registry order. ``'z_order'`` and
+        ``'meander_4'``/``'meander_5'`` are accepted aliases for single plots.
+        ``'moore'`` is not yet implemented; ``'coordinate_aligned'`` is an axis
+        rearrangement rather than a 2D traversal.
+    grid_shape : int or tuple[int, int], optional
+        Maximum grid height and width, in ``(y, x)`` order. An integer requests
+        a square. Compatible curves may use only a centered part of this grid.
+    ncols : int, optional
+        Maximum number of subplot columns. A single method uses one column.
+    cmap : str or Colormap, optional
+        Matplotlib colormap for the path's normalized start-to-end progress.
+    linewidth : float, optional
+        Width of the colored traversal line in points.
+    show_grid, mark_endpoints : bool, optional
+        Draw cell boundaries and colored start/end markers, respectively.
+    show : bool, optional
+        Display the figure with ``matplotlib.pyplot.show`` when True.
+
+    Returns
+    -------
+    tuple[Figure, ndarray]
+        Matplotlib figure and a 2D array of axes. Unused axes in ``'all'``
+        mode are hidden. A block method that cannot fit inside ``grid_shape``
+        gets an explanatory panel in ``'all'`` mode; a single-method request
+        raises the underlying size error.
+
+    Examples
+    --------
+    >>> fig, axes = plot_traversals('all', (64, 64), ncols=3)
+    >>> fig, axes = plot_traversals('peano', 81, linewidth=2, show=False)
+    """
+    if isinstance(grid_shape, Integral) and not isinstance(grid_shape, (bool, np.bool_)):
+        grid_shape = (grid_shape, grid_shape)
+    else:
+        grid_shape = np.asarray(grid_shape, dtype=object)
+        if grid_shape.shape != (2,):
+            raise ValueError("grid_shape must be a positive integer or (height, width).")
+    if any(
+        isinstance(size, (bool, np.bool_))
+        or not isinstance(size, (Integral, np.integer)) or size < 1
+        for size in grid_shape
+    ):
+        raise ValueError("grid_shape must contain positive integers.")
+    height, width = map(int, grid_shape)
+
+    if isinstance(ncols, (bool, np.bool_)) or not isinstance(ncols, Integral) or ncols < 1:
+        raise ValueError("ncols must be a positive integer.")
+    if isinstance(linewidth, (bool, np.bool_)) or not isinstance(
+        linewidth, (Integral, float, np.floating)
+    ) or not np.isfinite(linewidth) or linewidth <= 0:
+        raise ValueError("linewidth must be a positive finite number.")
+
+    requested_method = _normalize_traversal_method(method)
+    implemented = tuple(
+        name for name in _TRAVERSAL_INDEX_GENERATORS if name != 'moore'
+    )
+    if requested_method == 'all':
+        methods = implemented
+    elif requested_method == 'moore':
+        _moore_indices((height, width))
+    elif requested_method in implemented:
+        if (
+            requested_method in _BLOCK_TRAVERSAL_METHODS
+            and min(height, width) < _block_size_for_method(requested_method)
+        ):
+            _get_traversal_indices((height, width), requested_method)
+        methods = (requested_method,)
+    else:
+        valid = ', '.join(implemented)
+        raise ValueError(
+            f"method must be 'all' or one of: {valid}. "
+            "coordinate_aligned is not a 2D traversal."
+        )
+
+    plot_cols = min(int(ncols), len(methods))
+    plot_rows = int(np.ceil(len(methods) / plot_cols))
+    fig, axes = plt.subplots(
+        plot_rows, plot_cols, squeeze=False,
+        figsize=(4.8 * plot_cols, 4.8 * plot_rows), layout='constrained',
+    )
+    progress_norm = Normalize(vmin=0, vmax=1)
+
+    for ax, name in zip(axes.flat, methods):
+        ax.set_xlim(-0.5, width - 0.5)
+        ax.set_ylim(height - 0.5, -0.5)
+        ax.set_aspect('equal')
+        ax.set_facecolor('white')
+        if show_grid:
+            grid_lines = [
+                ((x - 0.5, -0.5), (x - 0.5, height - 0.5))
+                for x in range(width + 1)
+            ] + [
+                ((-0.5, y - 0.5), (width - 0.5, y - 0.5))
+                for y in range(height + 1)
+            ]
+            ax.add_collection(LineCollection(
+                grid_lines, colors='0.75', linewidths=0.3, alpha=0.45, zorder=0.5,
+            ))
+        ax.add_patch(Rectangle(
+            (-0.5, -0.5), width, height, fill=False,
+            edgecolor='0.45', linewidth=0.8, zorder=1,
+        ))
+
+        if name in _BLOCK_TRAVERSAL_METHODS and min(height, width) < _block_size_for_method(name):
+            block_size = _block_size_for_method(name)
+            ax.set_title(f'{name}\nunavailable / max {height}x{width}')
+            ax.text(
+                (width - 1) / 2, (height - 1) / 2,
+                f'Requires at least {block_size}x{block_size}',
+                ha='center', va='center', fontsize=9,
+            )
+            ax.set_axis_off()
+            continue
+
+        indices, details = _get_traversal_indices(
+            (height, width), name, curve_shape_strategy='center_crop',
+        )
+        used_height, used_width = details.get('curve_grid_shape', (height, width))
+        crop_slices = details.get('crop_slices')
+        if crop_slices is not None:
+            y0, y1 = crop_slices['y']
+            x0, x1 = crop_slices['x']
+            excluded_regions = (
+                (-0.5, -0.5, width, y0),
+                (-0.5, y1 - 0.5, width, height - y1),
+                (-0.5, y0 - 0.5, x0, y1 - y0),
+                (x1 - 0.5, y0 - 0.5, width - x1, y1 - y0),
+            )
+            for x, y, region_width, region_height in excluded_regions:
+                if region_width > 0 and region_height > 0:
+                    ax.add_patch(Rectangle(
+                        (x, y), region_width, region_height,
+                        facecolor='0.88', edgecolor='none', alpha=0.7, zorder=0.2,
+                    ))
+            ax.add_patch(Rectangle(
+                (x0 - 0.5, y0 - 0.5), used_width, used_height,
+                fill=False, edgecolor='0.35', linestyle='--',
+                linewidth=0.9, zorder=3,
+            ))
+
+        xy = indices[:, [1, 0]].astype(np.float32)
+        if len(xy) > 1:
+            segments = np.stack((xy[:-1], xy[1:]), axis=1)
+            path = LineCollection(
+                segments, cmap=cmap, norm=progress_norm,
+                linewidths=linewidth, zorder=2,
+            )
+            path.set_array(np.linspace(0, 1, len(segments), dtype=np.float32))
+            ax.add_collection(path)
+        if mark_endpoints:
+            ax.scatter(
+                xy[0, 0], xy[0, 1], s=28, marker='o', c='limegreen',
+                edgecolors='black', linewidths=0.5, zorder=4,
+            )
+            ax.scatter(
+                xy[-1, 0], xy[-1, 1], s=34, marker='X', c='crimson',
+                edgecolors='black', linewidths=0.5, zorder=4,
+            )
+        ax.set_title(f'{name}\nused {used_height}x{used_width} / max {height}x{width}')
+        ax.set_axis_off()
+
+    for ax in list(axes.flat)[len(methods):]:
+        ax.set_visible(False)
+    colorbar = fig.colorbar(
+        ScalarMappable(norm=progress_norm, cmap=cmap),
+        ax=list(axes.flat)[:len(methods)], shrink=0.7, pad=0.02,
+    )
+    colorbar.set_label('Traversal progress (start to end)')
+    if show:
+        plt.show()
+    return fig, axes
 
 
 def _inverse_transpose_order(order):
@@ -4591,25 +5012,142 @@ def combine_strain_maps(strain_maps: np.ndarray,
 
     return final_strain_maps
 
+
+def _peak_radii(r, num_peaks):
+    """Return one integration radius per peak without changing the input."""
+    radii = np.asarray(r, dtype=float)
+    if radii.ndim == 0:
+        return np.full(num_peaks, radii.item())
+    if radii.shape != (num_peaks,):
+        raise ValueError("r must be a scalar or contain one radius per peak.")
+    return radii
+
+
+def _spot_center_from_array(array, ky, kx, r, method='CoM', plotSpot=False):
+    """Refine one peak in a local zero-padded window of a 2D array."""
+    pad_width = int(np.ceil(r))
+    ky_padded, kx_padded = ky + pad_width, kx + pad_width
+    area_size = int(np.ceil(r * 2))
+    half = area_size // 2
+    mask = circular_mask(half, half, r)
+
+    ymin, ymax = int(ky_padded - half), int(ky_padded + half) + 1
+    xmin, xmax = int(kx_padded - half), int(kx_padded + half) + 1
+    height, width = array.shape
+    py0, py1, _ = slice(ymin, ymax).indices(height + 2 * pad_width)
+    px0, px1, _ = slice(xmin, xmax).indices(width + 2 * pad_width)
+    sy0, sy1 = max(py0, pad_width), min(py1, pad_width + height)
+    sx0, sx1 = max(px0, pad_width), min(px1, pad_width + width)
+
+    if sy0 == py0 and sy1 == py1 and sx0 == px0 and sx1 == px1:
+        spot_data = array[
+            sy0 - pad_width:sy1 - pad_width,
+            sx0 - pad_width:sx1 - pad_width,
+        ]
+    else:
+        spot_data = np.zeros(
+            (max(py1 - py0, 0), max(px1 - px0, 0)), dtype=array.dtype
+        )
+        if sy0 < sy1 and sx0 < sx1:
+            spot_data[
+                sy0 - py0:sy1 - py0, sx0 - px0:sx1 - px0
+            ] = array[
+                sy0 - pad_width:sy1 - pad_width,
+                sx0 - pad_width:sx1 - pad_width,
+            ]
+
+    if spot_data.shape != mask.shape:
+        side = min(*spot_data.shape, *mask.shape)
+        spot_data, mask = spot_data[:side, :side], mask[:side, :side]
+    masked_spot_data = spot_data * mask
+
+    if method == 'CoM':
+        com_y, com_x = center_of_mass(masked_spot_data)
+    elif method == 'gaussian':
+        com_y, com_x = fit_gaussian_2d(masked_spot_data)
+    elif method == 'elliptical_gaussian':
+        com_y, com_x = fit_elliptical_gaussian_2d(masked_spot_data)
+    else:
+        raise ValueError("method must be 'CoM', 'gaussian', or 'elliptical_gaussian'.")
+
+    if plotSpot:
+        base_cmap = plt.cm.turbo
+        custom_cmap = ListedColormap(np.concatenate((
+            [np.array([1, 1, 1, 1])],
+            base_cmap(np.linspace(0, 1, 2**12))[1:],
+        ), axis=0))
+        plt.imshow(masked_spot_data, cmap=custom_cmap)
+        plt.colorbar()
+        plt.scatter(com_x, com_y, color='yellow', s=50, label='Refined center')
+        plt.show()
+
+    return com_y + ymin - pad_width, com_x + xmin - pad_width
+
+
+def _peak_centers_from_array(array, r, ref_coords, method='CoM', show=False):
+    """Refine all reference peaks in one 2D diffraction pattern."""
+    ref_coords = np.asarray(ref_coords)
+    num_peaks = len(ref_coords)
+    radii = _peak_radii(r, num_peaks)
+    centers = np.zeros((num_peaks, 2))
+    for j in range(num_peaks):
+        centers[j] = _spot_center_from_array(
+            array, ref_coords[j, 0], ref_coords[j, 1],
+            radii[j] + 1e-10, method, show,
+        )
+    return centers
+
+
+def _peak_intensities_from_array(array, r, centers, return_pixel_counts=False):
+    """Integrate local circular windows, optionally counting included pixels."""
+    num_peaks = len(centers)
+    radii = _peak_radii(r, num_peaks)
+    ints = np.zeros(num_peaks)
+    pixel_counts = np.zeros(num_peaks, dtype=int) if return_pixel_counts else None
+    for int_idx, radius in enumerate(radii):
+        cy, cx = centers[int_idx]
+        y0 = max(0, min(array.shape[0], round(cy - (radius + 0.5))))
+        y1 = max(0, min(array.shape[0], round(cy + (radius + 0.5))))
+        x0 = max(0, min(array.shape[1], round(cx - (radius + 0.5))))
+        x1 = max(0, min(array.shape[1], round(cx + (radius + 0.5))))
+        if y0 >= y1 or x0 >= x1:
+            continue
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        local_mask = (yy - cy)**2 + (xx - cx)**2 <= (radius + 1e-10)**2
+        ints[int_idx] = np.sum(array[y0:y1, x0:x1] * local_mask)
+        if return_pixel_counts:
+            pixel_counts[int_idx] = np.count_nonzero(local_mask)
+    return (ints, pixel_counts) if return_pixel_counts else ints
+
     #%% The main 4D-STEM object
 
 class HyperData:
 
     def __init__(self, data,
                  real_units: str = None,
-                 real_conv_factor: float = None,
+                 real_conv_factor: float | tuple[float, float] = None,
                  reciprocal_units: str = None,
                  reciprocal_conv_factor: float = None,
                  polar_metadata: dict = None,
                  center_beam_metadata: dict = None,
                  hdf5_dataset=None,
-                 flip_axis=None):
+                 flip_axis=None,
+                 real_origin=None,
+                 clip_on_load=False,
+                 repair_nans=False):
         """Wrap an array or load a dataset with optional axis reversal.
 
         ``flip_axis`` accepts one axis or a sequence of axes to reverse. For
         4D data, axes ``(0, 1, 2, 3)`` mean ``(Ry, Rx, Ky, Kx)``. For 3D
         data, axes ``(0, 1, 2)`` mean ``(pattern, Ky, Kx)``. Negative axes
         follow NumPy conventions. Flipping a NumPy array creates a view.
+        ``real_conv_factor`` may be scalar or ``(y, x)`` units per pixel.
+        ``real_origin`` is the calibrated coordinate of scan pixel ``(0, 0)``
+        and defaults to ``(0, 0)``.
+        For generic files, ``clip_on_load`` replaces values below 1 with 1 and
+        ``repair_nans`` replaces NaN-containing patterns with neighbor averages.
+        Both are opt-in; loading preserves the stored data by default.
         """
         loaded_metadata = {}
 
@@ -4629,6 +5167,8 @@ class HyperData:
                 data = read_4D(
                     str(data_path),
                     hdf5_dataset=hdf5_dataset,
+                    clip=clip_on_load,
+                    repair_nans=repair_nans,
                 )
 
         if (
@@ -4649,6 +5189,8 @@ class HyperData:
             polar_metadata = loaded_metadata.get('polar_metadata')
         if center_beam_metadata is None and loaded_metadata:
             center_beam_metadata = loaded_metadata.get('center_beam_metadata')
+        if real_origin is None:
+            real_origin = loaded_metadata.get('real_origin', (0.0, 0.0))
 
         flip_axes = self._normalize_flip_axes(flip_axis, data.ndim)
         if polar_metadata is not None and any(
@@ -4671,6 +5213,7 @@ class HyperData:
         self._denoise_engine = _DenoiseEngine(self.array)
         self.real_units = None
         self.real_conv_factor = None
+        self.real_origin = _normalize_real_origin(real_origin)
         self.reciprocal_units = None
         self.reciprocal_conv_factor = None
         self.unfold_metadata = deepcopy(
@@ -4777,17 +5320,28 @@ class HyperData:
             )
         if not isinstance(units, str) or not units.strip():
             raise ValueError(f"'{label}_units' must be a non-empty string.")
-        if not np.isscalar(conv_factor) or conv_factor <= 0:
-            raise ValueError(f"'{label}_conv_factor' must be a positive scalar.")
-        return units.strip(), float(conv_factor)
+        if label == 'real':
+            return units.strip(), _normalize_real_spacing(conv_factor)
+        try:
+            factor = float(conv_factor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"'{label}_conv_factor' must be a positive finite scalar.") from exc
+        if not np.isscalar(conv_factor) or not np.isfinite(factor) or factor <= 0:
+            raise ValueError(f"'{label}_conv_factor' must be a positive finite scalar.")
+        return units.strip(), factor
 
-    def set_real_scale(self, units: str, conv_factor: float):
+    def set_real_scale(self, units: str, conv_factor):
         """
-        Attach a real-space calibration in units per pixel.
+        Attach scalar or ``(y, x)`` real-space units per pixel.
         """
         units, conv_factor = self._validate_scale(units, conv_factor, 'real')
         self.real_units = units
         self.real_conv_factor = conv_factor
+        return self
+
+    def set_real_origin(self, origin):
+        """Set the physical ``(y, x)`` coordinate of scan pixel ``(0, 0)``."""
+        self.real_origin = _normalize_real_origin(origin)
         return self
 
     def set_reciprocal_scale(self, units: str, conv_factor: float):
@@ -4805,6 +5359,7 @@ class HyperData:
         """Remove the stored real-space calibration."""
         self.real_units = None
         self.real_conv_factor = None
+        self.real_origin = (0.0, 0.0)
         return self
 
     def clear_reciprocal_scale(self):
@@ -4813,8 +5368,64 @@ class HyperData:
         self.reciprocal_conv_factor = None
         return self
 
+    @classmethod
+    @contextmanager
+    def open_hdf5(cls, filename, hdf5_dataset=None):
+        """Open a 3D/4D HDF5 dataset for bounded-memory reading.
+
+        This reader is intentionally separate from ``HyperData(path)``: it
+        never pretends that every HyperData analysis method is lazy. Use
+        ``get_dp`` for one pattern or ``iter_chunks`` for scan blocks. Each
+        returned chunk is an independent in-memory HyperData object; unfolding
+        metadata is not attached to partial chunks.
+
+        Examples
+        --------
+        >>> with HyperData.open_hdf5('experiment.h5') as source:
+        ...     for scan_slices, block in source.iter_chunks((16, 16)):
+        ...         process(block)
+        """
+        path = Path(filename).expanduser()
+        if path.suffix.lower() not in {'.h5', '.hdf5', '.hdf', '.4denoise'}:
+            raise ValueError("open_hdf5 requires an HDF5 file path.")
+        if not path.is_file():
+            raise FileNotFoundError(f"'{path}' does not exist or is not a file.")
+
+        with h5py.File(path, 'r') as file:
+            file_format = _decode_hdf5_value(
+                file.attrs.get('fourdenoise_format', None)
+            )
+            if file_format == _HYPERDATA_HDF5_FORMAT:
+                if hdf5_dataset is not None and str(hdf5_dataset).strip('/\\') != 'array':
+                    raise ValueError(
+                        "Saved HyperData files contain their data at '/array'; "
+                        "omit hdf5_dataset or use '/array'."
+                    )
+                if 'array' not in file:
+                    raise ValueError(f"'{path}' does not contain a saved data array.")
+                dataset = file['array']
+                metadata = {}
+                if 'metadata' in file:
+                    group = file['metadata']
+                    for key in (
+                        'real_units', 'real_conv_factor', 'real_origin',
+                        'reciprocal_units', 'reciprocal_conv_factor',
+                        'polar_metadata', 'center_beam_metadata',
+                    ):
+                        if key in group:
+                            metadata[key] = _read_hdf5_value(group, key)
+            else:
+                dataset = _select_hdf5_dataset(file, hdf5_dataset)
+                metadata = {}
+
+            reader = _HDF5ChunkReader(dataset, cls, metadata)
+            try:
+                yield reader
+            finally:
+                reader._closed = True
+
     def save(self, filename, overwrite=False, compression='gzip',
-             compression_opts=4):
+             compression_opts=4, atomic=True):
         """
         Save this HyperData object with its metadata.
 
@@ -4835,6 +5446,11 @@ class HyperData:
         compression_opts : int or None, optional
             Compression level/options passed to HDF5. For gzip, values usually
             range from 0 to 9.
+        atomic : bool, optional
+            Write to a temporary file in the destination directory and publish
+            it only after a complete save. This protects an existing file from
+            partial writes, but temporarily requires space for both copies
+            when overwriting. Set False to write directly as before.
 
         Returns
         -------
@@ -4856,6 +5472,10 @@ class HyperData:
                 "HyperData.save supports '.4denoise', '.h5', and '.hdf5' "
                 f"files; got '{path.suffix}'."
             )
+        if not isinstance(overwrite, (bool, np.bool_)):
+            raise ValueError("overwrite must be a boolean.")
+        if not isinstance(atomic, (bool, np.bool_)):
+            raise ValueError("atomic must be a boolean.")
         if path.exists() and not overwrite:
             raise FileExistsError(
                 f"'{path}' already exists. Use overwrite=True to replace it."
@@ -4864,47 +5484,67 @@ class HyperData:
             raise FileNotFoundError(
                 f"Output directory '{path.parent}' does not exist."
             )
-        if not isinstance(overwrite, (bool, np.bool_)):
-            raise ValueError("overwrite must be a boolean.")
         if compression is not None and not isinstance(compression, str):
             raise ValueError("compression must be a string or None.")
 
         metadata = {
             'real_units': self.real_units,
             'real_conv_factor': self.real_conv_factor,
+            'real_origin': self.real_origin,
             'reciprocal_units': self.reciprocal_units,
             'reciprocal_conv_factor': self.reciprocal_conv_factor,
-            'polar_metadata': deepcopy(self.polar_metadata),
-            'unfold_metadata': deepcopy(self.unfold_metadata),
-            'center_beam_metadata': deepcopy(self.center_beam_metadata),
+            'polar_metadata': self.polar_metadata,
+            'unfold_metadata': self.unfold_metadata,
+            'center_beam_metadata': self.center_beam_metadata,
         }
 
-        with h5py.File(path, 'w') as file:
-            file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
-            file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
-            file.attrs['saved_class'] = 'HyperData'
-            file.attrs['array_ndim'] = self.ndim
-            file.attrs['array_dtype'] = str(self.dtype)
+        def _write_file(target):
+            with h5py.File(target, 'w') as file:
+                file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
+                file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
+                file.attrs['saved_class'] = 'HyperData'
+                file.attrs['array_ndim'] = self.ndim
+                file.attrs['array_dtype'] = str(self.dtype)
 
-            file.create_dataset(
-                'array',
-                data=self.array,
-                **_hdf5_dataset_kwargs(
-                    self.array,
-                    compression,
-                    compression_opts,
-                ),
-            )
-            metadata_group = file.create_group('metadata')
-            metadata_group.attrs['kind'] = 'dict'
-            for key, value in metadata.items():
-                _write_hdf5_value(
-                    metadata_group,
-                    key,
-                    value,
-                    compression=compression,
-                    compression_opts=compression_opts,
+                file.create_dataset(
+                    'array',
+                    data=self.array,
+                    **_hdf5_dataset_kwargs(
+                        self.array,
+                        compression,
+                        compression_opts,
+                    ),
                 )
+                metadata_group = file.create_group('metadata')
+                metadata_group.attrs['kind'] = 'dict'
+                for key, value in metadata.items():
+                    _write_hdf5_value(
+                        metadata_group,
+                        key,
+                        value,
+                        compression=compression,
+                        compression_opts=compression_opts,
+                    )
+
+        if not atomic:
+            _write_file(path)
+            return str(path)
+
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent,
+        )
+        os.close(descriptor)
+        temp_path = Path(temp_name)
+        try:
+            _write_file(temp_path)
+            if overwrite:
+                os.replace(temp_path, path)
+            else:
+                # Linking publishes the finished file without a race that
+                # could overwrite a destination created by another process.
+                os.link(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
         return str(path)
 
@@ -4914,8 +5554,10 @@ class HyperData:
                reciprocal_units=_SCALE_UNSET,
                reciprocal_conv_factor=_SCALE_UNSET,
                polar_metadata=_SCALE_UNSET,
-               center_beam_metadata=_SCALE_UNSET):
-        """Create a new HyperData object while preserving calibration."""
+               center_beam_metadata=_SCALE_UNSET,
+               real_origin=_SCALE_UNSET,
+               preserve_unfold=False):
+        """Create an object; retain unfolding only for shape-preserving values."""
         if real_units is _SCALE_UNSET:
             real_units = self.real_units
         if real_conv_factor is _SCALE_UNSET:
@@ -4927,9 +5569,14 @@ class HyperData:
         if polar_metadata is _SCALE_UNSET:
             polar_metadata = self.polar_metadata
         if center_beam_metadata is _SCALE_UNSET:
-            center_beam_metadata = self.center_beam_metadata
+            center_beam_metadata = (
+                self.center_beam_metadata
+                if tuple(data.shape[-2:]) == self.k_shape else None
+            )
+        if real_origin is _SCALE_UNSET:
+            real_origin = self.real_origin
 
-        return HyperData(
+        result = HyperData(
             data,
             real_units=real_units,
             real_conv_factor=real_conv_factor,
@@ -4941,7 +5588,11 @@ class HyperData:
                 if center_beam_metadata is not None
                 else None
             ),
+            real_origin=real_origin,
         )
+        if preserve_unfold and result.shape == self.shape:
+            result.unfold_metadata = deepcopy(self.unfold_metadata)
+        return result
 
     def _spawn_reciprocal(self, data, units=_SCALE_UNSET,
                           conv_factor=_SCALE_UNSET,
@@ -4968,13 +5619,19 @@ class HyperData:
             ),
         )
 
-    def _spawn_real(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET):
+    def _spawn_real(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET,
+                    origin=_SCALE_UNSET, quantity='Intensity', value_units=None):
         """Create a RealSpace object using this dataset's calibration."""
         if units is _SCALE_UNSET:
             units = self.real_units
         if conv_factor is _SCALE_UNSET:
             conv_factor = self.real_conv_factor
-        return RealSpace(data, units=units, conv_factor=conv_factor)
+        if origin is _SCALE_UNSET:
+            origin = self.real_origin
+        return RealSpace(
+            data, units=units, conv_factor=conv_factor, origin=origin,
+            quantity=quantity, value_units=value_units,
+        )
 
     def copy(self):
         """
@@ -5056,63 +5713,6 @@ class HyperData:
             center_x + centers[:, 1] / float(conv_factor),
         ))
 
-    @staticmethod
-    def _parse_real_selection(value, max_len, name, mode, conv_factor):
-        """Parse scalar/range real-space selections into half-open pixel slices."""
-        if value is None:
-            return 0, max_len, 'all'
-
-        is_pair = (
-            isinstance(value, (tuple, list, np.ndarray))
-            and np.asarray(value).shape == (2,)
-        )
-        if is_pair:
-            a, b = np.asarray(value, dtype=float)
-            if not np.all(np.isfinite((a, b))):
-                raise ValueError(f"{name} range must contain finite values.")
-            if mode == 'calibrated':
-                a = a / conv_factor
-                b = b / conv_factor
-                start = int(np.floor(a))
-                stop = int(np.ceil(b))
-            else:
-                if not float(a).is_integer() or not float(b).is_integer():
-                    raise ValueError(
-                        f"{name} range must contain integer pixel indices when "
-                        "selection_units='pixels'."
-                    )
-                start = int(a)
-                stop = int(b)
-            if not (0 <= start < stop <= max_len):
-                raise ValueError(
-                    f"Invalid {name} range ({value[0]}, {value[1]}) for "
-                    f"length {max_len} using {mode} units."
-                )
-            return start, stop, 'range'
-
-        if np.isscalar(value):
-            value = float(value)
-            if not np.isfinite(value):
-                raise ValueError(f"{name} index must be finite.")
-            if mode == 'calibrated':
-                index = int(np.rint(value / conv_factor))
-            else:
-                if not value.is_integer():
-                    raise ValueError(
-                        f"{name} index must be an integer when "
-                        "selection_units='pixels'."
-                    )
-                index = int(value)
-            if not (0 <= index < max_len):
-                raise ValueError(
-                    f"{name} index {value:g} out of bounds for length "
-                    f"{max_len} using {mode} units."
-                )
-            return index, index + 1, 'index'
-
-        raise ValueError(f"{name} must be a scalar, a length-2 range, or None.")
-
-
     @property
     def available_denoising_methods(self):
         """Return denoising method names available through :meth:`denoise`."""
@@ -5170,7 +5770,7 @@ class HyperData:
         if return_array or not isinstance(result, np.ndarray):
             return result
 
-        return self._spawn(result)
+        return self._spawn(result, preserve_unfold=True)
 
     @staticmethod
     def _normalize_scalar_rank(rank):
@@ -5582,7 +6182,7 @@ class HyperData:
                resize_side=None, resize_side_mode='nearest',
                resize_method='linear', preserve_original=False,
                undo=False, metadata=None, original_shape=None,
-               return_metadata=False):
+               return_metadata=False, plot_traversal=False, plot_kwargs=None):
         """
         Unfold or restore a 4D-STEM tensor using explicit domain/method choices.
 
@@ -5644,6 +6244,18 @@ class HyperData:
             ``(Ry, Rx)`` is taken from the stack.
         return_metadata : bool, optional
             If True, return ``(result, metadata)``.
+        plot_traversal : bool, optional
+            Plot the selected traversal when unfolding. For ``domain='both'``,
+            show separate real- and reciprocal-space paths. Not available for
+            ``undo=True`` or ``method='coordinate_aligned'``.
+        plot_kwargs : dict or None, optional
+            Options passed to :func:`plot_traversals`, except ``method``, which
+            always matches this unfolding. By default ``grid_shape`` is the
+            actual traversal grid (after any resize). Set ``grid_shape`` for a
+            smaller preview; that figure may differ from the exact path used
+            on the data. Other options include ``cmap``, ``linewidth``,
+            ``show_grid``, ``mark_endpoints``, ``ncols``, and ``show``.
+            ``show=False`` leaves the figure open without displaying it.
 
         Returns
         -------
@@ -5670,7 +6282,34 @@ class HyperData:
         ...     domain='real',
         ...     original_shape=original.shape,
         ... )
+        >>> preview = hd.unfold(
+        ...     method='hilbert', plot_traversal=True,
+        ...     plot_kwargs={'grid_shape': (16, 16), 'cmap': 'viridis'},
+        ... )
         """
+        if not isinstance(plot_traversal, (bool, np.bool_)):
+            raise TypeError("plot_traversal must be a boolean.")
+        if plot_kwargs is not None and not isinstance(plot_kwargs, dict):
+            raise TypeError("plot_kwargs must be a dictionary or None.")
+        if plot_kwargs and not plot_traversal:
+            raise ValueError("Set plot_traversal=True to use plot_kwargs.")
+        if plot_traversal and undo:
+            raise ValueError("plot_traversal is only available when unfolding, not undoing.")
+
+        plot_options = dict(plot_kwargs or {})
+        if plot_traversal:
+            if 'method' in plot_options:
+                raise ValueError("plot_kwargs cannot override the unfolding method.")
+            valid_plot_options = {
+                'grid_shape', 'ncols', 'cmap', 'linewidth',
+                'show_grid', 'mark_endpoints', 'show',
+            }
+            unknown_options = set(plot_options) - valid_plot_options
+            if unknown_options:
+                raise TypeError(
+                    f"Unknown plot_kwargs: {', '.join(sorted(unknown_options))}."
+                )
+
         if undo:
             if metadata is None:
                 metadata = getattr(self, 'unfold_metadata', None)
@@ -5692,6 +6331,10 @@ class HyperData:
             return result
 
         domain, method = _normalize_unfold_request(domain=domain, method=method)
+        if plot_traversal and method == 'coordinate_aligned':
+            raise ValueError(
+                "coordinate_aligned rearranges axes, so it has no 2D traversal to plot."
+            )
         if not isinstance(curve_shape_strategy, str):
             raise ValueError("curve_shape_strategy must be a string.")
         curve_shape_strategy = curve_shape_strategy.lower()
@@ -5767,6 +6410,31 @@ class HyperData:
         result = working._spawn(unfolded)
         result.unfold_metadata = metadata
 
+        if plot_traversal:
+            preview_shape = plot_options.pop('grid_shape', None)
+            show_plot = plot_options.pop('show', True)
+            domains_to_plot = ('real', 'reciprocal') if domain == 'both' else (domain,)
+            for plotted_domain in domains_to_plot:
+                axis_slice = slice(0, 2) if plotted_domain == 'real' else slice(2, 4)
+                grid_shape = tuple(working.shape[axis_slice])
+                plotted_shape = grid_shape if preview_shape is None else preview_shape
+                fig, _ = plot_traversals(
+                    method, grid_shape=plotted_shape, show=False, **plot_options,
+                )
+                title = f"{plotted_domain.capitalize()}-space traversal"
+                if preview_shape is not None:
+                    title += f" preview (data grid {grid_shape[0]}x{grid_shape[1]})"
+                else:
+                    original_grid = tuple(self.shape[axis_slice])
+                    if original_grid != grid_shape:
+                        title += (
+                            f" (resized from {original_grid[0]}x{original_grid[1]}"
+                            f" to {grid_shape[0]}x{grid_shape[1]})"
+                        )
+                fig.suptitle(title)
+            if show_plot:
+                plt.show()
+
         if return_metadata:
             return result, metadata
         return result
@@ -5830,13 +6498,30 @@ class HyperData:
         
         # The original order is (0, 1, 2, 3) and we want to change to (2, 3, 0, 1)
         swapped_data = np.transpose(self.array, (2, 3, 0, 1))
-        
+        reciprocal_factor = self.real_conv_factor
+        reciprocal_units = self.real_units
+        if reciprocal_factor is not None and not np.isscalar(reciprocal_factor):
+            y_step, x_step = _real_spacing_pair(reciprocal_factor)
+            if np.isclose(y_step, x_step):
+                reciprocal_factor = y_step
+            else:
+                reciprocal_factor = None
+                reciprocal_units = None
+                warnings.warn(
+                    "swap_domains cleared anisotropic real-space calibration "
+                    "because reciprocal-space calibration is scalar-only.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         return self._spawn(
             swapped_data,
             real_units=self.reciprocal_units,
             real_conv_factor=self.reciprocal_conv_factor,
-            reciprocal_units=self.real_units,
-            reciprocal_conv_factor=self.real_conv_factor,
+            real_origin=(0.0, 0.0),
+            reciprocal_units=reciprocal_units,
+            reciprocal_conv_factor=reciprocal_factor,
+            center_beam_metadata=None,
         )
     
     
@@ -6096,10 +6781,14 @@ class HyperData:
 
         def _normalized_template_correlation(dp_region, template):
             corr = fftconvolve(dp_region, template[::-1, ::-1], mode='same')
-            support = np.ones_like(template)
-            local_sum = fftconvolve(dp_region, support[::-1, ::-1], mode='same')
-            local_sum_sq = fftconvolve(dp_region**2, support[::-1, ::-1], mode='same')
-            n_pix = support.size
+            n_pix = template.size
+            # A box filter gives the same zero-padded support sums without two FFTs.
+            local_sum = uniform_filter(
+                dp_region, size=template.shape, mode='constant', cval=0.0
+            ) * n_pix
+            local_sum_sq = uniform_filter(
+                dp_region**2, size=template.shape, mode='constant', cval=0.0
+            ) * n_pix
             local_energy = local_sum_sq - (local_sum**2 / n_pix)
             local_energy = np.maximum(local_energy, 0)
             denom = np.sqrt(local_energy)
@@ -6151,9 +6840,7 @@ class HyperData:
             )
             max_idx = (local_max_idx[0] + y0, local_max_idx[1] + x0)
 
-            corr = np.full((pattern_ky, pattern_kx), -np.inf, dtype=float)
-            corr[y0:y1, x0:x1] = corr_region
-            return corr, max_idx, corr[max_idx]
+            return corr_region, max_idx, corr_region[local_max_idx], (y0, x0)
 
         def _resolve_radius_reference_dp():
             if radius_reference_dp is None:
@@ -6197,7 +6884,7 @@ class HyperData:
             best_center = (center_y, center_x)
             best_score = -np.inf
             for candidate_radius in radii:
-                _, match_center, score = _integer_template_match(
+                _, match_center, score, _ = _integer_template_match(
                     representative_dp,
                     candidate_radius,
                     search_radius_value=search_radius,
@@ -6220,9 +6907,8 @@ class HyperData:
 
             for i in tqdm(range(y), desc=f"Template-matching {template} centers"):
                 for j in range(x):
-                    dp = np.asarray(array[i, j], dtype=float)
-                    corr, max_idx, _ = _integer_template_match(
-                        dp,
+                    corr, max_idx, _, corr_origin = _integer_template_match(
+                        array[i, j],
                         effective_r_center,
                         search_radius_value=pattern_search_radius,
                         center_value=reference_center,
@@ -6230,10 +6916,14 @@ class HyperData:
                     )
 
                     refine_radius = max(2, int(np.ceil(effective_r_center / 4)))
-                    y0 = max(0, max_idx[0] - refine_radius)
-                    y1 = min(pattern_ky, max_idx[0] + refine_radius + 1)
-                    x0 = max(0, max_idx[1] - refine_radius)
-                    x1 = min(pattern_kx, max_idx[1] + refine_radius + 1)
+                    y0 = max(0, max_idx[0] - refine_radius - corr_origin[0])
+                    y1 = min(
+                        corr.shape[0], max_idx[0] + refine_radius + 1 - corr_origin[0]
+                    )
+                    x0 = max(0, max_idx[1] - refine_radius - corr_origin[1])
+                    x1 = min(
+                        corr.shape[1], max_idx[1] + refine_radius + 1 - corr_origin[1]
+                    )
                     patch = corr[y0:y1, x0:x1]
                     finite_mask = np.isfinite(patch)
                     if not np.any(finite_mask):
@@ -6249,8 +6939,12 @@ class HyperData:
                     total = np.sum(weights)
                     if total > 0:
                         yy, xx = np.indices(weights.shape)
-                        fit_y[i, j] = y0 + np.sum(yy * weights) / total
-                        fit_x[i, j] = x0 + np.sum(xx * weights) / total
+                        fit_y[i, j] = (
+                            corr_origin[0] + y0 + np.sum(yy * weights) / total
+                        )
+                        fit_x[i, j] = (
+                            corr_origin[1] + x0 + np.sum(xx * weights) / total
+                        )
                     else:
                         fit_y[i, j], fit_x[i, j] = max_idx
 
@@ -6438,7 +7132,9 @@ class HyperData:
             return aligned_obj
 
         com_y, com_x = self._quickCOM(r_mask=r_center, center=center) 
-        cbed_tran = np.copy(self.array)
+        cbed_tran = np.array(
+            self.array, dtype=np.result_type(self.dtype, np.float32), copy=True
+        )
         cbed_tran_Obj = self._spawn(cbed_tran)
         initial_std_com = (np.std(com_y), np.std(com_x))
         initial_mean_com = (np.mean(com_y), np.mean(com_x))
@@ -6455,8 +7151,8 @@ class HyperData:
                 for j in range(x):
                     afine_tf = transform.AffineTransform(
                         translation=(
-                            com_y[i, j] - center_y,
                             com_x[i, j] - center_x,
+                            com_y[i, j] - center_y,
                         )
                     )
                     cbed_tran[i,j,:,:] = transform.warp(
@@ -6465,7 +7161,6 @@ class HyperData:
                         preserve_range=True,
                     )
         
-            cbed_tran_Obj = self._spawn(cbed_tran)
             com_y, com_x = cbed_tran_Obj._quickCOM(
                 r_mask=r_center,
                 center=center,
@@ -6624,7 +7319,7 @@ class HyperData:
                     prefilter=order > 1,
                 )
 
-            return self._spawn(new_data)
+            return self._spawn(new_data, center_beam_metadata=None)
 
         if self.ndim == 4:
             y_size, x_size = self.shape[:2]
@@ -6672,7 +7367,7 @@ class HyperData:
                     order=int(order),
                 )
 
-        return self._spawn(new_data)
+        return self._spawn(new_data, center_beam_metadata=None)
     
     def standardize(self, method='local'):
         """
@@ -6732,7 +7427,7 @@ class HyperData:
             # Standardize each image independently
             standardized_tensor = (arr - mean) / (std + 1)
     
-        return self._spawn(standardized_tensor)
+        return self._spawn(standardized_tensor, preserve_unfold=True)
 
     def normalize(self, method='global'):
         """
@@ -6801,7 +7496,7 @@ class HyperData:
     
             normalized_tensor = (arr - min_val) / denom_safe
     
-        return self._spawn(normalized_tensor)
+        return self._spawn(normalized_tensor, preserve_unfold=True)
 
     
     def _resolve_clip_mask(self, mask):
@@ -6915,7 +7610,9 @@ class HyperData:
         This method does not mutate ``self.array``.
         """
         if mask is None:
-            return self._spawn(clip_values(self.array, a_min, a_max))
+            return self._spawn(
+                clip_values(self.array, a_min, a_max), preserve_unfold=True,
+            )
 
         resolved_mask = self._resolve_clip_mask(mask)
         selected_values = clip_values(
@@ -6929,7 +7626,7 @@ class HyperData:
         )
         clipped = self.array.astype(output_dtype, copy=True)
         clipped[resolved_mask] = selected_values
-        return self._spawn(clipped)
+        return self._spawn(clipped, preserve_unfold=True)
 
     def block_direct_beam(self, radius=None, center=None, beam_units='auto',
                           fill_value=1, return_mask=False):
@@ -7010,7 +7707,7 @@ class HyperData:
         blocked = self.array.astype(output_dtype, copy=True)
         blocked[..., beam_mask] = fill_value
 
-        result = self._spawn(blocked)
+        result = self._spawn(blocked, preserve_unfold=True)
         resolved_metadata.update({
             'source': 'block_direct_beam',
             'fill_value': fill_value,
@@ -7055,15 +7752,19 @@ class HyperData:
             Shape (A, B) to resize cropped diffraction patterns to.
             If not provided, it is inferred from the cropped reciprocal region
             when subpixel cropping or explicit k-limits are used.
+            Interpolating integer data returns floating-point output so detector
+            counts retain their original range and subpixel values.
         rshape : tuple of (int, int), optional
             Shape (Ny_out, Nx_out) for real-space resizing (generalized binning).
             - If rshape divides the current real-space shape, block-averaging
               (binning) is used.
             - Otherwise, bilinear interpolation is used along the real-space axes.
+            Resampling integer data produces floating-point output so fractional
+            counts are not truncated.
         real_limit_units : {'auto', 'pixels', 'calibrated'}, optional
             Unit system used for ``ylim`` and ``xlim``. ``'auto'`` uses stored
             real-space calibration when available and otherwise falls back to
-            pixels.
+            pixels. Calibrated limits account for the image's real-space origin.
         reciprocal_limit_units : {'auto', 'pixels', 'calibrated'}, optional
             Unit system used for ``kylim`` and ``kxlim``. ``'auto'`` uses
             stored reciprocal-space calibration when available and otherwise
@@ -7111,7 +7812,8 @@ class HyperData:
         )
     
         def parse_limits(limits, max_length, allow_float=False, name="limits",
-                         unit_mode='pixels', conv_factor=None, axis='real'):
+                         unit_mode='pixels', conv_factor=None, axis='real',
+                         origin=0.0):
             """Return (start, end) within [0, max_length]."""
             if limits is None:
                 return (0, max_length)
@@ -7120,7 +7822,7 @@ class HyperData:
                 if unit_mode != 'calibrated':
                     return float(value)
                 if axis == 'real':
-                    return float(value) / conv_factor
+                    return (float(value) - origin) / conv_factor
                 axis_center = (max_length - 1) / 2.0
                 if axis == 'reciprocal_y':
                     return axis_center - float(value) / conv_factor
@@ -7195,8 +7897,9 @@ class HyperData:
             allow_float=False,
             name="ylim",
             unit_mode=real_mode,
-            conv_factor=real_factor,
+            conv_factor=_real_spacing_pair(real_factor)[0],
             axis='real',
+            origin=self.real_origin[0],
         )
         xlim_range = parse_limits(
             xlim,
@@ -7204,15 +7907,23 @@ class HyperData:
             allow_float=False,
             name="xlim",
             unit_mode=real_mode,
-            conv_factor=real_factor,
+            conv_factor=_real_spacing_pair(real_factor)[1],
             axis='real',
+            origin=self.real_origin[1],
         )
     
         # Fast path: only real-space crop, no k-space crop or resizing, no r-resize
         if kylim is None and kxlim is None and kshape is None and rshape is None:
             y0r, y1r = ylim_range
             x0r, x1r = xlim_range
-            return self._spawn(self.array[y0r:y1r, x0r:x1r])
+            real_step = _real_spacing_pair(self.real_conv_factor)
+            new_origin = (
+                self.real_origin[0] + y0r * real_step[0],
+                self.real_origin[1] + x0r * real_step[1],
+            )
+            return self._spawn(
+                self.array[y0r:y1r, x0r:x1r], real_origin=new_origin,
+            )
     
         # --- Reciprocal-space limits (allow floats for subpixel cropping) ---
         kylim_range = parse_limits(
@@ -7291,21 +8002,23 @@ class HyperData:
             # If kshape is None here, fall back to natural_kshape
             if kshape is None:
                 kshape = natural_kshape
-    
+
+            resize_dtype = np.result_type(subarray.dtype, np.float32)
             new_data = np.empty(
                 (subarray.shape[0], subarray.shape[1], kshape[0], kshape[1]),
-                dtype=subarray.dtype,
+                dtype=resize_dtype,
             )
     
             for i in range(subarray.shape[0]):
                 for j in range(subarray.shape[1]):
                     dp = cropped[i, j]
                     new_data[i, j] = transform.resize(
-                        dp,
+                        dp.astype(resize_dtype, copy=False),
                         kshape,
                         order=1,          # bilinear
                         mode="reflect",
                         anti_aliasing=True,
+                        preserve_range=True,
                     )
     
             cropped = new_data
@@ -7336,7 +8049,7 @@ class HyperData:
                     )
                     # Average over the binning dimensions (1 and 3)
                     binned = reshaped.mean(axis=(1, 3))
-                    cropped = binned.astype(cropped.dtype, copy=False)
+                    cropped = binned
     
                 else:
                     # Case 2: non-divisors -> interpolation along real-space axes
@@ -7345,18 +8058,22 @@ class HyperData:
                     tmp = cropped.reshape(Ny_c, Nx_c, channels)
     
                     resized = transform.resize(
-                        tmp,
+                        tmp.astype(np.result_type(tmp.dtype, np.float32), copy=False),
                         (Ny_out, Nx_out, channels),
                         order=1,          # bilinear in real space
                         mode="reflect",
                         anti_aliasing=True,
+                        preserve_range=True,
                     )
-                    cropped = resized.reshape(Ny_out, Nx_out, Ky_c, Kx_c).astype(
-                        cropped.dtype, copy=False
-                    )
-    
+                    cropped = resized.reshape(Ny_out, Nx_out, Ky_c, Kx_c)
+
         new_real_conv = self.real_conv_factor
         new_reciprocal_conv = self.reciprocal_conv_factor
+        real_step = _real_spacing_pair(self.real_conv_factor)
+        new_real_origin = (
+            self.real_origin[0] + y0r * real_step[0],
+            self.real_origin[1] + x0r * real_step[1],
+        )
 
         if kshape is not None and self.reciprocal_conv_factor is not None:
             y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
@@ -7370,50 +8087,57 @@ class HyperData:
         if rshape is not None and self.real_conv_factor is not None:
             y_scale = (ylim_range[1] - ylim_range[0]) / rshape[0]
             x_scale = (xlim_range[1] - xlim_range[0]) / rshape[1]
-            if np.isclose(y_scale, x_scale):
-                new_real_conv = self.real_conv_factor * x_scale
-            else:
-                print("Warning: anisotropic real-space resizing cleared the stored real-space calibration.")
-                new_real_conv = None
+            new_real_conv = _scaled_real_spacing(
+                self.real_conv_factor, (y_scale, x_scale),
+            )
+            new_real_origin = (
+                new_real_origin[0] + 0.5 * (y_scale - 1) * real_step[0],
+                new_real_origin[1] + 0.5 * (x_scale - 1) * real_step[1],
+            )
 
         new_real_units = self.real_units if new_real_conv is not None else None
         new_reciprocal_units = (
             self.reciprocal_units if new_reciprocal_conv is not None else None
         )
 
+        k_geometry_changed = (
+            (y0, y1, x0, x1) != (0, Ky, 0, Kx) or needs_k_resize
+        )
+        beam_metadata = self.center_beam_metadata
+        if k_geometry_changed:
+            beam_metadata = None if subpixel or self.polar_metadata is not None else (
+                _resampled_center_beam_metadata(
+                    self.center_beam_metadata, (Ky, Kx), cropped.shape[-2:],
+                    crop_origin=(y0, x0), crop_shape=natural_kshape,
+                    units=new_reciprocal_units,
+                    conv_factor=new_reciprocal_conv,
+                )
+            )
+
         return self._spawn(
             cropped,
             real_units=new_real_units,
             real_conv_factor=new_real_conv,
+            real_origin=new_real_origin,
             reciprocal_units=new_reciprocal_units,
             reciprocal_conv_factor=new_reciprocal_conv,
+            center_beam_metadata=beam_metadata,
         )
-           
-    
+
     # Private method: helper function for the 'alignment' method
     def _quickCOM(self, r_mask=5, center=None):
+        """Return masked (ky, kx) centers of mass for every diffraction pattern.
+
+        A circular radius or ``(inner, outer)`` ring is accepted. Empty or
+        zero-intensity regions retain the historical center value of zero.
         """
-        Compute the center of mass (COM) of electron diffraction patterns within a 
-        4D-STEM dataset.
-        
-        Function based on that written by Chuqiao Shi (2022)
-        See on GitHub: Chuqiao2333/Hierarchical_Clustering
-        
-        Inputs:
-            cbed_data: 4D numpy array
-            r_mask   : radius of mask used for COM calculation (int or float) 
-        Outputs:
-            ap2_y, ap2_x : numpy arrays containing the x and y coordinates of the 
-            centers of mass for each position in the real-space grid.
-        """
-        
+
         y, x, ky, kx = np.shape(self.array)
         if center is None:
             center_y, center_x = (ky - 1) / 2, (kx - 1) / 2
         else:
             center_y, center_x = tuple(float(v) for v in center)
 
-        # Assuming make_mask function is defined elsewhere that creates a circular mask
         if type(r_mask) == tuple:
             inner_mask = make_mask((center_y, center_x), r_mask[0], mask_dim=(ky, kx), invert=True)
             outer_mask = make_mask((center_y, center_x), r_mask[1], mask_dim=(ky, kx))
@@ -7422,19 +8146,27 @@ class HyperData:
         else:
             mask = make_mask((center_y, center_x), r_mask, mask_dim=(ky, kx))
         
-        ap2_x = np.zeros((y, x))
-        ap2_y = np.zeros_like(ap2_x)
-        vx = np.arange(kx)
-        vy = np.arange(ky)
+        ap2_y = np.zeros((y, x), dtype=float)
+        ap2_x = np.zeros_like(ap2_y)
+        rows, cols = np.nonzero(mask)
+        if rows.size == 0:
+            return ap2_y, ap2_x
 
-        for i in tqdm(range(y), desc = 'Computing centers of mass'):
-            for j in range(x):
-                cbed = np.squeeze(self.array[i, j, :, :] * mask)
-                pnorm = np.sum(cbed)
-                if pnorm != 0:
-                    ap2_y[i, j] = np.sum(vy * np.sum(cbed, axis=1)) / pnorm
-                    ap2_x[i, j] = np.sum(vx * np.sum(cbed, axis=0)) / pnorm
-
+        y0, y1 = rows.min(), rows.max() + 1
+        x0, x1 = cols.min(), cols.max() + 1
+        region = self.array[:, :, y0:y1, x0:x1]
+        local_mask = mask[y0:y1, x0:x1]
+        mass = np.einsum('ijab,ab->ij', region, local_mask, dtype=float)
+        y_moment = np.einsum(
+            'ijab,ab->ij', region,
+            local_mask * np.arange(y0, y1)[:, None], dtype=float,
+        )
+        x_moment = np.einsum(
+            'ijab,ab->ij', region,
+            local_mask * np.arange(x0, x1)[None, :], dtype=float,
+        )
+        np.divide(y_moment, mass, out=ap2_y, where=mass != 0)
+        np.divide(x_moment, mass, out=ap2_x, where=mass != 0)
         return ap2_y, ap2_x
     
     def fix_elliptical_distortions(self, r=None, R=None, interp_method='linear', 
@@ -7698,20 +8430,21 @@ class HyperData:
                                             axes=(-2, -1)
                                             ),
                                        axes=(-2, -1)
-                                      )))
+                                      )), center_beam_metadata=None)
     
     
     def get_stdDev(self, domain='reciprocal'):
         """
-        Calculate a 2D mask of the standard deviation of each pixel across the
-        specified domain (real or reciprocal).
+        Calculate a 2D standard-deviation image over the other coordinate grid.
 
         Parameters:
         domain (string): the domain for which the standard deviation will be
         computer for each position.
 
-        Returns:
-        numpy array: 2D mask of standard deviations with same shape as specified domain.
+        Returns
+        -------
+        RealSpace or ReciprocalSpace
+            Calibrated 2D image for the requested domain.
         """
         # Validate the shape of the data
         if len(self.array.shape) != 4:
@@ -7724,7 +8457,7 @@ class HyperData:
         elif domain == 'real':
             # Calculate the standard deviation for each pixel across all scanning positions
             std_dev = np.std(self.array, axis=(2, 3))
-            return self._spawn_real(std_dev)
+            return self._spawn_real(std_dev, quantity='Standard deviation')
         else:
             raise ValueError("'domain' must be 'reciprocal' or 'real'")
     
@@ -7948,8 +8681,11 @@ class HyperData:
                 label='axis_units',
             )
             real_scale = 1.0 if real_scale is None else real_scale
-            x_labels = x_centers * real_scale
-            y_labels = y_centers * real_scale
+            y_scale, x_scale = _real_spacing_pair(real_scale)
+            x_origin = self.real_origin[1] if real_units is not None else 0.0
+            y_origin = self.real_origin[0] if real_units is not None else 0.0
+            x_labels = x_origin + x_centers * x_scale
+            y_labels = y_origin + y_centers * y_scale
             real_units = (
                 'scan px' if real_units is None
                 else self._spawn_real(
@@ -8098,19 +8834,21 @@ class HyperData:
             # Region via y/x. Units are resolved before random sampling.
             if self.ndim == 4 and (y is not None or x is not None):
                 A, B = self.shape[0], self.shape[1]
-                y0, y1, _ = self._parse_real_selection(
+                y0, y1, _ = _parse_real_selection(
                     y,
                     A,
                     'y',
                     selection_mode,
-                    selection_factor,
+                    _real_spacing_pair(selection_factor)[0],
+                    self.real_origin[0],
                 )
-                x0, x1, _ = self._parse_real_selection(
+                x0, x1, _ = _parse_real_selection(
                     x,
                     B,
                     'x',
                     selection_mode,
-                    selection_factor,
+                    _real_spacing_pair(selection_factor)[1],
+                    self.real_origin[1],
                 )
                 y_pos = rng.randint(y0, y1)
                 x_pos = rng.randint(x0, x1)
@@ -8162,19 +8900,21 @@ class HyperData:
         if y is not None or x is not None:
             if self.ndim == 4:
                 A, B = self.shape[0], self.shape[1]
-                y0, y1, y_kind = self._parse_real_selection(
+                y0, y1, y_kind = _parse_real_selection(
                     y,
                     A,
                     'y',
                     selection_mode,
-                    selection_factor,
+                    _real_spacing_pair(selection_factor)[0],
+                    self.real_origin[0],
                 )
-                x0, x1, x_kind = self._parse_real_selection(
+                x0, x1, x_kind = _parse_real_selection(
                     x,
                     B,
                     'x',
                     selection_mode,
-                    selection_factor,
+                    _real_spacing_pair(selection_factor)[1],
+                    self.real_origin[1],
                 )
 
                 if y_kind == 'index' and x_kind == 'index':
@@ -8290,15 +9030,21 @@ class HyperData:
     @staticmethod
     def _resized_calibration(units, conv_factor, scale_factors, label):
         """
-        Update isotropic units-per-pixel calibration after resizing.
+        Update units-per-pixel calibration after resizing.
 
-        A single scalar calibration cannot represent anisotropic pixels, so clear
-        it if the resize changes the two axes by different factors.
+        Real-space spacing may be anisotropic. Reciprocal-space calibration is
+        still scalar and is cleared if the resize makes its pixels anisotropic.
         """
         if conv_factor is None:
             return units, conv_factor
 
         scale_factors = tuple(float(v) for v in scale_factors)
+        if label == 'real' and len(scale_factors) == 2:
+            return units, _scaled_real_spacing(conv_factor, scale_factors)
+        if label == 'real' and len(scale_factors) == 1:
+            return units, _scaled_real_spacing(
+                conv_factor, (scale_factors[0], scale_factors[0]),
+            )
         if len(scale_factors) == 1 or np.allclose(scale_factors, scale_factors[0]):
             return units, conv_factor * scale_factors[0]
 
@@ -8326,6 +9072,9 @@ class HyperData:
             ``'area'`` performs weighted area averaging and supports
             downsampling only. ``'linear'`` and ``'nearest'`` use interpolation
             and support both downsampling and upsampling.
+
+        Real-space resizing updates each pixel spacing independently and
+        shifts ``real_origin`` to the center of the first output pixel.
         """
         if domain is None:
             raise ValueError("domain must be 'real' or 'reciprocal'.")
@@ -8378,6 +9127,7 @@ class HyperData:
 
         real_units = self.real_units
         real_conv = self.real_conv_factor
+        real_origin = self.real_origin
         reciprocal_units = self.reciprocal_units
         reciprocal_conv = self.reciprocal_conv_factor
         scale_factors = tuple(
@@ -8388,17 +9138,34 @@ class HyperData:
             real_units, real_conv = self._resized_calibration(
                 real_units, real_conv, scale_factors, 'real'
             )
+            if self.ndim == 4:
+                old_step = _real_spacing_pair(self.real_conv_factor)
+                real_origin = tuple(
+                    old_origin + 0.5 * (factor - 1) * step
+                    for old_origin, factor, step in zip(
+                        self.real_origin, scale_factors, old_step,
+                    )
+                )
         else:
             reciprocal_units, reciprocal_conv = self._resized_calibration(
                 reciprocal_units, reciprocal_conv, scale_factors, 'reciprocal'
             )
 
+        beam_metadata = self.center_beam_metadata
+        if domain == 'reciprocal' and output_shape != current_shape:
+            beam_metadata = _resampled_center_beam_metadata(
+                self.center_beam_metadata, current_shape, output_shape,
+                units=reciprocal_units, conv_factor=reciprocal_conv,
+            ) if self.polar_metadata is None else None
+
         return self._spawn(
             resized,
             real_units=real_units,
             real_conv_factor=real_conv,
+            real_origin=real_origin,
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_conv,
+            center_beam_metadata=beam_metadata,
         )
 
     def bin_data(self, domain=None, iterations=1, *, bin_domain=None):
@@ -8464,7 +9231,7 @@ class HyperData:
                       units='auto', mask_cmap='turbo', mask_vmin=None,
                       mask_vmax=None, mask_power=1, mask_log_scale=True,
                       mask_show_kwargs=None, ring_color='green',
-                      ring_alpha=0.3):
+                      ring_alpha=0.3, show=True):
         """
         Form a real-space virtual image using a reciprocal-space detector.
 
@@ -8543,6 +9310,9 @@ class HyperData:
             Whether to show axes in the real-space visualization.
         return_detector : bool, optional
             If True, also return the masked mean diffraction pattern.
+        show : bool, optional
+            Display the virtual image when True. Set False to return a
+            ``RealSpace`` image without creating its figure.
 
         Returns
         -------
@@ -8779,7 +9549,9 @@ class HyperData:
             self.array * detector_weights[None, None, :, :],
             axis=(2, 3),
         )
-        virtual_image = self._spawn_real(masked_image)
+        virtual_image = self._spawn_real(
+            masked_image, quantity='Virtual detector signal',
+        )
 
         detector_array = mean_detector * detector_weights
         if self.is_polar:
@@ -8804,17 +9576,18 @@ class HyperData:
         if vmax is None:
             vmax = np.max(masked_image)
 
-        virtual_image.show(
-            title=title,
-            cmap='gray',
-            vmin=vmin,
-            vmax=vmax,
-            axes=axes,
-            grid=grid,
-            num_div=num_div,
-            gridColor=grid_color,
-            axis_units=axis_units,
-        )
+        if show:
+            virtual_image.show(
+                title=title,
+                cmap='gray',
+                vmin=vmin,
+                vmax=vmax,
+                axes=axes,
+                grid=grid,
+                num_div=num_div,
+                grid_color=grid_color,
+                axis_units=axis_units,
+            )
 
         if plot_mask:
             mask_options = {
@@ -9000,9 +9773,8 @@ class HyperData:
               - 3D, ragged list:
                   `ref_coords[i]` is array-like of shape (n_i, 2) for each DP.
     
-        method : {'CoM', ...}, optional
-            Center-finding method to be passed to the underlying 2D
-            ReciprocalSpace.get_centers (e.g., 'CoM' for center-of-mass).
+        method : {'CoM', 'gaussian', 'elliptical_gaussian'}, optional
+            Local center-refinement method for each diffraction pattern.
         real_mask : ndarray[bool] or None, optional
             Only used for 4D datasets. Boolean mask of shape (Ny, Nx) defining
             which real-space positions (i, j) should have centers computed.
@@ -9056,11 +9828,9 @@ class HyperData:
                             row.append(c)
                             continue
     
-                        dp = self.get_dp(i, j, selection_units='pixels')
-                        c = dp.get_centers(r=r,
-                                           ref_coords=coords_ij,
-                                           show=False,
-                                           method=method)
+                        c = _peak_centers_from_array(
+                            self.array[i, j], r, coords_ij, method=method
+                        )
                         row.append(c)
                     centers.append(row)
                 return centers
@@ -9075,11 +9845,9 @@ class HyperData:
                     # If masked out, leave zeros and skip
                     if real_mask is not None and not real_mask[i, j]:
                         continue
-                    dp = self.get_dp(i, j, selection_units='pixels')
-                    all_centers[i, j] = dp.get_centers(r=r,
-                                                       ref_coords=coords,
-                                                       show=False,
-                                                       method=method)
+                    all_centers[i, j] = _peak_centers_from_array(
+                        self.array[i, j], r, coords, method=method
+                    )
             return all_centers
     
         # 3D case
@@ -9094,11 +9862,9 @@ class HyperData:
                 centers = []
                 for i in tqdm(range(B), desc="Computing centers (3D)"):
                     coords_i = np.asarray(ref_coords[i])
-                    dp = self.get_dp(i)
-                    c = dp.get_centers(r=r,
-                                       ref_coords=coords_i,
-                                       show=False,
-                                       method=method)
+                    c = _peak_centers_from_array(
+                        self.array[i], r, coords_i, method=method
+                    )
                     centers.append(c)
                 return centers
     
@@ -9107,11 +9873,9 @@ class HyperData:
             n_peaks = coords.shape[0]
             all_centers = np.zeros((B, n_peaks, 2), dtype=float)
             for i in tqdm(range(B), desc="Computing centers (3D)"):
-                dp = self.get_dp(i)
-                all_centers[i] = dp.get_centers(r=r,
-                                                ref_coords=coords,
-                                                show=False,
-                                                method=method)
+                all_centers[i] = _peak_centers_from_array(
+                    self.array[i], r, coords, method=method
+                )
             return all_centers
 
 
@@ -9143,20 +9907,18 @@ class HyperData:
                 arrays, so that `centers[i][j]` has shape (n_ij, 2) for DP (i, j).
               - 3D: list of length B of (n_i, 2) arrays, so that `centers[i]` has
                 shape (n_i, 2) for DP i.
-            If None, centers are computed via `self.get_centers(...)`, and
-            `ref_coords` and `method` are forwarded there.
+            If None, centers are refined from `ref_coords` within each
+            diffraction pattern before its intensities are integrated.
         ref_coords : array-like or nested list, optional
-            Reference peak coordinates used when `centers is None`, passed to
-            `self.get_centers(r, ref_coords=..., method=..., real_mask=...)`.
+            Reference peak coordinates used when `centers is None`.
             See `get_centers` for allowed formats.
-        method : {'CoM', ...}, optional
-            Center-finding method to be passed to `get_centers` if `centers` is None.
+        method : {'CoM', 'gaussian', 'elliptical_gaussian'}, optional
+            Center-finding method used if `centers` is None.
         compute_resBg : bool, optional
-            If True, estimate and subtract a residual background before integrating
-            intensities in each diffraction pattern (forwarded to dp.get_intensities).
+            If True, subtract the estimated residual background from each
+            integrated peak using its actual number of included pixels.
         residual_frac : float, optional
-            Fraction of low-valued pixels used to estimate residual background
-            (forwarded to dp.get_intensities).
+            Fraction of the estimated background to subtract per included pixel.
         real_mask : ndarray[bool] or None, optional
             Only used for 4D datasets. Boolean mask of shape (Ny, Nx) defining
             which real-space positions (i, j) should have intensities computed.
@@ -9177,34 +9939,35 @@ class HyperData:
         Returns
         -------
         all_ints : np.ndarray or list
-            If `centers` was an array (and all DPs share n_peaks), returns a
+            If the peak positions were an array (and all DPs share n_peaks), returns a
             fixed-shape ndarray:
               - (Ny, Nx, n_peaks) for 4D
               - (B,     n_peaks)  for 3D
     
-            If `centers` was a list (ragged), returns a list of the same shape,
+            If the peak positions were a list (ragged), returns a list of the same shape,
             where each entry is the 1D intensity array for that DP.
         """
         assert 2 < self.ndim < 5, "HyperData must be 3D or 4D"
     
-        # compute centers if not provided
-        if centers is None:
-            centers = self.get_centers(
-                r,
-                ref_coords=ref_coords,
-                method=method,
-                real_mask=real_mask,
-            )
-    
-        # helper to process a single DP
-        def compute_dp_int(dp, dp_centers):
-            return dp.get_intensities(
-                r             = r,
-                centers       = dp_centers,
-                compute_resBg = compute_resBg,
-                residual_frac = residual_frac,
-                **resBg_kwargs
-            )
+        infer_centers = centers is None
+        if infer_centers and ref_coords is None:
+            raise ValueError("ref_coords is required when centers is None.")
+
+        def compute_dp_int(dp_array, dp_centers=None, dp_refs=None):
+            if dp_centers is None:
+                dp_centers = _peak_centers_from_array(
+                    dp_array, r, dp_refs, method=method
+                )
+            if compute_resBg:
+                dp = self._spawn_reciprocal(dp_array)
+                return dp.get_intensities(
+                    r=r,
+                    centers=dp_centers,
+                    compute_resBg=True,
+                    residual_frac=residual_frac,
+                    **resBg_kwargs,
+                )
+            return _peak_intensities_from_array(dp_array, r, dp_centers)
     
         # --------------------------- 4D case ---------------------------- #
         if self.ndim == 4:
@@ -9219,39 +9982,48 @@ class HyperData:
                     )
     
             # ragged (list-of-lists) branch
-            if isinstance(centers, list):
+            source = ref_coords if infer_centers else centers
+            if isinstance(source, list):
                 all_ints = []
                 for i in tqdm(range(Ny), desc="Row"):
                     row_ints = []
                     for j in range(Nx):
-                        dp_centers = np.asarray(centers[i][j])  # shape (n_ij, 2)
-    
+                        dp_coords = np.asarray(source[i][j])
+
                         # If masked out, skip computation and fill zeros
                         if real_mask is not None and not real_mask[i, j]:
-                            if dp_centers.size == 0:
-                                row_ints.append(np.zeros(0, dtype=float))
-                            else:
-                                row_ints.append(np.zeros(dp_centers.shape[0], dtype=float))
+                            row_ints.append(np.zeros(len(dp_coords), dtype=float))
                             continue
-    
-                        dp = self.get_dp(i, j, selection_units='pixels')
-                        row_ints.append(compute_dp_int(dp, dp_centers))
+
+                        if infer_centers:
+                            row_ints.append(compute_dp_int(
+                                self.array[i, j], dp_refs=dp_coords
+                            ))
+                        else:
+                            row_ints.append(compute_dp_int(
+                                self.array[i, j], dp_centers=dp_coords
+                            ))
                     all_ints.append(row_ints)
                 return all_ints
-    
+
             # fixed-shape array branch
             else:
-                centers_arr = np.asarray(centers)
-                n_peaks = centers_arr.shape[-2]
+                source_arr = np.asarray(source)
+                n_peaks = source_arr.shape[-2]
                 all_ints = np.zeros((Ny, Nx, n_peaks), dtype=float)
                 for i in tqdm(range(Ny), desc="Calculating intensities"):
                     for j in range(Nx):
                         # If masked out, leave zeros and skip
                         if real_mask is not None and not real_mask[i, j]:
                             continue
-                        dp_centers = centers_arr[i, j]  # (n_peaks, 2)
-                        dp = self.get_dp(i, j, selection_units='pixels')
-                        all_ints[i, j, :] = compute_dp_int(dp, dp_centers)
+                        if infer_centers:
+                            all_ints[i, j, :] = compute_dp_int(
+                                self.array[i, j], dp_refs=source_arr
+                            )
+                        else:
+                            all_ints[i, j, :] = compute_dp_int(
+                                self.array[i, j], dp_centers=source_arr[i, j]
+                            )
                 return all_ints
     
         # --------------------------- 3D case ---------------------------- #
@@ -9262,23 +10034,35 @@ class HyperData:
             B, _, _ = self.shape
     
             # ragged (list) branch
-            if isinstance(centers, list):
+            source = ref_coords if infer_centers else centers
+            if isinstance(source, list):
                 all_ints = []
                 for i in tqdm(range(B), desc="DP"):
-                    dp_centers = np.asarray(centers[i])  # shape (n_i, 2)
-                    dp = self.get_dp(i)
-                    all_ints.append(compute_dp_int(dp, dp_centers))
+                    dp_coords = np.asarray(source[i])
+                    if infer_centers:
+                        all_ints.append(compute_dp_int(
+                            self.array[i], dp_refs=dp_coords
+                        ))
+                    else:
+                        all_ints.append(compute_dp_int(
+                            self.array[i], dp_centers=dp_coords
+                        ))
                 return all_ints
     
             # fixed-shape array branch
             else:
-                centers_arr = np.asarray(centers)
-                n_peaks = centers_arr.shape[-2]
+                source_arr = np.asarray(source)
+                n_peaks = source_arr.shape[-2]
                 all_ints = np.zeros((B, n_peaks), dtype=float)
                 for i in tqdm(range(B), desc="Calculating intensities"):
-                    dp_centers = centers_arr[i]  # (n_peaks, 2)
-                    dp = self.get_dp(i)
-                    all_ints[i, :] = compute_dp_int(dp, dp_centers)
+                    if infer_centers:
+                        all_ints[i, :] = compute_dp_int(
+                            self.array[i], dp_refs=source_arr
+                        )
+                    else:
+                        all_ints[i, :] = compute_dp_int(
+                            self.array[i], dp_centers=source_arr[i]
+                        )
                 return all_ints
 
     
@@ -10352,7 +11136,7 @@ class HyperData:
                         f"got {mask.shape}."
                     )
 
-                return self._spawn(data * mask)
+                return self._spawn(data * mask, preserve_unfold=True)
 
             raise ValueError(
                 "When 'mask' is provided, 'domain' must be either 'real' or "
@@ -10379,7 +11163,7 @@ class HyperData:
                 mask_dim=(ky, kx),
             )
 
-        return self._spawn(data * bool_mask)
+        return self._spawn(data * bool_mask, preserve_unfold=True)
     
     @staticmethod
     def _majority_filter_labels(labels, size):
@@ -10400,7 +11184,7 @@ class HyperData:
             best_count[replace] = counts[replace]
         return result
 
-    def get_clusters(self, n_PCAcomponents, n_clusters, r_centerBeam=None,
+    def get_clusters(self, n_PCAcomponents=None, n_clusters=None, r_centerBeam=None,
                      std_Threshold=0.2, power=1, clustering_method="k-means",
                      plotStdMask=False, plotScree=False, plotClusterMap=False,
                      plot3dClusterMap=False, filter_size=None, cluster_cmap=None,
@@ -10410,8 +11194,12 @@ class HyperData:
                      normalize='none', pca_fit_samples=None, random_state=0,
                      batch_size=None, return_diagnostics=False,
                      include_mean_dps=False, split_connectivity=2,
-                     max_plot_points=10000):
-        """Cluster a 4D scan using selected detector pixels and incremental PCA.
+                     max_plot_points=10000, n_components=None, fit_samples=None,
+                     reduction_method='pca', feature_weighting='hard',
+                     soft_weight_scale=None, gmm_covariance_type='diag',
+                     hdbscan_min_cluster_size=20, hdbscan_min_samples=None,
+                     nmf_epochs=3):
+        """Cluster a 4D scan from weighted detector pixels and reduced features.
 
         The return value is a ``(Ry, Rx)`` integer label array. Set
         ``return_diagnostics=True`` for ``(labels, details)``. No intermediate
@@ -10419,8 +11207,12 @@ class HyperData:
 
         Parameters
         ----------
-        n_PCAcomponents, n_clusters : int
-            PCA components and requested initial cluster count.
+        n_components : int or None
+            Number of PCA or NMF components. Use this name for new calls;
+            ``n_PCAcomponents`` remains accepted by existing notebooks.
+        n_clusters : int or None
+            Requested cluster count. Must be None for HDBSCAN, which selects
+            its own number of clusters and may label outliers as -1.
         r_centerBeam, outer_ring : float or None
             Inner exclusion radius and optional outer limit. ``None`` means
             no inner/outer limit. Values use ``detector_units``.
@@ -10432,11 +11224,21 @@ class HyperData:
             Optional ``(Ky, Kx)`` or ``(Kr, Ktheta)`` mask intersected with
             the radial selection.
         std_Threshold : float
-            Keep pixels whose transformed-data standard deviation is at least
-            this fraction of the largest pixel standard deviation.
+            With ``feature_weighting='hard'``, keep pixels whose transformed-
+            data standard deviation is at least this fraction of the maximum.
+        feature_weighting : {'hard', 'soft', 'none'}
+            Hard uses the previous Boolean threshold. Soft retains every
+            varying pixel in the detector selection and assigns weight
+            ``std / (std + soft_weight_scale)``. None retains all selected
+            pixels with unit weight. Physical exclusions still use the hard
+            ``detector_mask`` and radial limits.
+        soft_weight_scale : positive float or None
+            Scale in transformed-data standard-deviation units. None uses the
+            75th percentile of positive pixel deviations, avoiding dependence
+            on a single unusually variable detector pixel. Only for soft mode.
         intensity_transform : {'log', 'log1p', 'sqrt', 'raw'}
             Transform nonnegative detector intensities before feature selection
-            and PCA. ``'log'`` uses ``log(max(I, 1))``; ``'raw'`` leaves
+            and decomposition. ``'log'`` uses ``log(max(I, 1))``; ``'raw'`` leaves
             intensities unchanged. Negative inputs are clipped to zero.
         power : positive float
             Exponent applied *after* ``intensity_transform``. Thus ``power=2``
@@ -10446,14 +11248,31 @@ class HyperData:
             ``'total'`` divides each pattern by its mean nonnegative signal
             over the radial detector region before transforming it. This
             removes overall brightness variation but preserves relative spots.
-        clustering_method : {'k-means', 'mini-batch-k-means', 'hierarchical'}
+        reduction_method : {'pca', 'nmf'}
+            PCA uses incremental fitting. NMF uses mini-batch nonnegative
+            factorization and can expose its detector components in diagnostics.
+            ``plotScree`` applies only to PCA.
+        nmf_epochs : positive int
+            Number of shuffled training passes for NMF. More passes may
+            improve the factorization but read the data more times.
+        clustering_method : {'k-means', 'mini-batch-k-means', 'hierarchical',
+                             'gaussian-mixture', 'hdbscan'}
             Mini-batch k-means is useful for large scans. Hierarchical
             clustering remains limited to 5000 patterns due to quadratic RAM.
-        pca_fit_samples : int, float in (0, 1], or None
-            Number or fraction of randomly sampled patterns used to fit PCA.
+            Gaussian mixtures provide probabilistic assignments; HDBSCAN
+            finds variable-density groups but may take longer on large scans.
+        gmm_covariance_type : {'diag', 'spherical', 'tied', 'full'}
+            Gaussian-mixture covariance model. Diagonal is the less costly
+            default for high-dimensional PCA or NMF scores.
+        hdbscan_min_cluster_size, hdbscan_min_samples : int or None
+            HDBSCAN density controls. The former defaults to 20; None for the
+            latter lets HDBSCAN use its own default.
+        fit_samples : int, float in (0, 1], or None
+            Number or fraction of randomly sampled patterns used to fit the
+            reducer. ``pca_fit_samples`` is accepted for existing notebooks.
             Every pattern is still transformed and clustered. None fits all.
         random_state : int or None
-            Seed for sampling and k-means; 0 makes repeated runs reproducible.
+            Seed for sampling, NMF, and clustering; 0 is reproducible.
         batch_size : int or None
             Patterns per data batch. None chooses a bounded size automatically.
         filter_size : odd positive int or None
@@ -10473,28 +11292,67 @@ class HyperData:
             Optional consistency check for existing calls. Geometry always
             follows ``self.is_polar`` and its metadata.
         return_diagnostics : bool
-            Also return retained feature mask, PCA variance, cluster sizes,
-            selected detector mask, and method settings.
+            Also return selected detector pixels, feature weights, cluster
+            sizes, and method settings. NMF components are in weighted feature
+            space. Gaussian-mixture confidence is before spatial filtering.
         include_mean_dps : bool
             With diagnostics, also compute raw mean diffraction patterns for
             the final clusters. This requires another pass over the 4D data.
 
         Notes
         -----
-        PCA and k-means labels can differ from earlier versions because the
-        feature threshold now uses the same transformed data as PCA, and label
-        smoothing is no longer on by default.
+        Soft weights multiply detector intensities by ``sqrt(weight)`` before
+        decomposition, so squared Euclidean distances weight each pixel by
+        ``weight``. PCA and k-means remain the defaults for existing calls.
         """
         if self.ndim != 4:
             raise ValueError("get_clusters requires a 4D dataset.")
-        if isinstance(n_PCAcomponents, (bool, np.bool_)) or not isinstance(
-            n_PCAcomponents, Integral
-        ) or n_PCAcomponents < 1:
-            raise ValueError("n_PCAcomponents must be a positive integer.")
-        if isinstance(n_clusters, (bool, np.bool_)) or not isinstance(
+        if n_PCAcomponents is not None and n_components is not None:
+            raise ValueError("Specify only one of n_components and n_PCAcomponents.")
+        n_components = n_PCAcomponents if n_components is None else n_components
+        if isinstance(n_components, (bool, np.bool_)) or not isinstance(
+            n_components, Integral
+        ) or n_components < 1:
+            raise ValueError("n_components must be a positive integer.")
+        if clustering_method not in (
+            'k-means', 'mini-batch-k-means', 'hierarchical',
+            'gaussian-mixture', 'hdbscan',
+        ):
+            raise ValueError("Unsupported clustering_method.")
+        if clustering_method == 'hdbscan':
+            if n_clusters is not None:
+                raise ValueError("n_clusters must be None for HDBSCAN.")
+        elif isinstance(n_clusters, (bool, np.bool_)) or not isinstance(
             n_clusters, Integral
         ) or n_clusters < 1:
             raise ValueError("n_clusters must be a positive integer.")
+        if reduction_method not in ('pca', 'nmf'):
+            raise ValueError("reduction_method must be 'pca' or 'nmf'.")
+        if isinstance(nmf_epochs, (bool, np.bool_)) or not isinstance(
+            nmf_epochs, Integral
+        ) or nmf_epochs < 1:
+            raise ValueError("nmf_epochs must be a positive integer.")
+        if feature_weighting not in ('hard', 'soft', 'none'):
+            raise ValueError("feature_weighting must be 'hard', 'soft', or 'none'.")
+        if soft_weight_scale is not None and (
+            feature_weighting != 'soft' or not np.isfinite(soft_weight_scale)
+            or soft_weight_scale <= 0
+        ):
+            raise ValueError("soft_weight_scale requires soft weighting and must be positive.")
+        if gmm_covariance_type not in ('diag', 'spherical', 'tied', 'full'):
+            raise ValueError("Unsupported gmm_covariance_type.")
+        if isinstance(hdbscan_min_cluster_size, (bool, np.bool_)) or not isinstance(
+            hdbscan_min_cluster_size, Integral
+        ) or hdbscan_min_cluster_size < 2:
+            raise ValueError("hdbscan_min_cluster_size must be an integer >= 2.")
+        if hdbscan_min_samples is not None and (
+            isinstance(hdbscan_min_samples, (bool, np.bool_))
+            or not isinstance(hdbscan_min_samples, Integral)
+            or hdbscan_min_samples < 1
+        ):
+            raise ValueError("hdbscan_min_samples must be a positive integer or None.")
+        if plotScree and reduction_method != 'pca':
+            raise ValueError("plotScree is only defined for PCA.")
         if not np.isfinite(power) or power <= 0:
             raise ValueError("power must be a positive finite number.")
         if not np.isfinite(std_Threshold) or not 0 <= std_Threshold <= 1:
@@ -10519,8 +11377,6 @@ class HyperData:
             raise ValueError("intensity_transform must be 'log', 'log1p', 'sqrt', or 'raw'.")
         if normalize not in ('none', 'total'):
             raise ValueError("normalize must be 'none' or 'total'.")
-        if clustering_method not in ('k-means', 'mini-batch-k-means', 'hierarchical'):
-            raise ValueError("Unsupported clustering_method.")
         if filter_size is not None and (
             isinstance(filter_size, (bool, np.bool_))
             or not isinstance(filter_size, Integral)
@@ -10542,12 +11398,14 @@ class HyperData:
 
         A, B, C, D = self.shape
         n_patterns = A * B
-        if n_PCAcomponents > n_patterns:
-            raise ValueError("n_PCAcomponents exceeds the number of patterns.")
-        if n_clusters > n_patterns:
+        if n_components > n_patterns:
+            raise ValueError("n_components exceeds the number of patterns.")
+        if n_clusters is not None and n_clusters > n_patterns:
             raise ValueError("n_clusters exceeds the number of patterns.")
-        if plot3dClusterMap and n_PCAcomponents < 3:
-            raise ValueError("plot3dClusterMap requires at least 3 PCA components.")
+        if clustering_method == 'hdbscan' and hdbscan_min_cluster_size > n_patterns:
+            raise ValueError("hdbscan_min_cluster_size exceeds the number of patterns.")
+        if plot3dClusterMap and n_components < 3:
+            raise ValueError("plot3dClusterMap requires at least 3 components.")
         if clustering_method == 'hierarchical' and n_patterns > 5000:
             raise ValueError(
                 "Hierarchical clustering uses quadratic memory and is limited "
@@ -10559,21 +11417,24 @@ class HyperData:
             raise ValueError("random_state must be an integer or None.")
         rng = np.random.default_rng(random_state)
 
-        if pca_fit_samples is None:
+        if pca_fit_samples is not None and fit_samples is not None:
+            raise ValueError("Specify only one of fit_samples and pca_fit_samples.")
+        fit_samples = pca_fit_samples if fit_samples is None else fit_samples
+        if fit_samples is None:
             n_fit_patterns = n_patterns
-        elif isinstance(pca_fit_samples, (bool, np.bool_)):
-            raise ValueError("pca_fit_samples must be an integer count or fraction.")
-        elif isinstance(pca_fit_samples, Integral):
-            n_fit_patterns = int(pca_fit_samples)
-        elif isinstance(pca_fit_samples, (float, np.floating)) and (
-            np.isfinite(pca_fit_samples) and 0 < pca_fit_samples <= 1
+        elif isinstance(fit_samples, (bool, np.bool_)):
+            raise ValueError("fit_samples must be an integer count or fraction.")
+        elif isinstance(fit_samples, Integral):
+            n_fit_patterns = int(fit_samples)
+        elif isinstance(fit_samples, (float, np.floating)) and (
+            np.isfinite(fit_samples) and 0 < fit_samples <= 1
         ):
-            n_fit_patterns = int(np.ceil(n_patterns * pca_fit_samples))
+            n_fit_patterns = int(np.ceil(n_patterns * fit_samples))
         else:
-            raise ValueError("pca_fit_samples must be an integer count or fraction in (0, 1].")
-        if not n_PCAcomponents <= n_fit_patterns <= n_patterns:
+            raise ValueError("fit_samples must be an integer count or fraction in (0, 1].")
+        if not n_components <= n_fit_patterns <= n_patterns:
             raise ValueError(
-                "pca_fit_samples must select between n_PCAcomponents and "
+                "fit_samples must select between n_components and "
                 "the total number of patterns."
             )
 
@@ -10610,27 +11471,27 @@ class HyperData:
         n_candidate_features = len(candidate_y)
         if n_candidate_features == 0:
             raise ValueError("The detector selection contains no pixels.")
-        if n_candidate_features < n_PCAcomponents:
-            raise ValueError("Fewer detector pixels than PCA components were selected.")
+        if n_candidate_features < n_components:
+            raise ValueError("Fewer detector pixels than components were selected.")
 
         batch_target_bytes = 32 * 1024 * 1024
         if batch_size is None:
             batch_size = max(
-                n_PCAcomponents,
+                n_components,
                 min(512, max(1, batch_target_bytes // (4 * n_candidate_features))),
             )
         elif isinstance(batch_size, (bool, np.bool_)) or not isinstance(
             batch_size, Integral
-        ) or batch_size < n_PCAcomponents:
-            raise ValueError("batch_size must be an integer >= n_PCAcomponents.")
+        ) or batch_size < n_components:
+            raise ValueError("batch_size must be an integer >= n_components.")
 
-        def batch_edges(count, require_pca_size=False):
+        def batch_edges(count, require_component_size=False):
             n_batches = max(1, int(np.ceil(count / batch_size)))
-            if require_pca_size:
-                n_batches = min(n_batches, count // n_PCAcomponents)
+            if require_component_size:
+                n_batches = min(n_batches, count // n_components)
             return np.linspace(0, count, n_batches + 1, dtype=int)
 
-        def load_batch(scan_indices, kept_columns=None):
+        def load_batch(scan_indices, kept_columns=None, feature_scales=None):
             # Only selected detector pixels are copied; normalization always
             # uses the same candidate region on every processing pass.
             batch = np.asarray(
@@ -10661,7 +11522,12 @@ class HyperData:
                 np.power(batch, power, out=batch)
             if not np.all(np.isfinite(batch)):
                 raise ValueError("The chosen transform produced nonfinite values.")
-            return batch if kept_columns is None else batch[:, kept_columns]
+            if kept_columns is None:
+                return batch
+            batch = batch[:, kept_columns]
+            if feature_scales is not None:
+                batch *= feature_scales
+            return batch
 
         sums = np.zeros(n_candidate_features, dtype=np.float64)
         squared_sums = np.zeros(n_candidate_features, dtype=np.float64)
@@ -10674,21 +11540,43 @@ class HyperData:
         means = sums / n_patterns
         variances = np.maximum(squared_sums / n_patterns - means**2, 0)
         deviations = np.sqrt(variances)
-        keep_features = (deviations > 0) & (
-            deviations >= std_Threshold * deviations.max()
-        )
+        resolved_weight_scale = None
+        if feature_weighting == 'hard':
+            keep_features = (deviations > 0) & (
+                deviations >= std_Threshold * deviations.max()
+            )
+            selected_weights = np.ones(int(keep_features.sum()), dtype=np.float32)
+        elif feature_weighting == 'soft':
+            keep_features = deviations > 0
+            if not np.any(keep_features):
+                raise ValueError("No varying detector pixels remain for soft weighting.")
+            resolved_weight_scale = (
+                float(np.percentile(deviations[keep_features], 75))
+                if soft_weight_scale is None else float(soft_weight_scale)
+            )
+            selected_deviations = deviations[keep_features]
+            selected_weights = (
+                selected_deviations / (selected_deviations + resolved_weight_scale)
+            ).astype(np.float32)
+        else:
+            keep_features = np.ones(n_candidate_features, dtype=bool)
+            selected_weights = np.ones(n_candidate_features, dtype=np.float32)
+
         feature_mask = np.zeros((C, D), dtype=bool)
         feature_mask[candidate_y[keep_features], candidate_x[keep_features]] = True
+        feature_weights = np.zeros((C, D), dtype=np.float32)
+        feature_weights[feature_mask] = selected_weights
+        feature_scales = np.sqrt(selected_weights)
         n_features = int(keep_features.sum())
-        if n_features < n_PCAcomponents:
+        if n_features < n_components:
             raise ValueError(
-                f"Only {n_features} varying detector pixels remain; "
-                f"n_PCAcomponents={n_PCAcomponents} is too large."
+                f"Only {n_features} detector pixels remain; "
+                f"n_components={n_components} is too large."
             )
         if plotStdMask:
             fig, ax = plt.subplots()
-            ax.imshow(feature_mask)
-            ax.set_title(f'Retained detector pixels (threshold = {std_Threshold})')
+            ax.imshow(feature_weights, vmin=0, vmax=1)
+            ax.set_title(f'Detector feature weights ({feature_weighting})')
             ax.set_axis_off()
             plt.show()
             plt.close(fig)
@@ -10698,20 +11586,39 @@ class HyperData:
             if n_fit_patterns == n_patterns
             else np.sort(rng.choice(n_patterns, n_fit_patterns, replace=False))
         )
-        pca = IncrementalPCA(n_components=n_PCAcomponents)
-        fit_edges = batch_edges(n_fit_patterns, require_pca_size=True)
-        for start, stop in zip(fit_edges[:-1], fit_edges[1:]):
-            batch = load_batch(fit_indices[start:stop], keep_features)
-            pca.partial_fit(batch)
+        if reduction_method == 'nmf':
+            reducer = MiniBatchNMF(
+                n_components=n_components, init='nndsvda',
+                batch_size=batch_size, random_state=random_state,
+            )
+        else:
+            reducer = IncrementalPCA(n_components=n_components)
+        fit_edges = batch_edges(n_fit_patterns, require_component_size=True)
+        n_fit_passes = nmf_epochs if reduction_method == 'nmf' else 1
+        for _ in range(n_fit_passes):
+            pass_indices = (
+                rng.permutation(fit_indices)
+                if reduction_method == 'nmf' else fit_indices
+            )
+            for start, stop in zip(fit_edges[:-1], fit_edges[1:]):
+                batch = load_batch(
+                    pass_indices[start:stop], keep_features, feature_scales,
+                )
+                reducer.partial_fit(batch)
 
-        data_reduced = np.empty((n_patterns, n_PCAcomponents), dtype=np.float32)
+        data_reduced = np.empty((n_patterns, n_components), dtype=np.float32)
         for start, stop in zip(all_edges[:-1], all_edges[1:]):
-            batch = load_batch(np.arange(start, stop), keep_features)
-            data_reduced[start:stop] = pca.transform(batch)
+            batch = load_batch(
+                np.arange(start, stop), keep_features, feature_scales,
+            )
+            data_reduced[start:stop] = reducer.transform(batch)
 
         if plotScree:
             fig, ax = plt.subplots()
-            ax.plot(range(1, n_PCAcomponents + 1), pca.explained_variance_ratio_, marker='o')
+            ax.plot(
+                range(1, n_components + 1),
+                reducer.explained_variance_ratio_, marker='o',
+            )
             ax.set_title("Scree Plot")
             ax.set_xlabel("Principal Component")
             ax.set_ylabel("Variance Explained")
@@ -10729,6 +11636,19 @@ class HyperData:
             )
             with threadpool_limits(limits=1, user_api='openmp'):
                 clusters = clustering_model.fit_predict(data_reduced)
+        elif clustering_method == 'gaussian-mixture':
+            clustering_model = GaussianMixture(
+                n_components=n_clusters, covariance_type=gmm_covariance_type,
+                random_state=random_state,
+            )
+            with threadpool_limits(limits=1, user_api='openmp'):
+                clusters = clustering_model.fit_predict(data_reduced)
+        elif clustering_method == 'hdbscan':
+            clustering_model = HDBSCAN(
+                min_cluster_size=hdbscan_min_cluster_size,
+                min_samples=hdbscan_min_samples,
+            )
+            clusters = clustering_model.fit_predict(data_reduced)
         else:
             from scipy.cluster.hierarchy import linkage, fcluster
             linkage_matrix = linkage(data_reduced, method='ward')
@@ -10740,17 +11660,20 @@ class HyperData:
                 np.arange(n_patterns) if n_patterns <= max_plot_points
                 else np.sort(rng.choice(n_patterns, max_plot_points, replace=False))
             )
-            colormap = plt.get_cmap(cluster_cmap or 'gnuplot', n_clusters)
+            plotted_labels = np.unique(clusters)
+            colormap = plt.get_cmap(cluster_cmap or 'gnuplot', len(plotted_labels))
             fig = plt.figure()
             ax = fig.add_subplot(111, projection='3d')
-            for i in range(n_clusters):
-                chosen = plotted[clusters[plotted] == i]
+            for i, label_value in enumerate(plotted_labels):
+                chosen = plotted[clusters[plotted] == label_value]
                 if chosen.size == 0:
                     continue
                 ax.scatter(
                     data_reduced[chosen, 0], data_reduced[chosen, 1],
-                    data_reduced[chosen, 2], c=[colormap(i)],
-                    label=f'Cluster {i + 1}', s=2, alpha=0.5,
+                    data_reduced[chosen, 2],
+                    c=['0.35' if label_value == -1 else colormap(i)],
+                    label='Noise' if label_value == -1 else f'Cluster {label_value + 1}',
+                    s=2, alpha=0.5,
                 )
             plt.show()
             plt.close(fig)
@@ -10770,10 +11693,12 @@ class HyperData:
         if plotClusterMap:
             colormap = plt.get_cmap(cluster_cmap or 'gnuplot', len(cluster_labels))
             palette = (colormap(np.arange(len(cluster_labels)))[:, :3] * 255).astype(np.uint8)
+            palette[cluster_labels == -1] = (80, 80, 80)
             cluster_map_colored = palette[np.searchsorted(cluster_labels, cluster_map)]
             fig, ax = plt.subplots()
             ax.imshow(cluster_map_colored)
-            ax.set_title(f"Cluster Map ({A}x{B}) with {len(cluster_labels)} Clusters")
+            n_found_clusters = int(np.count_nonzero(cluster_labels != -1))
+            ax.set_title(f"Cluster Map ({A}x{B}) with {n_found_clusters} Clusters")
             ax.set_axis_off()
             plt.show()
             plt.close(fig)
@@ -10784,8 +11709,18 @@ class HyperData:
         diagnostics = {
             'detector_mask': detector_selection,
             'feature_mask': feature_mask,
+            'feature_weights': feature_weights,
             'feature_count': n_features,
-            'explained_variance_ratio': pca.explained_variance_ratio_.copy(),
+            'feature_weighting': feature_weighting,
+            'soft_weight_scale': resolved_weight_scale,
+            'reduction_method': reduction_method,
+            'n_components': n_components,
+            'nmf_epochs': nmf_epochs if reduction_method == 'nmf' else None,
+            'explained_variance_ratio': (
+                reducer.explained_variance_ratio_.copy()
+                if reduction_method == 'pca' else None
+            ),
+            'reduction_fit_patterns': n_fit_patterns,
             'pca_fit_patterns': n_fit_patterns,
             'cluster_labels': cluster_labels,
             'cluster_sizes': cluster_sizes,
@@ -10798,9 +11733,23 @@ class HyperData:
             'outer_ring': outer_ring,
             'inertia': (
                 float(clustering_model.inertia_)
-                if clustering_model is not None else None
+                if hasattr(clustering_model, 'inertia_') else None
             ),
         }
+        if reduction_method == 'nmf':
+            diagnostics['component_vectors'] = reducer.components_.astype(
+                np.float32, copy=True,
+            )
+        if clustering_method == 'gaussian-mixture':
+            confidence = np.empty(n_patterns, dtype=np.float32)
+            for start, stop in zip(all_edges[:-1], all_edges[1:]):
+                confidence[start:stop] = clustering_model.predict_proba(
+                    data_reduced[start:stop]
+                ).max(axis=1)
+            diagnostics['model_confidence'] = confidence.reshape(A, B)
+            diagnostics['gmm_covariance_type'] = gmm_covariance_type
+        if clustering_method == 'hdbscan':
+            diagnostics['noise_count'] = int(np.count_nonzero(clusters == -1))
         if mapping is not None:
             diagnostics['split_mapping'] = mapping
 
@@ -10896,7 +11845,7 @@ class HyperData:
 
         if a_min is not None or a_max is not None:
             np.clip(result, a_min, a_max, out=result)
-        return self._spawn(result)
+        return self._spawn(result, preserve_unfold=True)
 
     def to_polar(self,
                  center: Tuple[float, float] = None,
@@ -10935,7 +11884,8 @@ class HyperData:
             Default: ``(ceil(r_max), ceil(2*pi*r_max))``.
         order : int, default=1
             The spline interpolation order for map_coordinates (0=nearest,
-            1=bilinear, 3=cubic, etc.).
+            1=bilinear, 3=cubic, etc.). For integer input, interpolation returns
+            floating-point data; nearest-neighbor sampling retains integer dtype.
         fill_value : float, optional
             Value used for out-of-bounds samples if ``r_max`` extends beyond
             the input diffraction pattern.
@@ -11015,10 +11965,11 @@ class HyperData:
         ))
 
         # 4) Prepare an output array of the correct shape
+        output_dtype = arr.dtype if order == 0 else np.result_type(arr.dtype, np.float32)
         if A is not None:
-            out_arr = np.zeros((A, B, n_r, n_theta), dtype=arr.dtype)
+            out_arr = np.zeros((A, B, n_r, n_theta), dtype=output_dtype)
         else:
-            out_arr = np.zeros((B, n_r, n_theta), dtype=arr.dtype)
+            out_arr = np.zeros((B, n_r, n_theta), dtype=output_dtype)
 
         # 5) The default r_max already crops to the useful centered circle.
         # 6) Loop over all slices. The coordinate grid is shared by every
@@ -11032,7 +11983,7 @@ class HyperData:
                     desc="Diffraction patterns",
                 )
             for i, j in iterator:
-                diff = arr[i, j]
+                diff = arr[i, j].astype(output_dtype, copy=False)
                 # Interpolate the 2D slice onto our polar grid
                 polar_flat = map_coordinates(
                     diff,
@@ -11053,7 +12004,7 @@ class HyperData:
                 else range(B)
             )
             for j in iterator:
-                diff = arr[j]
+                diff = arr[j].astype(output_dtype, copy=False)
                 polar_flat = map_coordinates(
                     diff,
                     coords,
@@ -11072,6 +12023,7 @@ class HyperData:
             out_arr,
             reciprocal_units=None,
             reciprocal_conv_factor=None,
+            center_beam_metadata=None,
         )
         radius_step_pixels = r_max_used / n_r
         radius_sample_step_pixels = r_max_used / (n_r - 1) if n_r > 1 else 0.0
@@ -11144,6 +12096,8 @@ class HyperData:
             original Cartesian center when available.
         order : int, optional
             Spline interpolation order passed to :func:`map_coordinates`.
+            For integer input, interpolation returns floating-point data;
+            nearest-neighbor sampling retains integer dtype.
         fill_value : float, optional
             Value assigned outside the polar support or outside polar bounds.
         clip : bool, optional
@@ -11252,10 +12206,11 @@ class HyperData:
         ))
         outside_support = radius_grid.ravel() > output_radius_pixels
 
+        output_dtype = arr.dtype if order == 0 else np.result_type(arr.dtype, np.float32)
         if A is not None:
-            out_arr = np.full((A, B, height, width), fill_value, dtype=arr.dtype)
+            out_arr = np.full((A, B, height, width), fill_value, dtype=output_dtype)
         else:
-            out_arr = np.full((B, height, width), fill_value, dtype=arr.dtype)
+            out_arr = np.full((B, height, width), fill_value, dtype=output_dtype)
 
         if A is not None:
             iterator = np.ndindex(A, B)
@@ -11266,7 +12221,7 @@ class HyperData:
                     desc="Cartesian diffraction patterns",
                 )
             for i, j in iterator:
-                polar_img = arr[i, j]
+                polar_img = arr[i, j].astype(output_dtype, copy=False)
                 polar_for_interp = np.concatenate(
                     (polar_img, polar_img[:, :1]),
                     axis=1,
@@ -11290,7 +12245,7 @@ class HyperData:
                 else range(B)
             )
             for j in iterator:
-                polar_img = arr[j]
+                polar_img = arr[j].astype(output_dtype, copy=False)
                 polar_for_interp = np.concatenate(
                     (polar_img, polar_img[:, :1]),
                     axis=1,
@@ -11326,6 +12281,7 @@ class HyperData:
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_conv_factor,
             polar_metadata=None,
+            center_beam_metadata=None,
         )
 
     def get_average_clusters(self,
@@ -12343,6 +13299,8 @@ class ReciprocalSpace:
         kshape : tuple of (int, int), optional
             Output shape (A, B) for resizing the cropped pattern.
             If not provided, inferred from crop size.
+            Interpolating integer data returns floating-point output. A crop
+            that needs no interpolation retains the original dtype.
     
         Returns
         -------
@@ -12392,7 +13350,7 @@ class ReciprocalSpace:
         new_conv_factor = self.conv_factor
 
         # --- Handle subpixel or resize ---
-        if subpixel or kshape is not None:
+        if subpixel or kshape != cropped.shape:
             if self.conv_factor is not None:
                 y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
                 x_scale = (kxlim_range[1] - kxlim_range[0]) / kshape[1]
@@ -12403,99 +13361,61 @@ class ReciprocalSpace:
                     print("Warning: anisotropic resizing cleared the stored reciprocal-space calibration.")
                     new_conv_factor = None
 
-            cropped = transform.resize(cropped, kshape,
-                             order=1,  # bilinear
-                             mode='reflect',
-                             anti_aliasing=True)
+            resize_dtype = np.result_type(cropped.dtype, np.float32)
+            cropped = transform.resize(
+                cropped.astype(resize_dtype, copy=False), kshape,
+                order=1, mode='reflect', anti_aliasing=True,
+                preserve_range=True,
+            )
 
         new_units = self.units if new_conv_factor is not None else None
-        return self._spawn(cropped, units=new_units, conv_factor=new_conv_factor)
+        geometry_changed = (y0, y1, x0, x1) != (0, ky, 0, kx) or (
+            subpixel or kshape != (ky, kx)
+        )
+        beam_metadata = self.center_beam_metadata
+        if geometry_changed:
+            beam_metadata = None if subpixel or self.polar_metadata is not None else (
+                _resampled_center_beam_metadata(
+                    self.center_beam_metadata, (ky, kx), cropped.shape,
+                    crop_origin=(y0, x0), crop_shape=(y1 - y0, x1 - x0),
+                    units=new_units, conv_factor=new_conv_factor,
+                )
+            )
+        return self._spawn(
+            cropped, units=new_units, conv_factor=new_conv_factor,
+            center_beam_metadata=beam_metadata,
+        )
     
     def get_spotCenter(self, ky, kx, r, method='CoM', plotSpot=False,):
         """
-        Find the center of mass (of pixel intensities) of a diffraction spot, 
-        allowing for non-integer radii.
+        Refine a diffraction-spot center inside a local circular window.
+
+        Missing pixels near detector edges are treated as zero, as with a
+        zero-padded diffraction pattern, without padding the whole image.
         """
-        
-        # Pad and round up to ensure the entire radius is accommodated
-        pad_width = int(np.ceil(r))
-        padded_data = np.pad(self.array, pad_width=pad_width, mode='constant')
-    
-        # Adjustment of padding coordinates
-        ky_padded, kx_padded = ky + pad_width, kx + pad_width
-        
-        # Determine the size of the area to extract based on r, ensuring it matches the mask's dimensions
-        area_size = int(np.ceil(r * 2))
-        # if area_size % 2 == 0:
-        #     area_size += 1  # Ensure the area size is odd to match an odd-sized mask
-            
-        # Generate the circular mask with the correct dimensions
-        mask = circular_mask((area_size) // 2, area_size // 2, r)
-        
-        # Extract the region of interest from the padded data
-        ymin, ymax = int(ky_padded - (area_size // 2)), int(ky_padded + (area_size // 2)) + 1
-        xmin, xmax = int(kx_padded - (area_size // 2)), int(kx_padded + (area_size // 2)) + 1
-        spot_data = padded_data[ymin:ymax, xmin:xmax]
-    
-        # Check if shapes match, otherwise adjust
-        if spot_data.shape != mask.shape:
-            min_dim = min(spot_data.shape[0], mask.shape[0], spot_data.shape[1], mask.shape[1])
-            spot_data = spot_data[:min_dim, :min_dim]
-            mask = mask[:min_dim, :min_dim]
-    
-        # Apply mask and calculate its CoM
-        masked_spot_data = spot_data * mask
-        
-        # Find peak maximum using the chosen method
-        if method == 'CoM':
-            com_y, com_x = center_of_mass(masked_spot_data)
-            
-        elif method == 'gaussian':
-            com_x, com_y = fit_gaussian_2d(masked_spot_data)
-            
-        elif method == 'elliptical_gaussian':
-            com_x, com_y = fit_gaussian_2d(masked_spot_data)    
-        
-        if plotSpot:
-            # Create turbo colormap with 0-values white
-            base_cmap = plt.cm.turbo
-            custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
-                                                         base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
-            plt.imshow(masked_spot_data, cmap=custom_cmap)
-            plt.colorbar()
-            plt.scatter(com_x, com_y, color='yellow', s=50, label='Subpixel CoM')
-            plt.show()
-        
-        ky_padded = com_y + ymin
-        kx_padded = com_x + xmin
-                
-        # Adjust the CoM to account for padding
-        ky_CoM = ky_padded - pad_width
-        kx_CoM = kx_padded - pad_width
-    
-        return ky_CoM, kx_CoM
+        return _spot_center_from_array(
+            self.array, ky, kx, r, method=method, plotSpot=plotSpot
+        )
     
     def get_centers(self, r, ref_coords, show=False, method='CoM'):
         """
-        Generate an array spot centers for any DP
-        
-        r : int, float or list
-            if list, its length must be the same as that of coords
+        Refine reference-peak centers in this diffraction pattern.
+
+        ``r`` may be a scalar or one radius per reference peak. ``method``
+        selects center of mass, axis-aligned Gaussian, or rotated elliptical
+        Gaussian fitting.
         """
-        
+
         assert len(self.shape) == 2, "Input data must be of 2-dimensional"
-        
+
         num_peaks = len(ref_coords)
-        
+        radii = _peak_radii(r, num_peaks)
         centers = np.zeros((num_peaks, 2))
         for j in range(num_peaks):
-            
-            if isinstance(r, (np.ndarray, list)):
-                r = r[j]
-                
-            centers[j] = self.get_spotCenter(ref_coords[j, 0], ref_coords[j, 1],
-                                            r + 1e-10,  method, show,)
-                                       
+            centers[j] = self.get_spotCenter(
+                ref_coords[j, 0], ref_coords[j, 1],
+                radii[j] + 1e-10, method, show,
+            )
         return centers
 
     #TODO: enable functionality for 4-fold symmetry as well
@@ -12559,7 +13479,7 @@ class ReciprocalSpace:
         if return_mask:
             return compound_mask
         
-    def get_intensities(self, 
+    def get_intensities(self,
                         r,
                         centers=None,  
                         ref_coords=None, 
@@ -12568,28 +13488,29 @@ class ReciprocalSpace:
                         residual_frac=0.9,
                         **resBg_kwargs):
         """
-        Extract Bragg peak intensities from a single DP
-        
-        residual_pxBg is an integer, float, or 
+        Integrate Bragg intensities in circular windows around peak centers.
+
+        ``r`` may be one radius or one radius per peak. Windows are clipped
+        to the detector boundaries; no pixels wrap around an image edge. When
+        subtracting residual background, the correction uses the number of
+        pixels actually included in each integration window.
         """
     
         if centers is None:
             centers = self.get_centers(r, ref_coords=ref_coords, method=method)
     
-        ints = np.zeros(len(centers))
-        
-        for int_idx, intensity in enumerate(ints):
-    
-            if isinstance(r, (list, np.ndarray)):
-                r = r[int_idx]        
-    
-            masked_data = self.array*make_mask(centers[int_idx], r_mask=r+1e-10, mask_dim=self.shape)
-            ints[int_idx] = np.sum(masked_data[round(centers[int_idx][0]-(r+0.5)):round(centers[int_idx][0]+(r+0.5)),
-                                                round(centers[int_idx][1]-(r+0.5)):round(centers[int_idx][1]+(r+0.5))])
-        
         if compute_resBg:
+            ints, pixel_counts = _peak_intensities_from_array(
+                self.array, r, centers, return_pixel_counts=True
+            )
             res_bg = self.get_residualBg(centers=centers, **resBg_kwargs)
-            ints -= res_bg * (np.pi*r**2) * residual_frac
+            correction = np.zeros_like(ints)
+            np.multiply(
+                res_bg, pixel_counts, out=correction, where=pixel_counts > 0
+            )
+            ints -= correction * residual_frac
+        else:
+            ints = _peak_intensities_from_array(self.array, r, centers)
                 
         return ints
     
@@ -12650,13 +13571,26 @@ class ReciprocalSpace:
                                      and outer radius of bg. region arounf each each spot""")
             
             res_bgs = np.zeros(len(centers))
-            dp_mask = np.zeros_like(self.array, dtype=bool)
+            dp_mask = np.zeros_like(self.array, dtype=bool) if show else None
             # We collect multiple values for the intensities corresponding to each Bragg peak
             for c_idx, center in enumerate(centers):
-                bool_mask = make_mask(center, r_spots, mask_dim=(A,B))
-                masked_dp = self.array * bool_mask
-                dp_mask += bool_mask
-                res_bgs[c_idx] = np.sum(masked_dp)/np.sum(bool_mask)
+                cy, cx = center
+                extent = abs(r_spots[1])
+                y0 = max(0, int(np.floor(cy - extent)))
+                y1 = min(A, int(np.ceil(cy + extent)) + 1)
+                x0 = max(0, int(np.floor(cx - extent)))
+                x1 = min(B, int(np.ceil(cx + extent)) + 1)
+                if y0 >= y1 or x0 >= x1:
+                    res_bgs[c_idx] = np.nan
+                    continue
+                local_mask = make_mask(
+                    (cy - y0, cx - x0), r_spots,
+                    mask_dim=(y1 - y0, x1 - x0),
+                )
+                values = self.array[y0:y1, x0:x1][local_mask]
+                res_bgs[c_idx] = values.mean() if values.size else np.nan
+                if show:
+                    dp_mask[y0:y1, x0:x1] |= local_mask
             if show:
                 self._spawn(self.array * dp_mask).show(**kwargs)
             return res_bgs
@@ -13564,56 +14498,72 @@ class RealSpace:
     units : str or None, optional
         Physical units associated with the real-space pixel spacing
         (for example ``'nm'`` or ``'Å'``).
-    conv_factor : float or None, optional
-        Conversion factor from pixels to physical units, expressed as
-        ``units / pixel``. When omitted, plots default to pixel units.
+    conv_factor : float or (float, float) or None, optional
+        Physical units per pixel. A scalar means equal ``(y, x)`` spacing;
+        a pair supports rectangular scan pixels.
+    origin : (float, float), optional
+        Physical ``(y, x)`` coordinate of pixel center ``(0, 0)``. Defaults
+        to ``(0, 0)`` and is preserved through crop and resize.
+    quantity, value_units : str or None, optional
+        Meaning and units of pixel values, used to label the colorbar.
     """
 
-    def __init__(self, data, units: str = None, conv_factor: float = None):
-        self.array = data
-        self.shape = data.shape
-        self._denoise_engine = _DenoiseEngine(data)
+    def __init__(self, data, units: str = None, conv_factor=None,
+                 origin=(0.0, 0.0), quantity='Intensity', value_units=None):
+        array = np.asarray(data)
+        if array.ndim != 2:
+            raise ValueError("RealSpace requires a 2D image.")
+        if not (
+            np.issubdtype(array.dtype, np.number)
+            or np.issubdtype(array.dtype, np.bool_)
+        ) or np.iscomplexobj(array):
+            raise TypeError("RealSpace requires a real-valued numeric or Boolean image.")
+        if not isinstance(quantity, str) or not quantity.strip():
+            raise ValueError("quantity must be a non-empty string.")
+        if value_units is not None and (
+            not isinstance(value_units, str) or not value_units.strip()
+        ):
+            raise ValueError("value_units must be a non-empty string or None.")
+
+        self.array = array
+        self.shape = array.shape
         self.units = None
         self.conv_factor = None
+        self.origin = _normalize_real_origin(origin)
+        self.quantity = quantity.strip()
+        self.value_units = value_units.strip() if value_units is not None else None
 
         if units is not None or conv_factor is not None:
             self.set_scale(units=units, conv_factor=conv_factor)
 
-    def set_scale(self, units: str, conv_factor: float):
-        """Attach a real-space calibration in units per pixel."""
+    @property
+    def pixel_size(self):
+        """Return calibrated ``(y, x)`` pixel spacing, or None."""
+        return None if self.conv_factor is None else _real_spacing_pair(self.conv_factor)
+
+    def set_scale(self, units: str, conv_factor):
+        """Attach scalar or ``(y, x)`` real-space calibration."""
         if units is None or conv_factor is None:
             raise ValueError("'units' and 'conv_factor' must both be provided.")
         if not isinstance(units, str) or not units.strip():
             raise ValueError("'units' must be a non-empty string.")
-        if not np.isscalar(conv_factor) or conv_factor <= 0:
-            raise ValueError("'conv_factor' must be a positive scalar.")
 
+        factor = _normalize_real_spacing(conv_factor)
         self.units = units.strip()
-        self.conv_factor = float(conv_factor)
+        self.conv_factor = factor
+        return self
+
+    def set_origin(self, origin):
+        """Set the physical ``(y, x)`` coordinate of pixel ``(0, 0)``."""
+        self.origin = _normalize_real_origin(origin)
         return self
 
     def clear_scale(self):
         """Remove any stored real-space calibration."""
         self.units = None
         self.conv_factor = None
+        self.origin = (0.0, 0.0)
         return self
-
-    def _resolve_scale(self, units=None, conv_factor=None):
-        """Resolve plot calibration from explicit inputs or stored metadata."""
-        resolved_units = self.units if units is None else units
-        resolved_factor = self.conv_factor if conv_factor is None else conv_factor
-
-        if resolved_units is None and resolved_factor is None:
-            return None, None
-        if resolved_units is None or resolved_factor is None:
-            raise ValueError(
-                "'units' and 'conv_factor' must be defined together, either "
-                "on the object or in the method call."
-            )
-        if not np.isscalar(resolved_factor) or resolved_factor <= 0:
-            raise ValueError("'conv_factor' must be a positive scalar.")
-
-        return str(resolved_units).strip(), float(resolved_factor)
 
     def _format_unit_text(self, units):
         """Return a display-friendly unit label."""
@@ -13630,20 +14580,33 @@ class RealSpace:
         return units
 
     def _axis_extent(self, conv_factor=None):
-        """
-        Return imshow-compatible axis limits with the origin at the top-left.
-        """
+        """Return image-edge limits for a top-left row-zero convention."""
         ny, nx = self.shape
-        scale = 1.0 if conv_factor is None else conv_factor
-        return (-0.5 * scale, (nx - 0.5) * scale, (ny - 0.5) * scale, -0.5 * scale)
+        sy, sx = _real_spacing_pair(conv_factor)
+        oy, ox = self.origin if conv_factor is not None else (0.0, 0.0)
+        return (
+            ox - 0.5 * sx, ox + (nx - 0.5) * sx,
+            oy + (ny - 0.5) * sy, oy - 0.5 * sy,
+        )
 
-    def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET):
-        """Create a new RealSpace object while preserving calibration."""
+    def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET,
+               origin=_SCALE_UNSET, quantity=_SCALE_UNSET,
+               value_units=_SCALE_UNSET):
+        """Create a RealSpace image while preserving metadata."""
         if units is _SCALE_UNSET:
             units = self.units
         if conv_factor is _SCALE_UNSET:
             conv_factor = self.conv_factor
-        return RealSpace(data, units=units, conv_factor=conv_factor)
+        if origin is _SCALE_UNSET:
+            origin = self.origin
+        if quantity is _SCALE_UNSET:
+            quantity = self.quantity
+        if value_units is _SCALE_UNSET:
+            value_units = self.value_units
+        return RealSpace(
+            data, units=units, conv_factor=conv_factor, origin=origin,
+            quantity=quantity, value_units=value_units,
+        )
 
     def copy(self):
         """
@@ -13653,6 +14616,118 @@ class RealSpace:
         object can be edited without changing this object.
         """
         return self._spawn(np.array(self.array, copy=True))
+
+    def crop(self, ylim=None, xlim=None, selection_units='pixels'):
+        """Return a cropped image while retaining its physical origin.
+
+        ``ylim`` and ``xlim`` are indices or half-open ``(start, stop)``
+        ranges. Use ``selection_units='calibrated'`` for physical coordinates.
+        Pixel selections are the default, even on calibrated images.
+        """
+        _, factor, mode = _resolve_unit_mode(
+            selection_units, self.units, self.conv_factor,
+            label='selection_units',
+        )
+        sy, sx = _real_spacing_pair(factor)
+        y0, y1, _ = _parse_real_selection(
+            ylim, self.shape[0], 'ylim', mode, sy, self.origin[0],
+        )
+        x0, x1, _ = _parse_real_selection(
+            xlim, self.shape[1], 'xlim', mode, sx, self.origin[1],
+        )
+        source_sy, source_sx = _real_spacing_pair(self.conv_factor)
+        new_origin = (
+            self.origin[0] + y0 * source_sy,
+            self.origin[1] + x0 * source_sx,
+        )
+        return self._spawn(self.array[y0:y1, x0:x1], origin=new_origin)
+
+    def resize(self, shape, method='area'):
+        """Resize the image and update pixel spacing and pixel-center origin.
+
+        ``method='area'`` computes area-weighted downsampling. ``'linear'``
+        and ``'nearest'`` also support upsampling. Pixel values are preserved
+        in their original range; integer data may become floating point.
+        """
+        values = np.asarray(shape, dtype=object)
+        if values.shape != (2,) or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (Integral, np.integer)) or value < 1
+            for value in values
+        ):
+            raise ValueError("shape must be a positive integer (y, x) pair.")
+        output_shape = tuple(int(value) for value in values)
+        if method not in ('area', 'linear', 'nearest'):
+            raise ValueError("method must be 'area', 'linear', or 'nearest'.")
+        if method == 'area':
+            if any(new > old for new, old in zip(output_shape, self.shape)):
+                raise ValueError("method='area' supports downsampling only.")
+            resized = HyperData._resize_area(
+                self.array, output_shape, axes=(0, 1),
+            )
+        else:
+            order = 1 if method == 'linear' else 0
+            resized = transform.resize(
+                self.array.astype(float) if order == 1 and self.array.dtype == bool
+                else self.array,
+                output_shape, order=order, mode='reflect',
+                anti_aliasing=(order > 0 and any(
+                    new < old for new, old in zip(output_shape, self.shape)
+                )),
+                preserve_range=True,
+            )
+            if order == 0:
+                resized = resized.astype(self.array.dtype, copy=False)
+
+        factors = tuple(old / new for old, new in zip(self.shape, output_shape))
+        sy, sx = _real_spacing_pair(self.conv_factor)
+        new_origin = (
+            self.origin[0] + 0.5 * (factors[0] - 1) * sy,
+            self.origin[1] + 0.5 * (factors[1] - 1) * sx,
+        )
+        new_factor = (
+            None if self.conv_factor is None
+            else _scaled_real_spacing(self.conv_factor, factors)
+        )
+        return self._spawn(resized, conv_factor=new_factor, origin=new_origin)
+
+    @staticmethod
+    def _draw_scale_bar(ax, length, unit_text, color, position, label, extent):
+        """Draw a real-space bar in displayed coordinate units."""
+        left, right, bottom, top = extent
+        width = right - left
+        height = bottom - top
+        margin = 0.06 * width
+        if length > width - 2 * margin:
+            raise ValueError("scale_bar is too long for the displayed image.")
+        if position == 'left':
+            x0 = left + margin
+        elif position == 'right':
+            x0 = right - margin - length
+        else:
+            x0 = left + (width - length) / 2
+        x1 = x0 + length
+        y0 = bottom - 0.08 * height
+        cap = 0.012 * height
+        outline = [
+            path_effects.Stroke(linewidth=5, foreground='black'),
+            path_effects.Normal(),
+        ]
+        ax.plot(
+            [x0, x1], [y0, y0], color=color, linewidth=3,
+            zorder=5, path_effects=outline,
+        )
+        for xpos in (x0, x1):
+            ax.plot(
+                [xpos, xpos], [y0 - cap, y0 + cap],
+                color=color, linewidth=2, zorder=5, path_effects=outline,
+            )
+        if label:
+            ax.text(
+                (x0 + x1) / 2, y0 - 2 * cap,
+                f"{length:g} {unit_text}", color=color,
+                ha='center', va='bottom', zorder=5, path_effects=outline,
+            )
 
     def show(self,
              title: str = 'Real-Space Image',
@@ -13667,16 +14742,50 @@ class RealSpace:
              cmap: str = 'gray',
              coords: np.ndarray | None = None,
              axis_units='auto',
+             *, ax=None, show=True, colorbar=None, colorbar_label=None,
+             grid_color=None, grid_ticks=None,
+             scale_bar=None, scale_bar_position='left',
+             scale_bar_color='white', scale_bar_label=True,
+             coords_units='pixels', y=None, x=None,
+             percentiles=None, symmetric=False,
              **scatter_kwargs):
-        """
-        Visualize the real-space image stored in this object.
+        """Display the image on new or existing Matplotlib axes.
 
         Parameters
         ----------
         axis_units : {'auto', 'pixels', 'calibrated'}, optional
-            Unit system used for the displayed axes. ``'auto'`` uses stored
-            real-space calibration when available and otherwise falls back to
-            pixels.
+            Axis and scale-bar units. ``'auto'`` uses calibration if available.
+        ax : matplotlib.axes.Axes or None, optional
+            Existing axes for a subplot. If None, create a new figure.
+        show : bool, optional
+            Call ``plt.show()`` when True. Set False when composing figures.
+        colorbar : bool or None, optional
+            Draw a colorbar. None follows ``axes``; an explicit value is
+            independent of whether image axes are visible.
+        colorbar_label : str or None, optional
+            Override the label from ``quantity`` and ``value_units``.
+        coords, y, x : array-like, optional
+            Scatter positions, with ``coords`` in ``(y, x)`` order. Supply
+            either ``coords`` or both ``y`` and ``x``. The default input is
+            pixel indices even when displayed axes are calibrated.
+        coords_units : {'pixels', 'calibrated'}, optional
+            Input coordinate system for scatter positions.
+        grid_color, grid_ticks : optional
+            Grid color and tick count (scalar or ``(y, x)``). ``num_div`` and
+            ``gridColor`` remain accepted for existing plotting calls.
+        scale_bar : positive float or None, optional
+            Length in the displayed axis units. Its location, color, and
+            numeric label are controlled by the ``scale_bar_*`` arguments.
+        percentiles : (float, float) or None, optional
+            Use these finite-data percentiles when ``vmin`` or ``vmax`` is
+            omitted. Explicit limits take priority.
+        symmetric : bool, optional
+            Use color limits symmetric around zero, useful for strain maps.
+
+        Returns
+        -------
+        tuple[Figure, Axes]
+            The figure and image axes. The image is not modified.
         """
         if 'units' in scatter_kwargs or 'conv_factor' in scatter_kwargs:
             raise TypeError(
@@ -13684,58 +14793,182 @@ class RealSpace:
                 "'calibrated'. Set the object scale with set_scale() instead "
                 "of passing units/conv_factor to show()."
             )
+        if coords is not None and (y is not None or x is not None):
+            raise ValueError("Provide either coords or y and x, not both.")
+        if (y is None) != (x is None):
+            raise ValueError("Supply both y and x for scatter points.")
+        if y is not None:
+            y_values = np.atleast_1d(np.asarray(y, dtype=float))
+            x_values = np.atleast_1d(np.asarray(x, dtype=float))
+            if y_values.ndim != 1 or x_values.ndim != 1 or y_values.shape != x_values.shape:
+                raise ValueError("y and x must be equally sized scalar or 1D arrays.")
+            coords = np.column_stack((y_values, x_values))
+        if coords is not None:
+            coords = np.asarray(coords, dtype=float)
+            if coords.shape == (2,):
+                coords = coords.reshape(1, 2)
+            if coords.size == 0:
+                coords = np.empty((0, 2), dtype=float)
+            if coords.ndim != 2 or coords.shape[1] != 2:
+                raise ValueError("coords must have shape (N, 2) in (y, x) order.")
+            if not np.all(np.isfinite(coords)):
+                raise ValueError("Scatter coordinates must be finite.")
+        elif scatter_kwargs:
+            raise TypeError("Scatter styling requires coords or both y and x.")
+
+        input_mode = _normalize_unit_mode(coords_units, label='coords_units')
+        if input_mode == 'auto':
+            input_mode = 'pixels'
+        if input_mode == 'calibrated' and self.conv_factor is None:
+            raise ValueError("coords_units='calibrated' requires image calibration.")
         units, conv_factor, _ = _resolve_unit_mode(
-            axis_units,
-            self.units,
-            self.conv_factor,
-            label='axis_units',
+            axis_units, self.units, self.conv_factor, label='axis_units',
         )
         axis_unit_text = self._format_unit_text(units)
         extent = self._axis_extent(conv_factor=conv_factor)
-        scale = 1.0 if conv_factor is None else conv_factor
+        display_sy, display_sx = _real_spacing_pair(conv_factor)
+        display_origin = self.origin if conv_factor is not None else (0.0, 0.0)
 
-        plt.figure(figsize=figsize)
-        im1 = plt.imshow(self.array, vmin=vmin, vmax=vmax, cmap=cmap, extent=extent)
-        ax = plt.gca()
+        if grid_color is None:
+            grid_color = gridColor
+        to_rgba(grid_color)
+        to_rgba(scale_bar_color)
+        if scale_bar_position not in ('left', 'center', 'right'):
+            raise ValueError("scale_bar_position must be 'left', 'center', or 'right'.")
+        if scale_bar is not None:
+            if isinstance(scale_bar, (bool, np.bool_)):
+                raise ValueError("scale_bar must be positive and finite.")
+            try:
+                scale_bar = float(scale_bar)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("scale_bar must be positive and finite.") from exc
+            if not np.isfinite(scale_bar) or scale_bar <= 0:
+                raise ValueError("scale_bar must be positive and finite.")
+            if scale_bar > 0.88 * (extent[1] - extent[0]):
+                raise ValueError("scale_bar is too long for the displayed image.")
+
+        def tick_counts(value, label, minimum):
+            if isinstance(value, (Integral, np.integer)) and not isinstance(value, (bool, np.bool_)):
+                value = (value, value)
+            if not isinstance(value, (tuple, list, np.ndarray)) or len(value) != 2:
+                raise ValueError(f"{label} must be an integer or (y, x) pair.")
+            if any(
+                isinstance(count, (bool, np.bool_))
+                or not isinstance(count, (Integral, np.integer)) or count < minimum
+                for count in value
+            ):
+                raise ValueError(f"{label} must contain integers >= {minimum}.")
+            return tuple(int(count) for count in value)
+
+        if grid_ticks is not None:
+            ny_ticks, nx_ticks = tick_counts(grid_ticks, 'grid_ticks', 1)
+        elif num_div is None:
+            ny_ticks = nx_ticks = None
+        else:
+            ny_div, nx_div = tick_counts(num_div, 'num_div', 0)
+            ny_ticks = ny_div + 1 if ny_div else None
+            nx_ticks = nx_div + 1 if nx_div else None
+
+        finite_values = np.asarray(self.array)[np.isfinite(self.array)]
+        if finite_values.size == 0:
+            raise ValueError("Real-space image has no finite values to display.")
+        if percentiles is not None:
+            try:
+                limits = np.asarray(percentiles, dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "percentiles must satisfy 0 <= low < high <= 100."
+                ) from exc
+            if (
+                limits.shape != (2,) or not np.all(np.isfinite(limits))
+                or limits[0] < 0 or limits[1] > 100 or limits[0] >= limits[1]
+            ):
+                raise ValueError("percentiles must satisfy 0 <= low < high <= 100.")
+            low, high = np.percentile(finite_values, limits)
+            vmin = low if vmin is None else vmin
+            vmax = high if vmax is None else vmax
+        if symmetric:
+            low = np.min(finite_values) if vmin is None else vmin
+            high = np.max(finite_values) if vmax is None else vmax
+            limit = max(abs(low), abs(high))
+            vmin, vmax = -limit, limit
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            if not hasattr(ax, 'imshow') or not hasattr(ax, 'figure'):
+                raise TypeError("ax must be a Matplotlib Axes instance.")
+            fig = ax.figure
+        im1 = ax.imshow(
+            self.array, vmin=vmin, vmax=vmax, cmap=cmap,
+            extent=extent, origin='upper',
+        )
 
         if aspect is not None:
             ax.set_aspect(aspect)
 
-        if coords is not None:
-            coords = np.asarray(coords)
-            if coords.size > 0:
-                x_coords = coords[:, 1] * scale
-                y_coords = coords[:, 0] * scale
-                plt.scatter(x_coords, y_coords, **scatter_kwargs)
+        if coords is not None and coords.size:
+            if input_mode == 'calibrated':
+                source_sy, source_sx = self.pixel_size
+                pixel_y = (coords[:, 0] - self.origin[0]) / source_sy
+                pixel_x = (coords[:, 1] - self.origin[1]) / source_sx
+            else:
+                pixel_y, pixel_x = coords[:, 0], coords[:, 1]
+            x_positions = display_origin[1] + pixel_x * display_sx
+            y_positions = display_origin[0] + pixel_y * display_sy
+            ax.scatter(x_positions, y_positions, **scatter_kwargs)
+
+        x_positions = (
+            ax.get_xticks() if nx_ticks is None else np.linspace(
+                display_origin[1],
+                display_origin[1] + (self.shape[1] - 1) * display_sx,
+                nx_ticks,
+            )
+        )
+        y_positions = (
+            ax.get_yticks() if ny_ticks is None else np.linspace(
+                display_origin[0],
+                display_origin[0] + (self.shape[0] - 1) * display_sy,
+                ny_ticks,
+            )
+        )
 
         if axes:
             ax.set_xlabel(f"x ({axis_unit_text})", fontsize=14)
             ax.set_ylabel(f"y ({axis_unit_text})", fontsize=14)
-            ax.set_title(title, fontsize=18)
-
-            if isinstance(num_div, tuple):
-                ydiv, xdiv = num_div
-            else:
-                ydiv = num_div
-                xdiv = num_div
-
-            if xdiv and xdiv > 0:
-                ax.set_xticks(np.linspace(0, (self.shape[1] - 1) * scale, xdiv + 1))
-            if ydiv and ydiv > 0:
-                ax.set_yticks(np.linspace(0, (self.shape[0] - 1) * scale, ydiv + 1))
-
+            if nx_ticks is not None:
+                ax.set_xticks(x_positions)
+            if ny_ticks is not None:
+                ax.set_yticks(y_positions)
             if grid:
-                ax.grid(color=gridColor)
-
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-            cb = plt.colorbar(im1, cax=cax)
-            cb.ax.tick_params(labelsize=12)
-            cb.set_label("Intensity", fontsize=14)
+                ax.grid(color=grid_color)
         else:
-            plt.axis('off')
+            if grid:
+                for xpos in x_positions:
+                    ax.axvline(xpos, color=grid_color, linewidth=0.7, zorder=2)
+                for ypos in y_positions:
+                    ax.axhline(ypos, color=grid_color, linewidth=0.7, zorder=2)
+            ax.set_axis_off()
 
-        plt.show()
+        if title is not None:
+            ax.set_title(title, fontsize=18)
+        if colorbar is None:
+            colorbar = axes
+        if colorbar:
+            cb = fig.colorbar(im1, ax=ax)
+            label = colorbar_label or self.quantity
+            if colorbar_label is None and self.value_units is not None:
+                label += f" ({self.value_units})"
+            cb.set_label(label, fontsize=14)
+        if scale_bar is not None:
+            self._draw_scale_bar(
+                ax, scale_bar, axis_unit_text, scale_bar_color,
+                scale_bar_position, scale_bar_label, extent,
+            )
+
+        if show:
+            plt.show()
+        return fig, ax
 
 #%% Denoising Functions and Classes
 
