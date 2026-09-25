@@ -96,3 +96,72 @@ python -m ipykernel install --user --name 4denoise-main --display-name "4denoise
 ```
 
 #### 8. We type `jupyter notebook` in the Anaconda Prompt (or select it directly in the Anaconda app) to open the Jupyter notebook application. We then open the file `DEMO_exp_4dstem_ripple_processing.ipynb`
+
+The editable install now declares the packages needed to import and use
+`fourdenoise`. Without the Conda environment, install the optional simulation
+and notebook tools with `pip install -e ".[simulation,notebook]"`. The optional
+BM3D/BM4D methods can be installed with `pip install -e ".[bm]"`.
+
+To run the local regression suite from the repository directory:
+
+```bash
+python -m unittest discover -s tests
+```
+
+`HyperData` uses the last two axes as an image/pattern. Its `scan_shape` is
+`()` for a 2D image, `(N,)` for a 3D stack, and `(Ry, Rx)` for a 4D scan.
+`pattern_shape` (also available as `k_shape`) is the shape of the last two
+axes. `real_shape` is `(Ry, Rx)` only for a 4D scan; it is `None` for a 3D
+stack because the original 2D scan geometry is not known.
+
+For a raw binary file with known layout, pass the full stored shape and dtype:
+
+```python
+data = HyperData(
+    'scan.raw', raw_shape=(Ry, Rx, Ky, Kx), raw_dtype='>u2',
+    raw_order='C',
+)
+```
+
+The dtype can include byte order (`'>u2'` is big-endian unsigned 16-bit).
+With an explicit `raw_shape`, no detector rows are trimmed unless
+`raw_trim_meta=True` and `raw_trim_dims=(Ky, Kx)` are supplied. Without an
+explicit shape, the legacy float32 EMPAD reader infers a square scan and
+trims a 130x128 detector to 128x128 when those dimensions are available.
+Rectangular scans require `raw_shape`.
+
+Curve unfolding can retain excluded values for exact undo. The returned
+metadata reports their size as `preserved_values_nbytes`; resizing with
+`preserve_original=True` retains a complete original-tensor copy. Subsequent
+shape-preserving operations share these read-only saved values, while
+`HyperData.copy()` makes an independent metadata copy. Values outside a
+center-cropped traversal remain unchanged by operations on its unfolded data.
+
+`HyperData.save()` writes atomically by default: a failed write leaves an
+existing output untouched. Overwriting temporarily needs disk space for both
+the old and new files; use `atomic=False` only when that extra space is not
+available and a partial file on failure is acceptable.
+New saves use format version 1.1. Existing version 1.0 files remain readable;
+unsupported or unversioned files raise a clear error instead of being
+interpreted as generic HDF5 data.
+
+For a large 3D/4D HDF5 dataset, read bounded scan blocks instead of loading
+the entire array:
+
+```python
+from fourdenoise import HyperData
+
+with HyperData.open_hdf5('experiment.h5') as source:
+    pattern = source.get_dp(0, 0)  # 4D data: one scan position
+    for scan_slices, block in source.iter_chunks((16, 16)):
+        print(scan_slices, block.shape)  # each block is an in-memory HyperData
+```
+
+For 3D stacks, `get_dp` takes one index and `iter_chunks` accepts a scalar
+chunk size. Use `hdf5_dataset='/entry/data'` when a file contains multiple
+datasets. `HyperData(path)` remains eager, and methods called on a chunk do
+not automatically process the rest of the HDF5 file.
+
+`requirements.lock.txt` is a snapshot from a specific machine and contains
+local `file:///` package paths. Use `environment.yml` or the editable install
+above on another computer instead of treating that snapshot as a portable lock.
