@@ -108,10 +108,42 @@ To run the local regression suite from the repository directory:
 python -m unittest discover -s tests
 ```
 
+`HyperData` uses the last two axes as an image/pattern. Its `scan_shape` is
+`()` for a 2D image, `(N,)` for a 3D stack, and `(Ry, Rx)` for a 4D scan.
+`pattern_shape` (also available as `k_shape`) is the shape of the last two
+axes. `real_shape` is `(Ry, Rx)` only for a 4D scan; it is `None` for a 3D
+stack because the original 2D scan geometry is not known.
+
+For a raw binary file with known layout, pass the full stored shape and dtype:
+
+```python
+data = HyperData(
+    'scan.raw', raw_shape=(Ry, Rx, Ky, Kx), raw_dtype='>u2',
+    raw_order='C',
+)
+```
+
+The dtype can include byte order (`'>u2'` is big-endian unsigned 16-bit).
+With an explicit `raw_shape`, no detector rows are trimmed unless
+`raw_trim_meta=True` and `raw_trim_dims=(Ky, Kx)` are supplied. Without an
+explicit shape, the legacy float32 EMPAD reader infers a square scan and
+trims a 130x128 detector to 128x128 when those dimensions are available.
+Rectangular scans require `raw_shape`.
+
+Curve unfolding can retain excluded values for exact undo. The returned
+metadata reports their size as `preserved_values_nbytes`; resizing with
+`preserve_original=True` retains a complete original-tensor copy. Subsequent
+shape-preserving operations share these read-only saved values, while
+`HyperData.copy()` makes an independent metadata copy. Values outside a
+center-cropped traversal remain unchanged by operations on its unfolded data.
+
 `HyperData.save()` writes atomically by default: a failed write leaves an
 existing output untouched. Overwriting temporarily needs disk space for both
 the old and new files; use `atomic=False` only when that extra space is not
 available and a partial file on failure is acceptable.
+New saves use format version 1.1. Existing version 1.0 files remain readable;
+unsupported or unversioned files raise a clear error instead of being
+interpreted as generic HDF5 data.
 
 For a large 3D/4D HDF5 dataset, read bounded scan blocks instead of loading
 the entire array:

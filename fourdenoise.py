@@ -24,6 +24,7 @@ import h5py
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import lru_cache
+from math import isqrt, prod
 from numbers import Integral
 
 
@@ -105,7 +106,8 @@ from typing import Union, Sequence, Tuple
 
 _SCALE_UNSET = object()
 _HYPERDATA_HDF5_FORMAT = '4denoise.hyperdata'
-_HYPERDATA_HDF5_VERSION = '1.0'
+_HYPERDATA_HDF5_VERSION = '1.1'
+_HYPERDATA_HDF5_READABLE_VERSIONS = ('1.0', '1.1')
 
 
 def _normalize_real_spacing(spacing):
@@ -664,9 +666,42 @@ def _is_hyperdata_hdf5_file(filename):
             file_format = _decode_hdf5_value(
                 file.attrs.get('fourdenoise_format', None)
             )
-            return file_format == _HYPERDATA_HDF5_FORMAT and 'array' in file
+            return file_format == _HYPERDATA_HDF5_FORMAT
     except OSError:
         return False
+
+
+def _checked_hyperdata_format_version(file, path):
+    """Validate the on-disk schema before reading saved HyperData metadata."""
+    version = _decode_hdf5_value(file.attrs.get('format_version'))
+    if version is None:
+        raise ValueError(
+            f"'{path}' is missing its 4Denoise format_version; the saved "
+            "metadata schema cannot be determined safely."
+        )
+    if version not in _HYPERDATA_HDF5_READABLE_VERSIONS:
+        raise ValueError(
+            f"'{path}' uses unsupported 4Denoise format version "
+            f"{version!r}; this installation can read versions "
+            f"{', '.join(_HYPERDATA_HDF5_READABLE_VERSIONS)}."
+        )
+    return version
+
+
+def _migrate_hyperdata_metadata(metadata, version):
+    """Normalize each supported file schema to the current in-memory form."""
+    if version in _HYPERDATA_HDF5_READABLE_VERSIONS:
+        migrated = dict(metadata)
+        migrated.setdefault('real_origin', (0.0, 0.0))
+        if version == '1.0' and isinstance(migrated.get('unfold_metadata'), dict):
+            unfolded = dict(migrated['unfold_metadata'])
+            unfolded.setdefault(
+                'preserved_values_nbytes',
+                sum(values.nbytes for values in _unfold_payload_arrays(unfolded)),
+            )
+            migrated['unfold_metadata'] = unfolded
+        return migrated
+    raise ValueError(f"No metadata migration is defined for version {version!r}.")
 
 
 def _load_hyperdata_hdf5(filename):
@@ -683,6 +718,7 @@ def _load_hyperdata_hdf5(filename):
         if 'array' not in file:
             raise ValueError(f"'{path}' does not contain a saved data array.")
 
+        version = _checked_hyperdata_format_version(file, path)
         array = file['array'][()]
         metadata = {}
         if 'metadata' in file:
@@ -691,7 +727,7 @@ def _load_hyperdata_hdf5(filename):
                 key: _read_hdf5_value(metadata_group, key)
                 for key in metadata_group.keys()
             }
-    return array, metadata
+    return array, _migrate_hyperdata_metadata(metadata, version)
 
 
 def _format_hdf5_dataset_listing(dataset_info):
@@ -899,8 +935,32 @@ class _HDF5ChunkReader:
 #TODO: read EMD file data
 #TODO: combine with RosettaSciIO
 
-def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
-            trim_meta=True, clip=False, hdf5_dataset=None, repair_nans=False):
+def _validate_raw_dimensions(value, name, allowed_lengths):
+    """Normalize user-specified raw dimensions without silently rounding."""
+    try:
+        dimensions = tuple(value)
+    except TypeError as exc:
+        raise ValueError(
+            f"{name} must contain {allowed_lengths} positive integer dimensions."
+        ) from exc
+    if (
+        len(dimensions) not in allowed_lengths
+        or any(
+            not isinstance(size, Integral)
+            or isinstance(size, (bool, np.bool_))
+            or size <= 0
+            for size in dimensions
+        )
+    ):
+        raise ValueError(
+            f"{name} must contain {allowed_lengths} positive integer dimensions."
+        )
+    return tuple(map(int, dimensions))
+
+
+def read_4D(fname, dp_dims=(128, 130), trim_dims=(128, 128),
+            trim_meta=None, clip=False, hdf5_dataset=None, repair_nans=False,
+            raw_shape=None, raw_dtype=np.float32, raw_order='C'):
     """
     Read array data from a .raw, .mat, .npy, .h5, .hdf5, or .hdf file.
     
@@ -919,6 +979,19 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
         HDF5 dataset path to load. Generic HDF5 files containing exactly one
         numeric multidimensional dataset are selected automatically. This
         argument is required when a file contains multiple candidates.
+    raw_shape : tuple of 2 to 4 ints or None, optional
+        Full shape stored in a raw file, in array axis order. For 4D-STEM,
+        specify ``(Ry, Rx, Ky, Kx)``. If omitted, the legacy EMPAD layout
+        uses ``dp_dims`` and requires a square scan grid.
+    raw_dtype : numpy dtype, optional
+        Stored raw scalar type, including byte order (for example ``'>u2'``).
+        Defaults to float32. Used only for ``.raw`` files.
+    raw_order : {'C', 'F'}, optional
+        Storage order of raw values. Defaults to NumPy row-major order.
+    trim_meta : bool or None, optional
+        Crop the raw detector axes to ``trim_dims``. None keeps the historical
+        crop for inferred EMPAD layouts and disables it for explicit
+        ``raw_shape``, so an explicit shape is loaded without hidden trimming.
     clip : bool, optional
         Replace values below 1 with 1. Disabled by default to preserve raw
         detector counts, including zeros and negative values.
@@ -981,24 +1054,75 @@ def read_4D(fname, dp_dims=(128, 130), trim_dims=(128,128),
 
     # Read 4D data from .raw file
     fname_end = Path(fname).suffix.lower()
-        
-    if fname_end == '.raw':
-        with open(fname, 'rb') as file:
-            dp = np.fromfile(file, np.float32)
+    if fname_end != '.raw' and raw_shape is not None:
+        raise ValueError("raw_shape applies only to .raw files.")
 
-        columns = dp_dims[0]    
-        rows = dp_dims[1]
-            
-        sqpix = dp.size/columns/rows
-        
-        # Assuming square scan, i.e. same number of x and y scan points
-        pix = int(sqpix**(0.5))
-        
-        dp = np.reshape(dp, (pix, pix, rows, columns), order = 'C')
-        
-        # Trim off the last two meta data rows if desired. The metadata is for EMPAD debugging, and generally doesn't need to be kept.
+    if fname_end == '.raw':
+        try:
+            dtype = np.dtype(raw_dtype)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid raw_dtype {raw_dtype!r}.") from exc
+        if dtype.kind not in 'biufc':
+            raise ValueError("raw_dtype must be a numeric or boolean dtype.")
+        if raw_order not in ('C', 'F'):
+            raise ValueError("raw_order must be 'C' or 'F'.")
+        if trim_meta is not None and not isinstance(trim_meta, (bool, np.bool_)):
+            raise ValueError("trim_meta must be a boolean or None.")
+
+        explicit_raw_shape = raw_shape is not None
+        if explicit_raw_shape:
+            raw_shape = _validate_raw_dimensions(
+                raw_shape, 'raw_shape', (2, 3, 4),
+            )
+        else:
+            columns, rows = _validate_raw_dimensions(dp_dims, 'dp_dims', (2,))
+
+        file_size = Path(fname).stat().st_size
+        if file_size % dtype.itemsize:
+            raise ValueError(
+                f"Raw file has {file_size} bytes, not a multiple of "
+                f"raw_dtype item size {dtype.itemsize}."
+            )
+        if raw_shape is None:
+            frame_elements = rows * columns
+            n_elements = file_size // dtype.itemsize
+            if n_elements % frame_elements:
+                raise ValueError(
+                    "Raw file size is not divisible by dp_dims; specify the "
+                    "correct dp_dims or raw_shape."
+                )
+            n_patterns = n_elements // frame_elements
+            scan_side = isqrt(n_patterns)
+            if scan_side == 0 or scan_side * scan_side != n_patterns:
+                raise ValueError(
+                    "Raw scan is not square; specify raw_shape=(Ry, Rx, Ky, Kx)."
+                )
+            raw_shape = (scan_side, scan_side, rows, columns)
+
+        expected_size = prod(raw_shape) * dtype.itemsize
+        if file_size != expected_size:
+            raise ValueError(
+                f"Raw file has {file_size} bytes but raw_shape={raw_shape} "
+                f"and raw_dtype={dtype} require {expected_size} bytes."
+            )
+
+        dp = np.fromfile(fname, dtype=dtype).reshape(raw_shape, order=raw_order)
+
+        if trim_meta is None:
+            trim_meta = False
+            if not explicit_raw_shape:
+                trim_dims = _validate_raw_dimensions(trim_dims, 'trim_dims', (2,))
+                trim_meta = all(
+                    size <= limit for size, limit in zip(trim_dims, dp.shape[-2:])
+                )
         if trim_meta:
-            dp = dp[:,:,:trim_dims[0],:trim_dims[1]]
+            trim_dims = _validate_raw_dimensions(trim_dims, 'trim_dims', (2,))
+            if any(size > limit for size, limit in zip(trim_dims, dp.shape[-2:])):
+                raise ValueError(
+                    "trim_dims must contain two positive sizes no larger than "
+                    f"the raw detector shape {dp.shape[-2:]}."
+                )
+            dp = dp[..., :trim_dims[0], :trim_dims[1]]
 
     elif fname_end == '.mat':
         dp = _read_mat_file(fname)
@@ -3047,8 +3171,49 @@ def _extract_excess_values(array, metadata):
             values[idx] = array[:, :, ky_idx, kx_idx]
         metadata['excess_values'] = values
     elif representation == 'both_matrix':
-        metadata['excess_values'] = array.copy()
-        metadata['excess_values_encoding'] = 'full_tensor'
+        real_excess = np.asarray(metadata['real_excess_indices'], dtype=int)
+        reciprocal_excess = np.asarray(
+            metadata['reciprocal_excess_indices'], dtype=int,
+        )
+        real_kept = np.asarray(metadata['real_traversal_indices'], dtype=int)
+        metadata['excess_values'] = {
+            'real': array[
+                real_excess[:, 0], real_excess[:, 1], :, :
+            ].copy(),
+            'reciprocal': array[
+                real_kept[:, 0, None],
+                real_kept[:, 1, None],
+                reciprocal_excess[None, :, 0],
+                reciprocal_excess[None, :, 1],
+            ].copy(),
+        }
+        metadata['excess_values_encoding'] = 'separated_domains'
+
+
+def _unfold_payload_arrays(metadata):
+    """Yield large saved values; traversal coordinates remain independent."""
+    for key in ('original_values', 'excess_values'):
+        value = metadata.get(key)
+        if isinstance(value, np.ndarray):
+            yield value
+        elif isinstance(value, dict):
+            yield from (
+                item for item in value.values()
+                if isinstance(item, np.ndarray)
+            )
+
+
+def _clone_unfold_metadata(metadata, *, share_payload=False):
+    """Copy metadata without recopying immutable undo payloads by default."""
+    if metadata is None:
+        return None
+    if not share_payload:
+        return deepcopy(metadata)
+    memo = {}
+    for values in _unfold_payload_arrays(metadata):
+        values.setflags(write=False)
+        memo[id(values)] = values
+    return deepcopy(metadata, memo)
 
 
 def _crop_restore_shape(metadata):
@@ -3148,7 +3313,27 @@ def _restore_both_matrix(array, metadata):
         if strategy == 'resize' and metadata.get('preserve_original', False):
             return np.array(metadata['original_values'], copy=True)
         if strategy == 'center_crop' and metadata.get('preserve_excess', False):
-            restored = np.array(metadata['excess_values'], copy=True)
+            encoding = metadata.get('excess_values_encoding', 'full_tensor')
+            if encoding == 'full_tensor':
+                # Saved files from the original implementation use this form.
+                restored = np.array(metadata['excess_values'], copy=True)
+            elif encoding == 'separated_domains':
+                restored = np.empty(metadata['working_shape'], dtype=array.dtype)
+                real_excess = np.asarray(metadata['real_excess_indices'], dtype=int)
+                reciprocal_excess = np.asarray(
+                    metadata['reciprocal_excess_indices'], dtype=int,
+                )
+                values = metadata['excess_values']
+                restored[real_excess[:, 0], real_excess[:, 1], :, :] = values['real']
+                for flat_idx, (ry_idx, rx_idx) in enumerate(real_indices):
+                    restored[
+                        ry_idx, rx_idx,
+                        reciprocal_excess[:, 0], reciprocal_excess[:, 1],
+                    ] = values['reciprocal'][flat_idx]
+            else:
+                raise ValueError(
+                    f"Unsupported excess-values encoding '{encoding}'."
+                )
         else:
             restored = np.empty(metadata['working_shape'], dtype=array.dtype)
         real_local = real_indices
@@ -3316,6 +3501,10 @@ def _unfold_array(array, domain='real', method='row_major',
         metadata['original_values'] = np.array(original_values, copy=True)
 
     _extract_excess_values(array, metadata)
+    payloads = tuple(_unfold_payload_arrays(metadata))
+    metadata['preserved_values_nbytes'] = sum(values.nbytes for values in payloads)
+    for values in payloads:
+        values.setflags(write=False)
     representation = metadata['representation']
 
     if representation == 'coordinate_aligned_matrix':
@@ -5135,7 +5324,12 @@ class HyperData:
                  flip_axis=None,
                  real_origin=None,
                  clip_on_load=False,
-                 repair_nans=False):
+                 repair_nans=False,
+                 raw_shape=None,
+                 raw_dtype=np.float32,
+                 raw_order='C',
+                 raw_trim_meta=None,
+                 raw_trim_dims=(128, 128)):
         """Wrap an array or load a dataset with optional axis reversal.
 
         ``flip_axis`` accepts one axis or a sequence of axes to reverse. For
@@ -5145,15 +5339,25 @@ class HyperData:
         ``real_conv_factor`` may be scalar or ``(y, x)`` units per pixel.
         ``real_origin`` is the calibrated coordinate of scan pixel ``(0, 0)``
         and defaults to ``(0, 0)``.
+        ``scan_shape`` contains all leading (non-pattern) axes and
+        ``pattern_shape`` contains the last two axes. ``real_shape`` is the
+        2D scan grid only for 4D data; a 3D stack has ``scan_shape=(N,)``
+        and ``real_shape=None`` because its scan geometry is unknown.
         For generic files, ``clip_on_load`` replaces values below 1 with 1 and
         ``repair_nans`` replaces NaN-containing patterns with neighbor averages.
         Both are opt-in; loading preserves the stored data by default.
+        For ``.raw`` files, ``raw_shape`` specifies the full stored shape;
+        ``raw_dtype`` and ``raw_order`` specify the binary layout. Explicit
+        ``raw_shape`` disables EMPAD metadata-row trimming by default. Set
+        ``raw_trim_meta=True`` and ``raw_trim_dims`` to request that crop.
         """
         loaded_metadata = {}
 
         # Read dataset from file path if input object is string/path-like.
         if isinstance(data, (str, Path)):
             data_path = Path(data).expanduser()
+            if raw_shape is not None and data_path.suffix.lower() != '.raw':
+                raise ValueError("raw_shape applies only to .raw files.")
             if _is_hyperdata_hdf5_file(data_path):
                 data, loaded_metadata = _load_hyperdata_hdf5(data_path)
             elif data_path.suffix.lower() == '.4denoise':
@@ -5169,6 +5373,11 @@ class HyperData:
                     hdf5_dataset=hdf5_dataset,
                     clip=clip_on_load,
                     repair_nans=repair_nans,
+                    raw_shape=raw_shape,
+                    raw_dtype=raw_dtype,
+                    raw_order=raw_order,
+                    trim_meta=raw_trim_meta,
+                    trim_dims=raw_trim_dims,
                 )
 
         if (
@@ -5192,6 +5401,12 @@ class HyperData:
         if real_origin is None:
             real_origin = loaded_metadata.get('real_origin', (0.0, 0.0))
 
+        if data.ndim < 2:
+            raise ValueError(
+                "HyperData requires at least two spatial axes; expected a "
+                "2D image, 3D image stack, or 4D scan."
+            )
+
         flip_axes = self._normalize_flip_axes(flip_axis, data.ndim)
         if polar_metadata is not None and any(
             axis in (data.ndim - 2, data.ndim - 1) for axis in flip_axes
@@ -5207,8 +5422,10 @@ class HyperData:
         self.array = data
         self.ndim = data.ndim
         self.shape = data.shape
-        self.real_shape = (data.shape[0], data.shape[1])
-        self.k_shape = (data.shape[-2], data.shape[-1])
+        self.scan_shape = tuple(data.shape[:-2])
+        self.pattern_shape = tuple(data.shape[-2:])
+        self.real_shape = tuple(data.shape[:2]) if data.ndim == 4 else None
+        self.k_shape = self.pattern_shape
         self.dtype = data.dtype
         self._denoise_engine = _DenoiseEngine(self.array)
         self.real_units = None
@@ -5216,10 +5433,11 @@ class HyperData:
         self.real_origin = _normalize_real_origin(real_origin)
         self.reciprocal_units = None
         self.reciprocal_conv_factor = None
-        self.unfold_metadata = deepcopy(
+        self.unfold_metadata = _clone_unfold_metadata(
             loaded_metadata.get('unfold_metadata')
             if loaded_metadata and not flip_axes
-            else None
+            else None,
+            share_payload=True,
         )
         self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
         self.center_beam_metadata = (
@@ -5396,6 +5614,7 @@ class HyperData:
                 file.attrs.get('fourdenoise_format', None)
             )
             if file_format == _HYPERDATA_HDF5_FORMAT:
+                version = _checked_hyperdata_format_version(file, path)
                 if hdf5_dataset is not None and str(hdf5_dataset).strip('/\\') != 'array':
                     raise ValueError(
                         "Saved HyperData files contain their data at '/array'; "
@@ -5414,6 +5633,7 @@ class HyperData:
                     ):
                         if key in group:
                             metadata[key] = _read_hdf5_value(group, key)
+                metadata = _migrate_hyperdata_metadata(metadata, version)
             else:
                 dataset = _select_hdf5_dataset(file, hdf5_dataset)
                 metadata = {}
@@ -5591,7 +5811,9 @@ class HyperData:
             real_origin=real_origin,
         )
         if preserve_unfold and result.shape == self.shape:
-            result.unfold_metadata = deepcopy(self.unfold_metadata)
+            result.unfold_metadata = _clone_unfold_metadata(
+                self.unfold_metadata, share_payload=True,
+            )
         return result
 
     def _spawn_reciprocal(self, data, units=_SCALE_UNSET,
@@ -5642,7 +5864,7 @@ class HyperData:
         to the returned object do not mutate this object.
         """
         copied = self._spawn(np.array(self.array, copy=True))
-        copied.unfold_metadata = deepcopy(self.unfold_metadata)
+        copied.unfold_metadata = _clone_unfold_metadata(self.unfold_metadata)
         return copied
 
     def _resolve_real_selection_units(self, selection_units):
@@ -6214,7 +6436,9 @@ class HyperData:
             center-crop only.
         preserve_excess : bool, optional
             For center-crop curve methods, store cropped-out values in metadata
-            so undo can reconstruct the original full tensor exactly.
+            so undo can reconstruct the original full tensor exactly. This
+            consumes space proportional to the excluded data. Value-only
+            operations on an unfolded object leave excluded values unchanged.
         resize_side : int or None, optional
             Explicit compatible side length for resize mode. Hilbert, Morton,
             Z-order, and Moore require powers of 2; Peano requires powers of 3.
@@ -6225,7 +6449,11 @@ class HyperData:
             Method passed to :meth:`resize` in resize mode.
         preserve_original : bool, optional
             For resize mode, store the original tensor in metadata so undo can
-            reconstruct it exactly. Otherwise undo returns the resized tensor.
+            reconstruct it exactly. This requires one full-tensor copy;
+            otherwise undo returns the resized tensor. Shape-preserving
+            operations share the stored read-only values rather than copying
+            them again. ``metadata['preserved_values_nbytes']`` reports their
+            total size.
         undo : bool, optional
             If True, restore an unfolded object using ``metadata`` or this
             object's attached ``unfold_metadata``. If no metadata is available,
