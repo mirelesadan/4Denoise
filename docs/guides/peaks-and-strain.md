@@ -36,6 +36,18 @@ valid = result.valid_mask
 ```
 
 `exx`, `eyy`, and `exy` are dimensionless. `erot` is in radians.
+
+**Tensor directions are separate from map positions.** Peak coordinates have
+order `(ky, kx)`. At `ang=0`, `exx` follows detector kx and `eyy` follows
+detector ky. A `(Ry, Rx)` map's location in the scan does not make those tensor
+directions scan-aligned. Supply the acquisition-specific basis rotation with
+`get_strains(..., ang=angle_degrees)`; this rotates the tensor, not the image.
+For example, `ang=90` exchanges the normal components and reverses the shear
+sign while leaving pixel positions, local rotation, and peak-fit errors
+unchanged. Neither `as_real_space()` nor stored `rq_calibration` currently
+applies this correction automatically. A reflection also requires the correct
+coordinate convention; an angle alone cannot represent a mirrored frame.
+
 `fit_rmse` measures residual peak-position error in the supplied peak
 coordinate units; `relative_fit_rmse` divides that error by the RMS
 reference-peak radius. Neither number is a confidence probability. Check

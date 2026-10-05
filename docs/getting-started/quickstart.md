@@ -76,13 +76,20 @@ The reference below is the mean of refined peak positions from a selected
 strip. It gives strain *relative to that strip*, not an absolute unstrained
 crystal standard.
 
+Peak coordinates and fitted matrices use `(ky, kx)` order: `eyy` comes from
+stretch-matrix element `[0, 0]`, and `exx` from `[1, 1]`. Maps keep the
+`(Ry, Rx)` scan layout. This example applies no basis rotation. Its `exx`
+and `eyy` components follow detector x and y, which need not be physically
+aligned with scan x and y. Coordinate order alone does not establish that
+alignment, and the fit does not remove out-of-plane tilt effects.
+
 ```python
 reference_positions = centers[2:11, 6].mean(axis=0)
 strain = data.get_strains(
     centers=centers, ref_centers=reference_positions,
 )
 strain.as_real_space("exx").show(
-    title="Relative exx strain", cmap="RdBu", symmetric=True,
+    title="Relative exx strain (detector basis)", cmap="RdBu", symmetric=True,
 )
 print(int(strain.valid_mask.sum()), "valid scan positions")
 ```

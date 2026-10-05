@@ -94,6 +94,23 @@ class AbTEMHelperTests(unittest.TestCase):
         self.assertEqual(mask[2, 2], 1)
         self.assertEqual(mask[0, 0], 0)
 
+    def test_simdp_forwards_supported_arguments_and_transposes(self):
+        pattern = np.arange(12).reshape(3, 4)
+        with patch.object(self.helpers, 'simulate_diff', return_value=_Measurement(pattern)) as simulate:
+            output = self.helpers.simDP(object(), plot=False)
+
+        np.testing.assert_array_equal(output, pattern.T)
+        self.assertNotIn('max_frequency', simulate.call_args.kwargs)
+        self.assertEqual(simulate.call_args.kwargs['rotZ'], 0)
+
+    def test_simdp_rejects_unsupported_frequency_and_missing_crop_radius(self):
+        with patch.object(self.helpers, 'simulate_diff') as simulate:
+            with self.assertRaisesRegex(ValueError, 'max_frequency'):
+                self.helpers.simDP(object(), plot=False, max_frequency=1)
+            with self.assertRaisesRegex(ValueError, 'r must be provided'):
+                self.helpers.simDP(object(), plot=False, crop=True)
+            simulate.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

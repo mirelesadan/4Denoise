@@ -362,13 +362,30 @@ def add_poisson_noise(array, counts, rng=None):
     return generator.poisson(signal * (counts / total))
     
 
-def show_atoms_top_and_side(atom_model, 
-                              figsize: tuple = (12,4), 
-                              show_cell: bool = True, 
-                              title1: str ='Top View', 
+def show_atoms_top_and_side(atom_model,
+                              figsize: tuple = (12,4),
+                              show_cell: bool = True,
+                              title1: str ='Top View',
                               title2: str ='Side View',
                               ):
-    
+    """Draw top (xy) and side (xz) views of an atomic model.
+
+    Parameters
+    ----------
+    atom_model : ase.Atoms
+        Atomic structure passed to abTEM's ``show_atoms``.
+    figsize : tuple of float, optional
+        Width and height of the two-panel Matplotlib figure in inches.
+    show_cell : bool, optional
+        Draw the unit cell in both views.
+    title1, title2 : str, optional
+        Titles for the top and side panels, respectively.
+
+    Notes
+    -----
+    This function creates a figure as a side effect and does not return it.
+    """
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
     show_atoms(atom_model, ax=ax1, plane='xy', title=title1,show_cell=show_cell)
     show_atoms(atom_model, ax=ax2, plane='xz', title=title2,show_cell=show_cell)
@@ -467,13 +484,68 @@ def simDP(atom_model,
           max_frequency=None,
           rotZ=None,
           title='Simulated Diffraction Pattern'):
+    """Simulate one diffraction pattern and optionally display it.
 
-    cbed_pattern = simulate_diff(atom_model, 
+    Parameters
+    ----------
+    atom_model : ase.Atoms
+        Atomic structure supplied to :func:`simulate_diff`.
+    theta_tilt, phi_rot : float, optional
+        Model tilt and azimuth in degrees, following the default units of
+        :func:`simulate_diff`.
+    plot : bool, optional
+        Display the simulated pattern using :func:`plotDP`.
+    vmin, vmax : float, optional
+        Display limits for the plot; they do not change the returned data.
+    r : int or None, optional
+        Half-width of the centered plot crop and, when ``crop=True``, of the
+        returned array crop. Required if ``crop=True``.
+    crop : bool, optional
+        Crop the returned array around its center after simulation.
+    resize_dim : tuple or None, optional
+        Currently unused; this function does not resize its output.
+    gpts : int, optional
+        Grid points passed to :func:`simulate_diff`.
+    energy : float, optional
+        Electron energy in eV.
+    semiangle_cutoff : float, optional
+        Probe convergence semiangle in mrad.
+    sampling_potential, slice_thickness, sampling_probe : float, optional
+        Simulation sampling and slice parameters in angstroms.
+    device : str, optional
+        Computation device passed to :func:`simulate_diff`.
+    max_angle : float or None, optional
+        Maximum scattering angle passed to :func:`simulate_diff`.
+    max_frequency : None, optional
+        Unsupported. Passing a value raises ``ValueError``; use
+        ``max_angle`` to constrain the simulated angular range.
+    rotZ : float or None, optional
+        In-plane model rotation in degrees; ``None`` means no rotation.
+    log01 : bool, optional
+        Display the logarithm of intensity when plotting.
+    cmap : str, optional
+        Matplotlib colormap for the plot.
+    title : str, optional
+        Plot title.
+
+    Returns
+    -------
+    numpy.ndarray
+        Simulated diffraction intensity array, transposed relative to the
+        abTEM measurement. It is cropped only when ``crop=True``.
+    """
+
+    if max_frequency is not None:
+        raise ValueError("max_frequency is not supported; use max_angle instead.")
+    if crop and r is None:
+        raise ValueError("r must be provided when crop=True.")
+
+    cbed_pattern = simulate_diff(atom_model,
                                  theta_tilt=theta_tilt, phi_rot=phi_rot, 
                                  energy=energy, semiangle_cutoff=semiangle_cutoff, 
                                  sampling_potential=sampling_potential,slice_thickness=slice_thickness,
                                  sampling_probe=sampling_probe,gpts=gpts,device=device,
-                                 max_angle=max_angle, max_frequency=max_frequency,rotZ=rotZ)
+                                 max_angle=max_angle, rotZ=0 if rotZ is None else rotZ)
     
     # ky, kx = cbed_pattern.array.shape
     # (cbed_pattern**0.15).show()
@@ -517,100 +589,7 @@ def make_mask(center, r, mask_dim=(128,128)):
 
     return mask
 
-def extract_spot_features(dp, min_sigma=0.85, 
-                          max_sigma=2.5, 
-                          num_sigma=100, 
-                          threshold=85,
-                          bg_frac=0.99,
-                          mask_radial_frac=0.9,
-                          min_distance_factor=0.8,
-                          max_distance_factor=1.5,
-                          search_radius_factor=2.5, # When refining centers of mass
-                          iterations=5,
-                          n_estimators = 60, learning_rate = 0.1, max_depth = 50, # Predictor model parameters
-                          radii_multiplier=1.5, radii_slope=1.38,
-                          vmin=5,vmax=16, get_bg = True,
-                          plotAxes=False,plotInput=False,plotCenters=True,plotBg=False,plotResult=True,):
-    
-    A, B = dp.shape
-    # mask = make_mask((A//2,B//2), r=(A+B)//4*mask_radial_frac, mask_dim=(A,B)) # Define region where spots are to be found
-    
-    # Extract centers and radii automatically
-    # blobs_log = feature.blob_log(dp*mask, min_sigma=min_sigma, 
-    blobs_log = feature.blob_log(dp, min_sigma=min_sigma, 
-                                 max_sigma=max_sigma, 
-                                 num_sigma=num_sigma, 
-                                 threshold=threshold,overlap=0)
-    # Unpack values
-    r_vals = blobs_log[:,2]
-    blobs_array = np.array(blobs_log[:, :2])
-    
-    # Calculate pairwise distances between blobs. The result is a square matrix.
-    distances = cdist(blobs_array, blobs_array)
-    
-    # Set diagonal to np.inf to ignore self-comparison.
-    np.fill_diagonal(distances, np.inf)
-    # Find the distance to the nearest neighbor for each blob.
-    nearest_neighbor_dist = distances.min(axis=1)
-
-    # Define your distance thresholds.
-    min_threshold = np.mean(np.min(distances,axis=0))*min_distance_factor  # Minimum acceptable distance to the nearest neighbor.
-    max_threshold = np.mean(np.min(distances,axis=0))*max_distance_factor  # Maximum acceptable distance to the nearest neighbor.
-
-    # Filter blobs. Keep a blob if its nearest neighbor is neither too close nor too far.
-    filtered_indices = np.where((nearest_neighbor_dist >= min_threshold) 
-                                & (nearest_neighbor_dist <= max_threshold)
-                                & (((blobs_array[:,0]-A//2)**2+(blobs_array[:,1]-B//2)**2)**.5 <= (A+B)//4*mask_radial_frac*(8/9)))[0]
-
-    # Apply filter
-    blobs_log = np.zeros((len(filtered_indices), 3))
-    blobs_log[:, :2] = blobs_array[filtered_indices]
-    blobs_log[:, 2] = r_vals[filtered_indices]
-    
-        
-    # Refine peak centers using CoM
-    peak_centers = getCenters(dp,r=blobs_log[:,2]*search_radius_factor,
-                              coords=blobs_log[:,:2], iterations=iterations)
-    
-    if plotCenters:
-    
-        plt.figure(figsize=(10, 10))
-        plt.imshow(np.log(dp), cmap='turbo',vmin=vmin,vmax=vmax)
-        plt.axis('off')
-    
-        # Circle around each blob
-        for idx, blob in enumerate(blobs_log):
-            y, x, r = blob
-            y , x = peak_centers[idx]
-            c = plt.Circle((x, y), r, color='red', linewidth=2, fill=False)
-            plt.gca().add_patch(c)
-    
-        plt.show()
-    
-    distance_to_center = np.linalg.norm(peak_centers-(A+B)//4,axis=1)
-    radii = blobs_log[:,2]*radii_multiplier + radii_slope*(1 - distance_to_center/np.max(distance_to_center))
-    
-    if get_bg:
-        # Masks sizes are based on computed radius of spot and distance to center (center spots with greater radius than far spots)
-        dp_bg = predict_values(dp,centers=peak_centers,radius=radii,
-                               n_estimators=n_estimators,learning_rate=learning_rate, max_depth=max_depth)
-
-    if plotInput:
-        plotDP(dp, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
-    
-    if plotBg and get_bg:
-        plotDP(dp_bg, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
-
-    if plotResult:
-        plotDP(rem_negs(dp-bg_frac*dp_bg), vmin=vmin,vmax=vmax,plotAxes=plotAxes,
-               title=f'ne={n_estimators},learning_rate={learning_rate}, max_depth={max_depth}')
-    
-    if get_bg:
-        return peak_centers, radii, dp_bg
-    else:
-        return peak_centers, radii
-
-def getCenters(dp_data, spots_order=None, r=6, coords=None, num_spots_per_order=6, 
+def getCenters(dp_data, spots_order=None, r=6, coords=None, num_spots_per_order=6,
                plotSpots=False, iterations=1):
     """
     Generate an array spot centers for any DP
@@ -697,6 +676,20 @@ def getSpotCenter(ky, kx, r, diff_data, plotSpot=False, iterations=1):
     return ky_CoM, kx_CoM
 
 def circular_mask(center_y, center_x, radius):
+    """Return a Boolean disk mask on a ``2*radius`` square grid.
+
+    Parameters
+    ----------
+    center_y, center_x : int
+        Disk center in the generated mask's row and column coordinates.
+    radius : int
+        Disk radius in pixels; the grid extends from zero to twice this size.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        Pixels at distance at most ``radius`` from the specified center.
+    """
     y, x = np.ogrid[-center_y:radius*2-center_y, -center_x:radius*2-center_x]
     mask = x**2 + y**2 <= radius**2
     return mask

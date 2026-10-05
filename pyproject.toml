@@ -55,6 +55,7 @@ docs-test = [
 py-modules = [
   "fourdenoise",
   "fourdenoise_geometry",
+  "fourdenoise_metadata",
   "fourdenoise_rq",
   "abTEM_helpers",
   "rippleModel",

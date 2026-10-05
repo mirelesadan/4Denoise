@@ -68,6 +68,91 @@ class StrainResultTests(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertIs(result[0], result.exx)
 
+    def test_normal_components_follow_yx_peaks_without_transposing_the_scan(self):
+        measured = self.measured.copy()
+        measured[0, 1, :, 1] *= 1.02  # Reciprocal x expansion at one scan pixel.
+        measured[1, 0, :, 0] *= 1.03  # Reciprocal y expansion at another pixel.
+        result = self.data.get_strains(
+            centers=measured, ref_centers=self.reference, center=(0, 0),
+            match_peaks='ordered',
+        )
+        np.testing.assert_allclose(result.exx, [[0, -0.02], [0, 0]], atol=1e-12)
+        np.testing.assert_allclose(result.eyy, [[0, 0], [-0.03, 0]], atol=1e-12)
+        np.testing.assert_allclose(result.exy, 0, atol=1e-12)
+        np.testing.assert_allclose(result.erot, 0, atol=1e-12)
+        np.testing.assert_array_equal(result.as_real_space('exx').array, result.exx)
+        self.assertEqual(result.basis_angle_deg, 0)
+
+    def test_basis_rotation_matches_tensor_rotation_and_preserves_the_fit(self):
+        transform = np.array([[1.01, 0.015], [0.015, 0.98]])
+        measured = self.measured @ transform.T
+        options = dict(
+            centers=measured, ref_centers=self.reference, center=(0, 0),
+            match_peaks='ordered', return_transform=True,
+        )
+        original = self.data.get_strains(**options)
+        for angle in (30, 90, 135):
+            with self.subTest(angle=angle):
+                rotated = self.data.get_strains(**options, ang=angle)
+                expected = fd.rotate_strain(
+                    original.exx, original.eyy, original.exy, np.radians(angle),
+                )
+                for name, values in zip(('exx', 'eyy', 'exy'), expected):
+                    np.testing.assert_allclose(getattr(rotated, name), values, atol=1e-12)
+                np.testing.assert_allclose(rotated.erot, original.erot, atol=1e-12)
+                np.testing.assert_array_equal(rotated.fit_rmse, original.fit_rmse)
+                np.testing.assert_array_equal(rotated.valid_mask, original.valid_mask)
+                np.testing.assert_array_equal(
+                    rotated.diagnostics['transforms'], original.diagnostics['transforms'],
+                )
+                self.assertEqual(rotated.basis_angle_deg, angle)
+                if angle == 90:
+                    np.testing.assert_allclose(rotated.exx, original.eyy, atol=1e-12)
+                    np.testing.assert_allclose(rotated.eyy, original.exx, atol=1e-12)
+                    np.testing.assert_allclose(rotated.exy, -original.exy, atol=1e-12)
+
+    def test_detect_refine_and_fit_preserves_yx_on_rectangular_patterns(self):
+        origin = np.array([20, 30])
+        reference = np.array([[10, 15], [10, 45], [30, 15], [30, 45]])
+        positions = np.broadcast_to(reference, (2, 3, 4, 2)).copy()
+        positions[0, 2, :, 1] = [14, 46, 14, 46]  # Only kx expands.
+        positions[1, 0, :, 0] = [9, 9, 31, 31]  # Only ky expands.
+        yy, xx = np.ogrid[:41, :61]
+        patterns = np.zeros((2, 3, 41, 61))
+        for scan_index in np.ndindex(2, 3):
+            for (y, x), amplitude in zip(positions[scan_index], (20, 50, 40, 30)):
+                disk = (yy - y) ** 2 + (xx - x) ** 2 <= 1
+                patterns[scan_index][disk] = amplitude
+        data = fd.HyperData(patterns)
+        detected = data.get_dp(0, 0).get_peaks(
+            radius=1, min_distance=5, threshold_abs=1,
+        )
+        self.assertEqual(set(map(tuple, detected)), set(map(tuple, reference)))
+        refined = data.get_centers(r=3, ref_coords=detected, method='CoM')
+        order = [np.flatnonzero(np.all(reference == point, axis=1))[0]
+                 for point in detected]
+        np.testing.assert_allclose(refined, positions[:, :, order, :], atol=1e-12)
+
+        expected_x = np.zeros((2, 3))
+        expected_y = np.zeros((2, 3))
+        expected_x[0, 2] = 1 - 16 / 15
+        expected_y[1, 0] = 1 - 11 / 10
+        for stacked in (False, True):
+            with self.subTest(stacked=stacked):
+                source = fd.HyperData(patterns.reshape(6, 41, 61)) if stacked else data
+                centers = refined.reshape(6, 4, 2) if stacked else refined
+                result = source.get_strains(
+                    centers=centers, ref_centers=detected, center=origin,
+                )
+                self.assertTrue(result.valid_mask.all())
+                self.assertEqual(result.exx.shape, (6,) if stacked else (2, 3))
+                np.testing.assert_allclose(result.exx.reshape(2, 3), expected_x, atol=1e-12)
+                np.testing.assert_allclose(result.eyy.reshape(2, 3), expected_y, atol=1e-12)
+                np.testing.assert_allclose(result.exy, 0, atol=1e-12)
+                np.testing.assert_allclose(result.erot, 0, atol=1e-12)
+                if not stacked:
+                    np.testing.assert_array_equal(result.as_real_space('exx').array, result.exx)
+
     def test_final_weighted_residual_matches_reported_error(self):
         measured = self.measured.copy()
         measured[0, 0, 0] += [0.35, -0.2]

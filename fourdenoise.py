@@ -107,6 +107,12 @@ from tensorly.decomposition import symmetric_parafac_power_iteration as sym_para
 
 from pathlib import Path
 from typing import Union, Sequence, Tuple
+from fourdenoise_metadata import (
+    _acquisition_summary,
+    _copy_acquisition_metadata,
+    _load_acquisition_metadata,
+    _validate_acquisition_shape,
+)
 from fourdenoise_rq import (
     RQCalibration,
     RQComparison,
@@ -802,6 +808,7 @@ class _HDF5ChunkReader:
                 polar_metadata=self._metadata.get('polar_metadata'),
                 center_beam_metadata=self._metadata.get('center_beam_metadata'),
                 rq_calibration=self._metadata.get('rq_calibration'),
+                acquisition_metadata=self._metadata.get('acquisition_metadata'),
             )
     
 #%%
@@ -5408,6 +5415,12 @@ class StrainResult:
     source 4D scan. ``as_real_space`` is available for 2D maps. The result can
     also be indexed or unpacked like the historical four-array return; when
     ``return_transform=True``, the diagnostics dictionary is item five.
+
+    Map positions and tensor directions are distinct. At ``basis_angle_deg=0``,
+    ``exx`` follows the second peak coordinate (kx), and ``eyy`` the first (ky).
+    They are not automatically aligned with the real-space scan axes. The
+    requested ``get_strains(ang=...)`` changes the tensor basis, not the scan
+    layout; copying scan calibration to a map does not rotate its components.
     """
 
     exx: np.ndarray
@@ -5445,6 +5458,7 @@ class StrainResult:
 
         ``component`` may be a strain component, ``fit_rmse``,
         ``relative_fit_rmse``, a peak-count map, or ``valid_mask``.
+        This changes neither the scan layout nor the strain tensor basis.
         """
         quantities = {
             'exx': ('Strain exx', None),
@@ -5532,7 +5546,9 @@ class HyperData:
                  raw_trim_meta=None,
                  raw_trim_dims=(128, 128),
                  mat_variable=None,
-                 rq_calibration=None):
+                 rq_calibration=None,
+                 metadata_path='auto',
+                 acquisition_metadata=None):
         """Wrap an array or load a dataset with optional axis reversal.
 
         ``flip_axis`` accepts one axis or a sequence of axes to reverse. For
@@ -5561,8 +5577,36 @@ class HyperData:
         ``rq_calibration`` is an optional :class:`RQCalibration` or saved
         calibration dictionary describing real-to-detector orientation.
         Saved files restore it automatically; axis flips update its frame.
+
+        ``metadata_path='auto'`` discovers recognized EMPAD XML sidecars in
+        the same directory as a raw file. The XML must name that raw file;
+        multiple matches raise an error rather than choosing silently. Pass
+        an explicit XML path to select a sidecar, or None to disable external
+        discovery. Explicit paths are relative to the working directory.
+        Imported scan dimensions must match the loaded array (or the pattern
+        count for a 3D stack); sidecars do not change raw layout or trimming.
+        Malformed sidecars warn and are skipped in auto mode; explicit ones
+        raise errors. Auto discovery does not search for XML beside NumPy or
+        generic HDF5 files. Saved HyperData files restore embedded metadata
+        even with ``metadata_path=None`` and do not rediscover sidecars.
+
+        ``acquisition_metadata`` optionally supplies a descriptive dictionary
+        for an array or overrides saved/imported acquisition information.
+        It cannot be combined with an explicit ``metadata_path``. The record
+        is deep-copied and describes the original acquisition, not the current
+        cropped/resized geometry. It never sets pixel calibration or
+        ``rq_calibration``; explicit user calibrations remain authoritative.
         """
         loaded_metadata = {}
+        imported_acquisition = {}
+        data_path = None
+        if metadata_path is not None and not isinstance(metadata_path, (str, Path)):
+            raise TypeError("metadata_path must be 'auto', a file path, or None.")
+        if acquisition_metadata is not None:
+            if not isinstance(acquisition_metadata, dict):
+                raise TypeError('acquisition_metadata must be a dictionary or None.')
+            if metadata_path not in ('auto', None):
+                raise ValueError('Use acquisition_metadata or an explicit metadata_path, not both.')
 
         # Read dataset from file path if input object is string/path-like.
         if isinstance(data, (str, Path)):
@@ -5581,6 +5625,8 @@ class HyperData:
                     "valid 4Denoise HyperData save file."
                 )
             else:
+                if acquisition_metadata is None:
+                    imported_acquisition = _load_acquisition_metadata(data_path, metadata_path)
                 data = read_4D(
                     str(data_path),
                     hdf5_dataset=hdf5_dataset,
@@ -5595,6 +5641,15 @@ class HyperData:
                 )
         elif mat_variable is not None:
             raise ValueError("mat_variable applies only to .mat files.")
+
+        if not imported_acquisition and metadata_path not in ('auto', None):
+            imported_acquisition = _load_acquisition_metadata(data_path, metadata_path)
+        if imported_acquisition:
+            _validate_acquisition_shape(imported_acquisition, data.shape)
+        if acquisition_metadata is None:
+            acquisition_metadata = (
+                imported_acquisition or loaded_metadata.get('acquisition_metadata')
+            )
 
         if (
             real_units is None
@@ -5652,6 +5707,7 @@ class HyperData:
                 )
 
         self.array = data
+        self.acquisition_metadata = acquisition_metadata
         self.real_units = None
         self.real_conv_factor = None
         self.real_origin = _normalize_real_origin(real_origin)
@@ -5692,6 +5748,36 @@ class HyperData:
             self.set_real_scale(real_units, real_conv_factor)
         if reciprocal_units is not None or reciprocal_conv_factor is not None:
             self.set_reciprocal_scale(reciprocal_units, reciprocal_conv_factor)
+
+    @property
+    def acquisition_metadata(self):
+        """Descriptive original-acquisition record; never an inferred calibration."""
+        return self._acquisition_metadata
+
+    @acquisition_metadata.setter
+    def acquisition_metadata(self, value):
+        self._acquisition_metadata = _copy_acquisition_metadata(value)
+
+    def metadata_summary(self):
+        """Return a readable acquisition and current-calibration summary.
+
+        Use ``print(data.metadata_summary())`` in a notebook. Missing fields
+        remain unknown. The original acquisition scan shape and instrument
+        settings are reported separately from the current data shape and
+        user/verified calibration; no rotation or scale is inferred here.
+        Original XML values and conversion provenance are available through
+        ``acquisition_metadata['raw_metadata']`` and ``['field_sources']``.
+        """
+        lines = [f'Current data shape: {self.shape}']
+        lines.extend(_acquisition_summary(self.acquisition_metadata))
+        for label, factor, units in (
+            ('real-space', self.real_conv_factor, self.real_units),
+            ('reciprocal-space', self.reciprocal_conv_factor, self.reciprocal_units),
+        ):
+            calibration = 'not set' if factor is None else f'{factor!r} {units!r} per pixel'
+            lines.append(f'Current {label} calibration: {calibration}')
+        lines.append(f'Current R/Q calibration: {self.rq_calibration!r}')
+        return '\n'.join(lines)
 
     @property
     def array(self):
@@ -6047,6 +6133,7 @@ class HyperData:
                         'reciprocal_units', 'reciprocal_conv_factor',
                         'polar_metadata', 'center_beam_metadata',
                         'rq_calibration',
+                        'acquisition_metadata',
                     ):
                         if key in group:
                             metadata[key] = _read_hdf5_value(group, key)
@@ -6159,6 +6246,7 @@ class HyperData:
                                     'reciprocal_conv_factor': polar_block.reciprocal_conv_factor,
                                     'polar_metadata': polar_block.polar_metadata,
                                     'unfold_metadata': None,
+                                    'acquisition_metadata': polar_block.acquisition_metadata,
                                     'center_beam_metadata': None,
                                     'rq_calibration': (
                                         polar_block.rq_calibration.to_dict()
@@ -6252,6 +6340,7 @@ class HyperData:
             raise ValueError("compression must be a string or None.")
 
         metadata = {
+            'acquisition_metadata': self.acquisition_metadata,
             'real_units': self.real_units,
             'real_conv_factor': self.real_conv_factor,
             'real_origin': self.real_origin,
@@ -6360,6 +6449,7 @@ class HyperData:
             ),
             real_origin=real_origin,
             rq_calibration=rq_calibration,
+            acquisition_metadata=self.acquisition_metadata,
         )
         if preserve_unfold and result.shape == self.shape:
             result.unfold_metadata = _clone_unfold_metadata(
@@ -9371,7 +9461,9 @@ class HyperData:
             for j in range(B):
                 corrected_data[i, j] = self._apply_affine_transformation(self.array[i, j], *params, interp_method)
         
-        corrected_data = HyperData(corrected_data)
+        corrected_data = HyperData(
+            corrected_data, acquisition_metadata=self.acquisition_metadata,
+        )
         
         mean_pattern = corrected_data.get_dp('mean').array
         params = corrected_data._extract_ellipse(mean_pattern, C//2, D//2, r, R)
@@ -11308,18 +11400,34 @@ class HyperData:
         measured peaks are paired by a one-to-one, centroid-aligned spatial
         assignment before fitting.
 
+        Peak coordinates and fitted matrices use ``(ky, kx)`` order, with no
+        implicit coordinate swap. At ``ang=0``, the polar stretch matrix
+        ``U`` gives ``eyy = 1 - U[0, 0]`` and ``exx = 1 - U[1, 1]``.
+        Map indices retain the input scan order ``(Ry, Rx)``. The named
+        result components (and tuple unpacking order) remain ``exx, eyy,
+        exy, erot``; their ordering does not change the coordinate convention.
+
         Parameters
         ----------
         centers : ndarray or nested list, optional
             Measured peak centers. Common fixed-size shape is
-            ``(Ry, Rx, n_peaks, 2)``. Nested lists may be used when each
+            ``(Ry, Rx, n_peaks, 2)``, with each coordinate in ``(ky, kx)``
+            order. Nested lists may be used when each
             diffraction pattern has a different number of peaks.
         ref_centers : ndarray or nested list, optional
             Reference peak centers. Supported forms are a global
             ``(n_ref_peaks, 2)`` array or a local reference with the same scan
             layout as ``centers``.
         ang : float, optional
-            In-plane angle in degrees used to rotate the strain basis.
+            In-plane angle in degrees used to rotate the reporting basis of
+            the fitted strain tensor, not the scan image. At the default 0,
+            ``exx`` follows kx and ``eyy`` follows ky; these directions need
+            not coincide with the real-space scan axes. A 90-degree basis
+            rotation exchanges ``exx`` and ``eyy`` and reverses ``exy`` without
+            moving scan pixels or changing the fitted local rotation.
+            Determine this angle from the acquisition's coordinate frames;
+            it is not inferred from the strain map. Stored ``rq_calibration``
+            is not automatically applied by this method.
         g_vector : optional
             Retained for compatibility with older calls. The least-squares
             implementation uses all matched peaks rather than selecting a
@@ -12309,6 +12417,7 @@ class HyperData:
 
                 rejected_mask = ~peak_keep
                 rejected_count = int(np.count_nonzero(rejected_mask))
+                # Fitted matrix axes follow peak-coordinate order: (ky, kx).
                 eyy[out_idx] = 1 - U[0, 0]
                 exx[out_idx] = 1 - U[1, 1]
                 exy[out_idx] = U[1, 0]

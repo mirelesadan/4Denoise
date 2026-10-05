@@ -13,6 +13,8 @@ before using a method on a new dataset.
 Loading and metadata
 --------------------
 
+.. automethod:: fourdenoise.HyperData.metadata_summary
+
 .. automethod:: fourdenoise.HyperData.open_hdf5
 
 .. automethod:: fourdenoise.HyperData.to_polar_hdf5
