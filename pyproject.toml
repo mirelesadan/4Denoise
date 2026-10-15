@@ -57,6 +57,8 @@ py-modules = [
   "fourdenoise_geometry",
   "fourdenoise_metadata",
   "fourdenoise_rq",
+  "fourdenoise_reductions",
+  "fourdenoise_resampling",
   "abTEM_helpers",
   "rippleModel",
   "kin_diff_sim"

@@ -29,6 +29,41 @@ the stored data. For an actual transformed array, use
 `HyperData.to_polar(...)`; the returned object's metadata records the polar
 geometry, and `to_cartesian(...)` remaps it back by interpolation.
 
+## Aggregate Diffraction Patterns Without a Large Selected Copy
+
+Mean, population standard deviation (`ddof=0`), minimum and maximum are
+calculated over bounded scan blocks. A Boolean `mask` of shape `(Ry, Rx)`
+selects which patterns contribute, without gathering the complete selected
+stack first. The returned `ReciprocalSpace` object retains detector calibration
+and polar/cepstral geometry. For example, if `clusters` is a scan-shaped label map:
+
+```python
+mean_dp = data.get_dp(mask=clusters == 0, operation="mean", working_memory_mb=64)
+mean_dp.show()
+std_dp = data.get_dp(operation="std", working_memory_mb=64)
+```
+
+The same reductions support half-open scan regions with `y=(start, stop)`
+and `x=(start, stop)`, or the entire scan when no selection is supplied.
+Use `selection_units="calibrated"` for physical scan limits. A mask takes
+precedence over y/x, and empty or non-Boolean masks raise errors.
+
+`working_memory_mb=None` automatically uses 256 MiB (one MiB is `1024**2`
+bytes). This budget accounts conservatively for explicit processing arrays,
+including dtype conversion and statistic buffers; it does not cap total RAM
+or include the resident source, caller's mask, allocator overhead or file
+caches. A budget too small for one pattern and its buffers raises an error
+showing the minimum required size. Integer means/stds return floating-point
+arrays; floating input retains its output dtype, with accumulation using at
+least float64 precision. No NaN filtering or intensity clipping is implicit.
+
+`operation="median"` remains exact and may allocate a large selected array.
+It is not bounded-memory; explicit `working_memory_mb` is rejected for median
+and random selection. Two scalar scan indices return one pattern directly
+without reduction buffers. The heuristic flat-field operation and its
+`percentile`/`show_mask` options have been removed; select a scientifically
+justified scan mask explicitly instead.
+
 ## Virtual Detectors
 
 Choose exactly one detector specification: an annulus, one or more disks,

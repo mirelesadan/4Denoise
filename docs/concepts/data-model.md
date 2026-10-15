@@ -19,9 +19,14 @@ scan-axis steps, and `real_origin` locates scan pixel `(0, 0)`.
 
 Scan axes and detector axes are not necessarily physically aligned. A strain
 map's `(Ry, Rx)` layout locates the measurement, while `exx` and `eyy` describe
-directions in the fitted tensor basis. With `get_strains(ang=0)`, these follow
-detector kx and ky. Converting the result to `RealSpace` does not rotate its
-tensor components; supply an appropriate acquisition-specific basis angle.
+directions in the fitted tensor basis. The default
+`get_strains(output_frame="reciprocal", ang=0)` reports detector kx and ky.
+Use `output_frame="real"` to report Cartesian real-space components using
+stored `rq_calibration`, including its rotation and optional reflection.
+The result records its output frame and the calibration used. Converting
+the result to `RealSpace` displays those components at the original scan
+positions without applying another tensor rotation. A recorded acquisition
+scan rotation does not automatically establish R/Q calibration.
 See [peaks and strain](../guides/peaks-and-strain.md) for this distinction.
 
 Value-only methods generally return a new object rather than altering the

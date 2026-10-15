@@ -13,6 +13,7 @@ was executed in a clean kernel with the current package.
 - [Visualization](guides/visualization.md): diffraction patterns, virtual detectors, and calibrated axes.
 - [Denoising and unfolding](guides/denoising-and-unfolding.md): what happens to excluded data during a traversal.
 - [Peaks and strain](guides/peaks-and-strain.md): interpreting strain maps and fit quality.
+- [Braggness](guides/braggness.md): concentrated sharp diffraction contrast and validity masks.
 
 The [API reference](reference/hyperdata.rst) lists selected public entry points
 and draws their signatures and descriptions from the source docstrings.
@@ -44,6 +45,7 @@ guides/io-and-calibration
 guides/visualization
 guides/denoising-and-unfolding
 guides/peaks-and-strain
+guides/braggness
 ```
 
 ```{toctree}

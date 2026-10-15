@@ -48,6 +48,9 @@ Diffraction patterns
 Analysis results
 ----------------
 
+.. autoclass:: fourdenoise.BraggnessResult
+   :members: as_real_space
+
 .. autoclass:: fourdenoise.RQCalibration
    :members: matrix, inverse_matrix, transform_vectors, to_dict, from_matrix
 

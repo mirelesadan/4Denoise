@@ -101,6 +101,10 @@ HDF5 files too large to load at once, read bounded scan blocks:
 ```python
 with HyperData.open_hdf5("experiment.h5") as source:
     pattern = source.get_dp(0, 0)  # 4D scan position
+    mean_pattern = source.get_dp(operation="mean", working_memory_mb=64)
+    regional_std = source.get_dp(
+        y=(10, 30), x=(20, 50), operation="std", working_memory_mb=64,
+    )
     for scan_slices, block in source.iter_chunks((16, 16)):
         print(scan_slices, block.shape)
 ```
@@ -108,6 +112,63 @@ with HyperData.open_hdf5("experiment.h5") as source:
 Each block is an in-memory `HyperData`; operations on one block do not
 automatically process the rest of the source. A 3D stack uses one pattern
 index and a scalar chunk size.
+
+The reader's `get_dp()` also supports Boolean scan masks, calibrated scan
+limits, and mean/std/min/max reductions using the same bounded reducer as
+in-memory `HyperData`. Returned patterns retain saved detector calibration
+and geometry and remain usable after the reader closes. Exact median is
+explicitly rejected on this bounded reader; select/load data into `HyperData`
+when an exact, potentially memory-intensive median is required.
+
+## Memory-Budgeted Resizing
+
+`HyperData.resize()` and `RealSpace.resize()` use one tiled numerical engine:
+
+```python
+resized = data.resize(
+    (64, 64), domain="real", method="area", working_memory_mb=64,
+)
+```
+
+`area` averages overlapping pixel/scan bins, including fractional weights for
+non-integer reductions. It preserves constant intensity, not total summed
+counts. `linear` and `nearest` also support upsampling. Bins and interpolation
+halos are defined in global coordinates, so changing the block size does not
+introduce seams or change which neighboring diffraction patterns contribute.
+
+Floating/complex outputs retain their dtype; averaging and linear interpolation
+of integer/Boolean data produce float64. Accumulators use at least float64
+precision. Nearest sampling and completely unchanged resizes retain the exact
+source dtype/values, including large integers. Results own independent storage.
+
+The default `working_memory_mb=None` uses a 256 MiB **temporary-array** budget.
+Resident source and complete returned output arrays, allocator overhead, and
+HDF5 caches are excluded. A budget cannot make a multi-GB output fit in RAM;
+use the disk-output path instead. Too-small budgets raise an informative error
+before allocating the complete output.
+
+```python
+saved_path = HyperData.resize_hdf5(
+    "experiment.h5", "resized.4denoise", (64, 64), domain="real",
+    method="area", working_memory_mb=64, progress=True,
+)
+with HyperData.open_hdf5(saved_path) as resized_source:
+    mean_pattern = resized_source.get_dp(working_memory_mb=64)
+```
+
+The source and output stay on disk; output tiles are written directly to HDF5.
+For a generic input with several arrays, specify `hdf5_dataset="/entry/data"`.
+Saved HyperData inputs retain their calibration and acquisition/R-Q records;
+generic inputs are not assumed to have calibration. Real-space spacing and
+origin, beam/cepstral geometry, and polar radial/angular sampling receive the
+same updates as in-memory resizing. Polar interpolation remains periodic for
+full-circle data. Unfolding undo metadata is not attached to resized outputs.
+
+Writes are atomic by default: failure leaves an existing destination intact
+and removes the temporary file. Replacement requires `overwrite=True`; source
+and destination must be different files. The return value is a path, not a
+fully loaded `HyperData`. `HyperData(saved_path)` deliberately loads the whole
+result into RAM. Atomic overwrites need space for both old and new outputs.
 
 ## Save and Reopen
 

@@ -19,6 +19,8 @@ Loading and metadata
 
 .. automethod:: fourdenoise.HyperData.to_polar_hdf5
 
+.. automethod:: fourdenoise.HyperData.resize_hdf5
+
 .. automethod:: fourdenoise.HyperData.save
 
 .. automethod:: fourdenoise.HyperData.copy
@@ -65,6 +67,8 @@ Preprocessing and denoising
 
 Peak and strain analysis
 ------------------------
+
+.. automethod:: fourdenoise.HyperData.get_braggness
 
 .. automethod:: fourdenoise.HyperData.get_peaks
 
