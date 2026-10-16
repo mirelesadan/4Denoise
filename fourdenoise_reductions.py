@@ -186,15 +186,8 @@ def _diffraction_reduction_plan(shape, dtype, operation, working_memory_mb=None)
     }
 
 
-def _iter_diffraction_blocks(source, max_patterns, mask=None):
-    """Yield (block, selected_count), never gathering the full selected stack.
-
-    Basic rectangular slices work even for non-contiguous arrays. An optional
-    Boolean selection copies at most the current block. Empty masked blocks
-    are skipped before reading the source, which matters for disk-backed data.
-    ``mask`` must already be validated with :func:`_validate_scan_mask`.
-    """
-    shape = _diffraction_shape(source)
+def _scan_block_slices(shape, max_patterns):
+    """Yield rectangular basic scan slices with at most max_patterns entries."""
     if isinstance(max_patterns, (bool, np.bool_)) or not isinstance(max_patterns, (int, np.integer)) or max_patterns < 1:
         raise ValueError('max_patterns must be a positive integer.')
     scan_shape = shape[:-2]
@@ -205,10 +198,22 @@ def _iter_diffraction_blocks(source, max_patterns, mask=None):
         lengths = (min(scan_shape[0], max_patterns // width), width)
     grid = tuple((size + length - 1) // length for size, length in zip(scan_shape, lengths))
     for index in np.ndindex(*grid):
-        slices = tuple(
+        yield tuple(
             slice(i * length, min((i + 1) * length, size))
             for i, length, size in zip(index, lengths, scan_shape)
         )
+
+
+def _iter_diffraction_blocks(source, max_patterns, mask=None):
+    """Yield (block, selected_count), never gathering the full selected stack.
+
+    Basic rectangular slices work even for non-contiguous arrays. An optional
+    Boolean selection copies at most the current block. Empty masked blocks
+    are skipped before reading the source, which matters for disk-backed data.
+    ``mask`` must already be validated with :func:`_validate_scan_mask`.
+    """
+    shape = _diffraction_shape(source)
+    for slices in _scan_block_slices(shape, max_patterns):
         block_count = int(np.prod([s.stop - s.start for s in slices]))
         local_mask = None if mask is None else mask[slices]
         count = block_count if local_mask is None else int(np.count_nonzero(local_mask))

@@ -33,6 +33,7 @@ MODULE_NAMES = (
     "fourdenoise_plotting",
     "fourdenoise_io",
     "fourdenoise_sources",
+    "fourdenoise_detectors",
     "fourdenoise_rosetta",
     "abTEM_helpers",
     "rippleModel",

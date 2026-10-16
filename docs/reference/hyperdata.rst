@@ -38,6 +38,8 @@ Disk-backed source
 
 .. automethod:: fourdenoise.DiffractionSource.get_dp
 
+.. automethod:: fourdenoise.DiffractionSource.virtual_image
+
 .. automethod:: fourdenoise.DiffractionSource.iter_chunks
 
 .. automethod:: fourdenoise.DiffractionSource.load

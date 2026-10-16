@@ -164,6 +164,47 @@ calibration overrides are rejected for saved polar/cepstral data, because
 those transformed axes have their own coordinate records; omit the overrides
 to preserve the saved coordinate system.
 
+### Streamed Virtual Images
+
+Integrate a detector over a complete 4D scan while keeping the diffraction
+patterns on disk. This works for native NumPy/HDF5 sources and the optional
+RosettaSciIO backend:
+
+```python
+with HyperData.open("processed.4denoise") as source:
+    image = source.virtual_image(
+        annulus=(10, 35), detector_units="pixels",
+        working_memory_mb=64, show=False,
+    )
+
+# The returned RealSpace owns its scan-sized array and keeps scan calibration.
+image.show(axis_units="auto")
+```
+
+The inputs and display options match `HyperData.virtual_image()`. Choose one
+of an annulus, a disk (or union of disks) using `radius` and `centers`, or a
+Boolean/signed/fractional detector `mask`. `detector_units="auto"` uses saved
+reciprocal calibration when available; specify `"pixels"` for pixel radii and
+positions. `axis_units` chooses real-space image units; `units` chooses the
+optional mean-detector preview units. Polar data accepts radial annuli and
+wrapped angular `theta_range`, but not Cartesian disks.
+
+The detector is built once, then basic scan blocks are integrated in a single
+pass. Both eager and streamed methods use at least float64 products/sums,
+without a full-size weighted tensor. `plot_mask=True` or
+`return_detector=True` accumulates the mean diffraction pattern in that same
+pass; otherwise no mean is computed. The latter returns
+`(image, masked_mean_detector)`; polar detectors retain their coordinate record.
+Overlapping disks count each pixel once, weights are not normalized, and
+NaN/Inf propagate like ordinary NumPy multiplication/sums.
+Complex amplitudes are rejected; supply real-valued intensities.
+
+`working_memory_mb` bounds numerical input/work buffers (default 256 MiB).
+Rosetta sources also reserve one declared reader chunk. The compact returned
+scan image, detector construction, metadata, caches and visualization are
+outside that budget. An insufficient budget raises before pixel reads. A
+3D stack is rejected: folding it into a 2D scan requires an explicit scan shape.
+
 ### Explicit Full Loading
 
 ```python
@@ -190,7 +231,7 @@ also does not prevent the OS from caching pages while data is processed.
 
 Disk-backed **loading** is not lazy execution of every analysis method. A
 source has no public `array` and rejects implicit NumPy conversion; use
-`get_dp`, `iter_chunks`, or explicit `load`. Global tensor decompositions still
+`get_dp`, `virtual_image`, `iter_chunks`, or explicit `load`. Global tensor decompositions still
 require a full in-memory input, not independent chunk-by-chunk fitting.
 
 ## RosettaSciIO Microscopy Formats

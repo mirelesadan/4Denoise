@@ -216,6 +216,7 @@ from fourdenoise_resampling import _normalize_resize_shape, _resize_array, _resi
 from fourdenoise_strain import _StrainFitEngine, _match_peak_candidates, _validate_matching_parameters
 from fourdenoise_streaming import _stream_transform
 from fourdenoise_sources import DiffractionSource, _open_diffraction_source
+from fourdenoise_detectors import _virtual_image
 from fourdenoise_rosetta import unpack_reader_metadata
 from fourdenoise_metadata import (
     _acquisition_summary,
@@ -3803,7 +3804,8 @@ class HyperData:
         ...     data = source.load(max_memory_mb=4096)
         """
         with _open_diffraction_source(
-            filename, cls, ReciprocalSpace, hdf5_dataset=hdf5_dataset,
+            filename, cls, ReciprocalSpace, real_type=RealSpace,
+            hdf5_dataset=hdf5_dataset,
             real_units=real_units, real_conv_factor=real_conv_factor,
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_conv_factor, real_origin=real_origin,
@@ -7948,9 +7950,17 @@ class HyperData:
                       units='auto', mask_cmap='turbo', mask_vmin=None,
                       mask_vmax=None, mask_power=1, mask_log_scale=True,
                       mask_show_kwargs=None, ring_color='green',
-                      ring_alpha=0.3, show=True):
+                      ring_alpha=0.3, show=True, working_memory_mb=None):
         """
         Form a real-space virtual image using a reciprocal-space detector.
+
+        Products and sums are evaluated blockwise in at least float64 precision
+        without allocating a complete weighted tensor. ``working_memory_mb``
+        bounds the numerical workspace (default 256 MiB); it excludes the
+        returned scan image, detector construction, metadata, caches and plots.
+        The source is never mutated, and NaN/Inf propagate as in NumPy sums.
+        A mean detector is computed only for plot_mask or return_detector.
+        Complex amplitudes are rejected; supply real-valued intensities.
 
         The detector type is inferred from exactly one of these specifications:
 
@@ -8048,278 +8058,29 @@ class HyperData:
         ... )
         >>> image = data.virtual_image(mask=detector_weights)
         """
-        if self.ndim != 4:
-            raise ValueError("virtual_image requires a 4D HyperData object.")
-        if mask_show_kwargs is not None and not isinstance(mask_show_kwargs, dict):
-            raise TypeError("mask_show_kwargs must be a dictionary or None.")
-        _normalize_unit_mode(units, label='units')
-        if not np.isfinite(ring_alpha) or not 0 <= ring_alpha <= 1:
-            raise ValueError("ring_alpha must be between 0 and 1.")
-        to_rgba(ring_color)
-
-        has_annulus = annulus is not None
-        has_mask = mask is not None
-        has_disk_input = radius is not None or centers is not None
-
-        if (radius is None) != (centers is None):
-            raise ValueError(
-                "radius and centers must be provided together for circular "
-                "detectors."
-            )
-
-        detector_count = sum((has_annulus, has_mask, has_disk_input))
-        if detector_count != 1:
-            raise ValueError(
-                "Specify exactly one detector: annulus, radius with centers, "
-                "or mask."
-            )
-        if has_disk_input and self.is_polar:
-            raise ValueError(
-                "radius and centers define Cartesian (ky, kx) circles and "
-                "cannot be applied after to_polar(). Use annulus or mask."
-            )
-
-        ky, kx = self.shape[-2:]
-        if has_annulus or has_disk_input:
-            if self.is_polar:
-                _, detector_factor, detector_mode = self._resolve_polar_radius_units(
-                    detector_units
-                )
-            else:
-                _, detector_factor, detector_mode = self._resolve_reciprocal_detector_units(
-                    detector_units
-                )
-        else:
-            _normalize_unit_mode(detector_units, label='detector_units')
-            detector_factor = None
-            detector_mode = 'pixels'
-
-        if has_mask:
-            if theta_range is not None:
-                raise ValueError(
-                    "theta_range is only valid with annulus on polar data."
-                )
-            detector_weights = np.asarray(mask)
-            if detector_weights.shape != (ky, kx):
-                raise ValueError(
-                    "mask must match the reciprocal-space shape "
-                    f"{(ky, kx)}; got {detector_weights.shape}."
-                )
-            if not (
-                np.issubdtype(detector_weights.dtype, np.bool_)
-                or np.issubdtype(detector_weights.dtype, np.number)
-            ):
-                raise TypeError("mask must contain Boolean or numeric values.")
-            if np.issubdtype(detector_weights.dtype, np.complexfloating):
-                raise TypeError("mask weights must be real-valued.")
-            if (
-                np.issubdtype(detector_weights.dtype, np.number)
-                and not np.all(np.isfinite(detector_weights))
-            ):
-                raise ValueError("mask must contain only finite values.")
-            detector_weights = detector_weights.astype(
-                np.result_type(detector_weights.dtype, np.float32),
-                copy=False,
-            )
-
-        elif has_annulus:
-            annulus_values = np.asarray(annulus, dtype=float)
-            if annulus_values.shape != (2,):
-                raise ValueError(
-                    "annulus must contain exactly (inner_radius, outer_radius)."
-                )
-            if not np.all(np.isfinite(annulus_values)):
-                raise ValueError("annulus radii must be finite.")
-            if detector_mode == 'calibrated':
-                annulus_values = self._scale_values_to_pixels(
-                    annulus_values,
-                    detector_factor,
-                )
-            inner_radius, outer_radius = annulus_values
-            if inner_radius < 0 or outer_radius <= inner_radius:
-                raise ValueError(
-                    "annulus must satisfy 0 <= inner_radius < outer_radius."
-                )
-
-            if self.is_polar:
-                metadata = self.polar_metadata or {}
-                radius_min, radius_max = metadata.get(
-                    'radius_range_pixels',
-                    (0.0, float(ky - 1)),
-                )
-                radius_values = np.linspace(radius_min, radius_max, ky)
-                radial_mask = (
-                    (radius_values >= inner_radius)
-                    & (radius_values <= outer_radius)
-                )
-
-                angular_mask = np.ones(kx, dtype=bool)
-                if theta_range is not None:
-                    angle_values = np.asarray(theta_range, dtype=float)
-                    if angle_values.shape != (2,):
-                        raise ValueError(
-                            "theta_range must contain exactly two angles."
-                        )
-                    if not np.all(np.isfinite(angle_values)):
-                        raise ValueError("theta_range angles must be finite.")
-                    theta_min, theta_max = angle_values
-                    _, _, _, _, theta_start, theta_step = _polar_grid(metadata, (ky, kx))
-                    theta_values = np.mod(theta_start + np.arange(kx) * theta_step, 360.0)
-                    if theta_min <= theta_max:
-                        angular_mask = (
-                            (theta_values >= theta_min)
-                            & (theta_values <= theta_max)
-                        )
-                    else:
-                        angular_mask = (
-                            (theta_values >= theta_min)
-                            | (theta_values <= theta_max)
-                        )
-
-                detector_weights = (
-                    radial_mask[:, None] & angular_mask[None, :]
-                ).astype(np.float32)
-            else:
-                if theta_range is not None:
-                    raise ValueError(
-                        "theta_range is only valid for polar data."
-                    )
-                detector_weights = make_mask(
-                    ((ky - 1) / 2, (kx - 1) / 2),
-                    (float(inner_radius), float(outer_radius)),
-                    mask_dim=(ky, kx),
-                ).astype(np.float32)
-
-        else:
-            if theta_range is not None:
-                raise ValueError(
-                    "theta_range is only valid with annulus on polar data."
-                )
-
-            center_values = np.asarray(centers, dtype=float)
-            if center_values.shape == (2,):
-                center_values = center_values.reshape(1, 2)
-            elif center_values.ndim != 2 or center_values.shape[1] != 2:
-                raise ValueError(
-                    "centers must be one (ky, kx) pair or an (N, 2) array."
-                )
-            if center_values.shape[0] == 0:
-                raise ValueError("centers must contain at least one center.")
-            if not np.all(np.isfinite(center_values)):
-                raise ValueError("centers must contain only finite values.")
-            if detector_mode == 'calibrated':
-                center_values = self._calibrated_centers_to_pixels(
-                    center_values,
-                    detector_factor,
-                    (ky, kx),
-                )
-
-            radius_values = np.asarray(radius, dtype=float)
-            if radius_values.ndim == 0:
-                radius_values = np.full(
-                    center_values.shape[0],
-                    float(radius_values),
-                )
-            elif (
-                radius_values.ndim == 1
-                and radius_values.size == center_values.shape[0]
-            ):
-                pass
-            else:
-                raise ValueError(
-                    "radius must be a scalar or contain one value per center."
-                )
-            if (
-                not np.all(np.isfinite(radius_values))
-                or np.any(radius_values <= 0)
-            ):
-                raise ValueError("All detector radii must be positive and finite.")
-            if detector_mode == 'calibrated':
-                radius_values = self._scale_values_to_pixels(
-                    radius_values,
-                    detector_factor,
-                )
-
-            detector_weights = np.zeros((ky, kx), dtype=np.float32)
-            for center, disk_radius in zip(center_values, radius_values):
-                detector_weights[
-                    make_mask(
-                        center,
-                        float(disk_radius),
-                        mask_dim=(ky, kx),
-                    )
-                ] = 1.0
-
-        if not np.any(detector_weights != 0):
-            raise ValueError("The detector selects no reciprocal-space pixels.")
-
-        mean_detector = np.mean(self.array, axis=(0, 1))
-        masked_image = np.sum(
-            self.array * detector_weights[None, None, :, :],
-            axis=(2, 3),
+        return _virtual_image(
+            self.array, annulus, radius=radius, centers=centers, mask=mask,
+            theta_range=theta_range, detector_units=detector_units,
+            axis_units=axis_units, vmin=vmin, vmax=vmax, grid=grid,
+            num_div=num_div, plot_mask=plot_mask, grid_color=grid_color,
+            axes=axes, return_detector=return_detector, title=title, units=units,
+            mask_cmap=mask_cmap, mask_vmin=mask_vmin, mask_vmax=mask_vmax,
+            mask_power=mask_power, mask_log_scale=mask_log_scale,
+            mask_show_kwargs=mask_show_kwargs, ring_color=ring_color,
+            ring_alpha=ring_alpha, show=show, working_memory_mb=working_memory_mb,
+            geometry={
+                'reciprocal_units': self.reciprocal_units,
+                'reciprocal_conv_factor': self.reciprocal_conv_factor,
+                'polar_metadata': self.polar_metadata,
+            },
+            real_factory=lambda array: self._spawn_real(
+                array, quantity='Virtual detector signal',
+            ),
+            reciprocal_factory=self._spawn_reciprocal,
+            polar_factory=lambda array: HyperData(
+                array, polar_metadata=deepcopy(self.polar_metadata),
+            ),
         )
-        virtual_image = self._spawn_real(
-            masked_image, quantity='Virtual detector signal',
-        )
-
-        detector_array = mean_detector * detector_weights
-        if self.is_polar:
-            detector_image = HyperData(
-                detector_array,
-                polar_metadata=deepcopy(self.polar_metadata),
-            )
-        else:
-            detector_image = self._spawn_reciprocal(detector_array)
-
-        has_negative_weights = np.any(detector_weights < 0)
-        if vmin is None:
-            if has_negative_weights:
-                vmin = np.min(masked_image)
-            else:
-                positive_values = masked_image[masked_image > 0]
-                vmin = (
-                    np.min(positive_values)
-                    if positive_values.size
-                    else np.min(masked_image)
-                )
-        if vmax is None:
-            vmax = np.max(masked_image)
-
-        if show:
-            virtual_image.show(
-                title=title,
-                cmap='gray',
-                vmin=vmin,
-                vmax=vmax,
-                axes=axes,
-                grid=grid,
-                num_div=num_div,
-                grid_color=grid_color,
-                axis_units=axis_units,
-            )
-
-        if plot_mask:
-            mask_options = {
-                'title': 'Mean Diffraction Pattern and Virtual Detector',
-                'cmap': mask_cmap,
-                'vmin': mask_vmin,
-                'vmax': mask_vmax,
-                'power': mask_power,
-                'logScale': mask_log_scale,
-                'axis_units': units,
-                'overlay_mask': detector_weights != 0,
-                'overlay_color': ring_color,
-                'overlay_alpha': ring_alpha,
-            }
-            if self.is_polar:
-                mask_options['aspect'] = 'auto'
-            if mask_show_kwargs:
-                mask_options.update(mask_show_kwargs)
-            self._spawn_reciprocal(mean_detector).show(**mask_options)
-
-        if return_detector:
-            return virtual_image, detector_image
-        return virtual_image
 
 
     def get_braggness(self, annulus=(18.0, 50.0), *, center=None, sigma=2.0,

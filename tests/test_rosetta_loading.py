@@ -127,6 +127,27 @@ class RosettaMockTests(unittest.TestCase):
             with fd.HyperData.open(self.path, backend='native'):
                 pass
 
+    def test_streamed_virtual_image_matches_eager_and_reserves_reader_chunk(self):
+        array = self.records[0]['data']
+        weights = np.linspace(-0.25, 1.5, 30).reshape(5, 6)
+        with fd.HyperData.open(self.path, real_units='nm', real_conv_factor=(2, 3),
+                               real_origin=(4, -5)) as source:
+            with self.assertRaisesRegex(ValueError, 'reader chunk'):
+                source.virtual_image(mask=weights, show=False, working_memory_mb=0.0001)
+            self.assertEqual(array.calls, [])
+            actual, detector = source.virtual_image(
+                mask=weights, show=False, return_detector=True, working_memory_mb=0.003,
+            )
+            expected = fd.HyperData(self.values).virtual_image(mask=weights, show=False)
+            np.testing.assert_allclose(actual.array, expected.array)
+            np.testing.assert_allclose(detector.array, self.values.mean(axis=(0, 1)) * weights)
+            self.assertEqual(actual.units, 'nm')
+            self.assertEqual(actual.conv_factor, (2, 3))
+            self.assertEqual(actual.origin, (4, -5))
+            self.assertGreater(len(array.calls), 2)
+        self.assertTrue(np.isfinite(actual.array).all())
+        self.assertEqual(self.handle.close_count, 1)
+
     def test_ambiguous_plugins_and_lazy_only_preflight(self):
         self.rsciio.IO_PLUGINS.append(dict(self.rsciio.IO_PLUGINS[0], name='Another DM'))
         with self.assertRaisesRegex(ValueError, 'Candidates'):

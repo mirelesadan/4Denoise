@@ -7,6 +7,7 @@ Opening a source never converts its complete array or reads unfolding payloads.
 
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import partial
 from math import prod
 from numbers import Integral
 from pathlib import Path
@@ -26,6 +27,7 @@ from fourdenoise_reductions import (
     _diffraction_shape, _get_dp_array, _working_memory_bytes,
 )
 from fourdenoise_traversals import _clone_unfold_metadata
+from fourdenoise_detectors import _virtual_image
 
 
 _SOURCE_METADATA_KEYS = (
@@ -143,12 +145,13 @@ class DiffractionSource:
 
     def __init__(self, dataset, hyperdata_type, reciprocal_type, *, metadata=None,
                  backend, filename, dataset_path=None, close_callback,
-                 unfold_loader=None):
+                 unfold_loader=None, real_type=None):
         self._shape = _diffraction_shape(dataset)
         self._dtype = np.dtype(dataset.dtype)
         self._dataset = dataset
         self._hyperdata_type = hyperdata_type
         self._reciprocal_type = reciprocal_type
+        self._real_type = real_type
         self._metadata = deepcopy(metadata or {})
         self._backend = backend
         self._filename = str(Path(filename).resolve())
@@ -323,6 +326,94 @@ class DiffractionSource:
             center_beam_metadata=self._metadata.get('center_beam_metadata'),
         )
 
+    def virtual_image(self, annulus=None, *, radius=None, centers=None,
+                      mask=None, theta_range=None, detector_units='auto',
+                      axis_units='auto', vmin=None, vmax=None, grid=True,
+                      num_div=10, plot_mask=False, grid_color='black', axes=True,
+                      return_detector=False, title='Virtual Detector Image',
+                      units='auto', mask_cmap='turbo', mask_vmin=None,
+                      mask_vmax=None, mask_power=1, mask_log_scale=True,
+                      mask_show_kwargs=None, ring_color='green', ring_alpha=0.3,
+                      show=True, working_memory_mb=None):
+        """Integrate a virtual detector without loading the complete 4D scan.
+
+        Detector definitions, inclusive boundaries, units and display options
+        are the same as :meth:`fourdenoise.HyperData.virtual_image`: specify exactly one
+        of ``annulus=(inner, outer)``, ``radius`` with ``centers``, or a real
+        Boolean/signed/fractional detector ``mask``. Overlapping disks count
+        once. Polar data supports annuli, wrapped ``theta_range`` or masks,
+        but not Cartesian disks. Radii in polar pixel mode refer to original
+        Cartesian-pixel distances, not row indices.
+
+        ``detector_units='auto'`` uses reciprocal calibration if available;
+        choose ``'pixels'`` explicitly for pixel radii/positions. ``axis_units``
+        chooses real-space display units, while ``units`` chooses detector
+        preview units. All other visualization options follow HyperData's
+        method, including the optional unmasked mean-pattern overlay.
+
+        Return a fully owned :class:`fourdenoise.RealSpace` image with scan calibration,
+        spacing and origin. It remains usable after the source closes. With
+        ``return_detector=True``, also return the masked mean detector image
+        (ReciprocalSpace, or polar HyperData). Mean patterns are accumulated
+        in the same read pass only when requested by this option or plot_mask.
+
+        ``working_memory_mb`` budgets numerical input/work buffers (default
+        256 MiB), reserving one declared Rosetta reader chunk too. It excludes
+        the returned scan-sized image, detector construction, metadata,
+        library/OS caches and plotting; it is not a process-RAM limit. A budget
+        too small for one pattern raises before pixel reads. Products and sums
+        use at least float64 precision; source data/dtype is never modified.
+        NaN/Inf propagate according to ordinary NumPy multiplication/sums.
+        Complex amplitudes are rejected; supply real-valued intensities.
+        3D stacks are rejected because they have no defined 2D scan grid.
+
+        Examples
+        --------
+        >>> with HyperData.open('scan.hdf5') as source:
+        ...     image = source.virtual_image(
+        ...         annulus=(10, 35), detector_units='pixels',
+        ...         working_memory_mb=64, show=False,
+        ...     )
+        >>> image.show()
+        """
+        self._require_open()
+        if self._real_type is None:
+            raise RuntimeError('Obtain virtual-image sources through HyperData.open().')
+        geometry = {
+            key: self._metadata.get(key) for key in (
+                'reciprocal_units', 'reciprocal_conv_factor', 'polar_metadata',
+            )
+        }
+        return _virtual_image(
+            self._dataset, annulus, radius=radius, centers=centers, mask=mask,
+            theta_range=theta_range, detector_units=detector_units,
+            axis_units=axis_units, vmin=vmin, vmax=vmax, grid=grid,
+            num_div=num_div, plot_mask=plot_mask, grid_color=grid_color,
+            axes=axes, return_detector=return_detector, title=title, units=units,
+            mask_cmap=mask_cmap, mask_vmin=mask_vmin, mask_vmax=mask_vmax,
+            mask_power=mask_power, mask_log_scale=mask_log_scale,
+            mask_show_kwargs=mask_show_kwargs, ring_color=ring_color,
+            ring_alpha=ring_alpha, show=show,
+            working_memory_mb=self._reader_working_memory(working_memory_mb),
+            geometry=geometry,
+            real_factory=partial(
+                self._real_type, units=self.real_units,
+                conv_factor=self.real_conv_factor, origin=self.real_origin,
+                quantity='Virtual detector signal',
+            ),
+            reciprocal_factory=partial(
+                self._reciprocal_type, units=self.reciprocal_units,
+                conv_factor=self.reciprocal_conv_factor,
+                polar_metadata=self._metadata.get('polar_metadata'),
+                cepstral_metadata=self._metadata.get('cepstral_metadata'),
+                center_beam_metadata=self._metadata.get('center_beam_metadata'),
+            ),
+            polar_factory=partial(
+                self._hyperdata_type,
+                polar_metadata=self._metadata.get('polar_metadata'),
+            ),
+        )
+
     def _make_block(self, array, scan_slices):
         metadata = self.metadata
         if self.ndim == 4:
@@ -401,7 +492,7 @@ class DiffractionSource:
 
 
 @contextmanager
-def _open_diffraction_source(filename, hyperdata_type, reciprocal_type, *,
+def _open_diffraction_source(filename, hyperdata_type, reciprocal_type, *, real_type=None,
                              hdf5_dataset=None, real_units=None,
                              real_conv_factor=None, reciprocal_units=None,
                              reciprocal_conv_factor=None, real_origin=None,
@@ -443,7 +534,7 @@ def _open_diffraction_source(filename, hyperdata_type, reciprocal_type, *,
                 source = DiffractionSource(
                     array, hyperdata_type, reciprocal_type, metadata=metadata,
                     backend='rosetta', filename=path, dataset_path=label,
-                    close_callback=close_callback,
+                    close_callback=close_callback, real_type=real_type,
                 )
                 yield source
             finally:
@@ -461,6 +552,7 @@ def _open_diffraction_source(filename, hyperdata_type, reciprocal_type, *,
             source = DiffractionSource(
                 dataset, hyperdata_type, reciprocal_type, metadata=metadata,
                 backend='numpy', filename=path, close_callback=close_callback,
+                real_type=real_type,
             )
             yield source
         finally:
@@ -502,6 +594,7 @@ def _open_diffraction_source(filename, hyperdata_type, reciprocal_type, *,
                 dataset, hyperdata_type, reciprocal_type, metadata=metadata,
                 backend='hdf5', filename=path, dataset_path=dataset.name,
                 close_callback=file.close, unfold_loader=unfold_loader,
+                real_type=real_type,
             )
             yield source
         finally:
