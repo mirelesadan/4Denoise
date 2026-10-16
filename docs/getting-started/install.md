@@ -25,6 +25,7 @@ optional dependencies:
 python -m pip install -e ".[notebook]"    # Jupyter and notebook analysis tools
 python -m pip install -e ".[simulation]"  # abTEM/ASE simulation tools
 python -m pip install -e ".[bm]"          # BM3D and BM4D denoisers
+python -m pip install -e ".[rosetta]"     # RosettaSciIO microscopy readers
 ```
 
 The Conda environment already includes Jupyter and most notebook tools, but
@@ -38,6 +39,14 @@ print(sys.executable)
 
 If this path is not from the intended environment, select the correct
 Jupyter kernel and restart it before importing `fourdenoise`.
+
+The `rosetta` extra currently supports RosettaSciIO 0.14.x and installs Dask
+for lazy reader arrays. It is optional: native NumPy/HDF5 I/O and the core
+package do not import RosettaSciIO at startup. Some plugin families require
+additional reader-specific dependencies; see the
+[RosettaSciIO format documentation](https://hyperspy.org/rosettasciio/supported_formats/index.html).
+The [I/O guide](../guides/io-and-calibration.md#rosettasciio-microscopy-formats)
+explains dataset selection, axis ordering and the limits of lazy reading.
 
 ## Build This Guide
 

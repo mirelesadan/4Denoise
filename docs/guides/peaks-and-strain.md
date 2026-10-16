@@ -97,3 +97,44 @@ the source 4D data when its shape matches that scan.
 Existing four-value unpacking and numeric indexing still work. With
 `return_transform=True`, transform and peak-rejection diagnostics are
 available in `result.diagnostics` and as `result[4]`.
+
+## Local Peak Pairing and Failure Diagnostics
+
+The default matcher uses one-to-one candidates within a neighborhood of each
+reference peak, not centroids of differently populated peak sets. Extra,
+missing, or distant peaks can remain unmatched. `match_radius` uses the same
+units as the supplied peaks; None selects 45% of the median nearest-reference
+peak spacing. For a large misorientation, supply an initial guess:
+
+```python
+result = data.get_strains(
+    centers=measured, ref_centers=reference, center=beam_center,
+    initial_rotation=rotation_angles, match_radius=0.15,
+    peak_units="calibrated", return_transform=True,
+)
+```
+
+Angles are Cartesian counterclockwise degrees, either scalar or scan-shaped.
+`initial_transform` instead accepts global/scan-shaped (2, 2) matrices in
+the input (ky, kx) order. Guesses guide matching only: the full fitted transform
+and its rotation are retained, not just a residual rotation. Stored current
+beam centers take precedence over historical pre-alignment mean-fit centers.
+
+`fit_translation=True` enables translation consensus that does not assume
+equal peak counts. An explicit `initial_translation` may be supplied in peak
+units. `ambiguity_ratio` optionally rejects close competing alternatives;
+smaller values are stricter. The reported pair-confidence margin is geometric,
+not a calibrated probability. Intensity weights remain attached to original
+measured-peak indices through cleaning, filtering and assignment.
+
+Inspect `result.fit_status` for masked locations, insufficient peaks/matches,
+no candidates, ambiguity rejection, ill-conditioned fits, or success.
+`condition_numbers` reports fitted design conditioning when available.
+With `return_transform=True`, `diagnostics['matching_information'][index]`
+contains original matched/unmatched indices, candidate counts, pair distances,
+confidence margins and the initial transform/translation actually used.
+Failed fits remain NaN; they are not silently converted to zero strain.
+
+Use `match_peaks="ordered"` only for known correspondences. Explicit
+`"hungarian"` allows unrestricted assignment when no gate is specified; it
+can force unrelated peaks into pairs and is not the recommended default.

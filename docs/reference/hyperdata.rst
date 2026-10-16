@@ -15,15 +15,36 @@ Loading and metadata
 
 .. automethod:: fourdenoise.HyperData.metadata_summary
 
+.. automethod:: fourdenoise.HyperData.open
+
 .. automethod:: fourdenoise.HyperData.open_hdf5
 
 .. automethod:: fourdenoise.HyperData.to_polar_hdf5
 
 .. automethod:: fourdenoise.HyperData.resize_hdf5
 
+.. automethod:: fourdenoise.HyperData.to_cartesian_hdf5
+
+.. automethod:: fourdenoise.HyperData.remove_bg_hdf5
+
 .. automethod:: fourdenoise.HyperData.save
 
 .. automethod:: fourdenoise.HyperData.copy
+
+Disk-backed source
+------------------
+
+.. autoclass:: fourdenoise.DiffractionSource
+
+.. automethod:: fourdenoise.DiffractionSource.get_dp
+
+.. automethod:: fourdenoise.DiffractionSource.iter_chunks
+
+.. automethod:: fourdenoise.DiffractionSource.load
+
+.. automethod:: fourdenoise.DiffractionSource.close
+
+.. autofunction:: fourdenoise.unpack_reader_metadata
 
 Viewing and geometry
 --------------------

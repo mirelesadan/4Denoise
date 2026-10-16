@@ -4,6 +4,297 @@ import numpy as np
 from copy import deepcopy
 from scipy.ndimage import gaussian_filter, map_coordinates
 
+def _center_beam_metadata_from_pixels(radius_px, center_px, shape, *,
+                                      units=None, conv_factor=None,
+                                      **extra_metadata):
+    """Build direct-beam metadata from pixel-space beam parameters."""
+    shape = tuple(int(v) for v in shape)
+    if len(shape) != 2:
+        raise ValueError("Direct-beam metadata requires a 2D reciprocal shape.")
+
+    radius_px = float(radius_px)
+    center_px = tuple(float(v) for v in center_px)
+    if not np.isfinite(radius_px) or radius_px <= 0:
+        raise ValueError("Direct-beam radius must be positive and finite.")
+    if len(center_px) != 2 or not np.all(np.isfinite(center_px)):
+        raise ValueError("Direct-beam center must contain two finite values.")
+
+    metadata = {
+        'radius_px': radius_px,
+        'center_px': center_px,
+        'shape': shape,
+        'coordinate_convention': (
+            "center_px is an array-coordinate (ky, kx) pair. "
+            "center_calibrated, when present, is relative to the diffraction "
+            "origin with positive ky upward and positive kx to the right."
+        ),
+    }
+
+    has_units = units is not None
+    has_factor = conv_factor is not None
+    if has_units != has_factor:
+        raise ValueError(
+            "Direct-beam metadata cannot use a partial reciprocal-space "
+            "calibration. Define both units and conv_factor, or clear both."
+        )
+    if has_units:
+        if not np.isscalar(conv_factor) or not np.isfinite(conv_factor) or conv_factor <= 0:
+            raise ValueError("conv_factor must be a positive scalar.")
+        metadata.update({
+            'calibrated_units': str(units).strip(),
+            'conv_factor': float(conv_factor),
+            'radius_calibrated': radius_px * float(conv_factor),
+            'center_calibrated': _center_to_calibrated(
+                center_px,
+                shape,
+                conv_factor,
+            ),
+        })
+
+    for key, value in extra_metadata.items():
+        if value is not None:
+            metadata[key] = deepcopy(value)
+
+    return metadata
+
+
+def _resampled_center_beam_metadata(metadata, old_shape, new_shape, *,
+                                    crop_origin=(0, 0), crop_shape=None,
+                                    units=None, conv_factor=None):
+    """Map a circular beam through an integer crop and isotropic resampling.
+
+    Return None when the old geometry is stale, the beam center is cropped out,
+    or unequal axis scales would turn the circle into an ellipse. Historical
+    alignment coordinates are not copied because they describe the old image.
+    """
+    if metadata is None:
+        return None
+    old_shape = tuple(old_shape)
+    new_shape = tuple(new_shape)
+    crop_shape = tuple(crop_shape) if crop_shape is not None else old_shape
+    if tuple(metadata.get('shape', ())) != old_shape:
+        return None
+    if 'center_px' not in metadata or 'radius_px' not in metadata:
+        return None
+
+    scales = np.asarray(new_shape, dtype=float) / np.asarray(crop_shape, dtype=float)
+    if not np.isclose(scales[0], scales[1]):
+        return None
+    center = np.asarray(metadata['center_px'], dtype=float)
+    origin = np.asarray(crop_origin, dtype=float)
+    new_center = (center - origin + 0.5) * scales - 0.5
+    if not np.all(np.isfinite(new_center)) or np.any(new_center < 0) or np.any(
+        new_center > np.asarray(new_shape) - 1
+    ):
+        return None
+    return _center_beam_metadata_from_pixels(
+        float(metadata['radius_px']) * scales[0], new_center, new_shape,
+        units=units, conv_factor=conv_factor,
+        source='resampling', parent_source=metadata.get('source'),
+    )
+
+
+def _resized_data_metadata(metadata, old_shape, new_shape, domain, method):
+    """Share global resize geometry between in-memory and streamed outputs."""
+    keys = ('real_units', 'real_conv_factor', 'real_origin', 'reciprocal_units',
+            'reciprocal_conv_factor', 'polar_metadata', 'cepstral_metadata',
+            'center_beam_metadata')
+    result = {key: deepcopy(metadata.get(key)) for key in keys}
+    result['real_origin'] = tuple(metadata.get('real_origin', (0.0, 0.0)))
+    if tuple(old_shape) == tuple(new_shape):
+        return result
+    axes = tuple(range(len(old_shape) - 2)) if domain == 'real' else (len(old_shape) - 2, len(old_shape) - 1)
+    factors = tuple(old_shape[a] / new_shape[a] for a in axes)
+    if domain == 'real':
+        factor = result['real_conv_factor']
+        if factor is not None:
+            scales = factors if len(factors) == 2 else factors * 2
+            result['real_conv_factor'] = _scaled_real_spacing(factor, scales)
+        if len(old_shape) == 4:
+            steps = _real_spacing_pair(factor)
+            result['real_origin'] = tuple(v + 0.5 * (f - 1) * s for v, f, s in zip(result['real_origin'], factors, steps))
+    else:
+        factor = result['reciprocal_conv_factor']
+        if factor is not None:
+            if np.allclose(factors, factors[0]):
+                result['reciprocal_conv_factor'] = factor * factors[0]
+            else:
+                result['reciprocal_units'] = result['reciprocal_conv_factor'] = None
+        result['polar_metadata'] = _resampled_polar_metadata(
+            result['polar_metadata'], old_shape[-2:], new_shape[-2:], endpoint_radial=method != 'area',
+        )
+        result['cepstral_metadata'] = _resampled_cepstral_metadata(
+            result['cepstral_metadata'], old_shape[-2:], new_shape[-2:],
+        )
+        result['center_beam_metadata'] = _resampled_center_beam_metadata(
+            result['center_beam_metadata'], old_shape[-2:], new_shape[-2:],
+            units=result['reciprocal_units'], conv_factor=result['reciprocal_conv_factor'],
+        ) if result['polar_metadata'] is None else None
+    return result
+
+
+def _beam_center_pixels(shape, metadata=None, conv_factor=None):
+    """Resolve a canonical beam center once for rotations, strain and plotting.
+
+    Prefer current center_px over historical mean-fit coordinates. Reject
+    stale geometry rather than rotating about a believable but wrong pivot.
+    The fallback is the subpixel image midpoint, never a rounded pixel.
+    """
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise ValueError('center_beam_metadata must be a dictionary or None.')
+        if 'shape' in metadata:
+            try:
+                stored_shape = tuple(metadata['shape'])
+            except TypeError as exc:
+                raise ValueError('center_beam_metadata has an invalid shape.') from exc
+            if stored_shape != tuple(shape):
+                raise ValueError('center_beam_metadata has a stale pattern shape; update it first.')
+        for key in ('center_px', 'mean_fit_center_px'):
+            if metadata.get(key) is not None:
+                center = np.asarray(metadata[key], dtype=float)
+                if center.shape != (2,) or not np.isfinite(center).all():
+                    raise ValueError(f'{key} must contain a finite coordinate pair.')
+                return tuple(center), key
+        if metadata.get('center_calibrated') is not None:
+            factor = metadata.get('conv_factor', conv_factor)
+            if factor is None or not np.isscalar(factor) or not np.isfinite(factor) or factor <= 0:
+                raise ValueError('center calibration factor must be positive and finite.')
+            return _calibrated_center_to_pixels(metadata['center_calibrated'], factor, shape), 'center_calibrated'
+    return tuple((size - 1) / 2 for size in shape), 'image midpoint'
+
+
+def _cropped_data_metadata(metadata, old_shape, new_shape, *, real_bounds=None,
+                           reciprocal_bounds=None):
+    """One crop rule for scan origins, calibrated patterns and transformed axes."""
+    result = _resized_data_metadata(metadata, old_shape, old_shape, 'real', 'area')
+    if real_bounds is not None:
+        steps = _real_spacing_pair(result['real_conv_factor'])
+        factors = tuple((b - a) / size for (a, b), size in zip(real_bounds, new_shape[:2]))
+        result['real_origin'] = tuple(v + a * s for v, (a, _), s in zip(result['real_origin'], real_bounds, steps))
+        if result['real_conv_factor'] is not None:
+            result['real_conv_factor'] = _scaled_real_spacing(result['real_conv_factor'], factors)
+            result['real_origin'] = tuple(v + 0.5 * (f - 1) * s for v, f, s in zip(result['real_origin'], factors, steps))
+    if reciprocal_bounds is None:
+        return result
+    old_pattern, new_pattern = old_shape[-2:], new_shape[-2:]
+    factors = tuple((b - a) / size for (a, b), size in zip(reciprocal_bounds, new_pattern))
+    factor = result['reciprocal_conv_factor']
+    if factor is not None:
+        if np.isclose(*factors):
+            result['reciprocal_conv_factor'] = factor * factors[0]
+        else:
+            result['reciprocal_units'] = result['reciprocal_conv_factor'] = None
+    result['polar_metadata'] = _resampled_polar_metadata(
+        result['polar_metadata'], old_pattern, new_pattern, bounds=reciprocal_bounds,
+    )
+    result['cepstral_metadata'] = _resampled_cepstral_metadata(
+        result['cepstral_metadata'], old_pattern, new_pattern, bounds=reciprocal_bounds,
+    )
+    changed = tuple(old_pattern) != tuple(new_pattern) or reciprocal_bounds != ((0, old_pattern[0]), (0, old_pattern[1]))
+    if changed:
+        fractional = any(not float(v).is_integer() for bounds in reciprocal_bounds for v in bounds)
+        result['center_beam_metadata'] = None if fractional or metadata.get('polar_metadata') is not None else _resampled_center_beam_metadata(
+            result['center_beam_metadata'], old_pattern, new_pattern,
+            crop_origin=tuple(a for a, _ in reciprocal_bounds),
+            crop_shape=tuple(b - a for a, b in reciprocal_bounds),
+            units=result['reciprocal_units'], conv_factor=result['reciprocal_conv_factor'],
+        )
+    return result
+
+
+def _flipped_data_metadata(metadata, shape, *, flip_axes):
+    """Update signed scan steps, beam/cepstral centers and the R/Q frame."""
+    result = _resized_data_metadata(metadata, shape, shape, 'real', 'area')
+    q_axes = (len(shape) - 2, len(shape) - 1)
+    if result['polar_metadata'] is not None and any(a in q_axes for a in flip_axes):
+        raise ValueError('Flipping polar radius or angle axes would invalidate polar metadata; convert to Cartesian first.')
+    if len(shape) == 4 and result['real_conv_factor'] is not None:
+        steps = list(_real_spacing_pair(_normalize_real_spacing(result['real_conv_factor'])))
+        origin = list(_normalize_real_origin(result['real_origin']))
+        for a in (0, 1):
+            if a in flip_axes:
+                origin[a] += (shape[a] - 1) * steps[a]
+                steps[a] *= -1
+        result['real_origin'] = tuple(origin)
+        result['real_conv_factor'] = steps[0] if np.isclose(*steps) else tuple(steps)
+    for field in ('center_beam_metadata', 'cepstral_metadata'):
+        record = result[field]
+        if record is None:
+            continue
+        for key in ('center_px', 'mean_fit_center_px', 'std_fit_center_px', 'target_center_px'):
+            if key in record:
+                center = np.asarray(record[key], dtype=float)
+                if center.shape == (2,):
+                    record[key] = tuple(shape[-2 + i] - 1 - c if q_axes[i] in flip_axes else c for i, c in enumerate(center))
+        if field == 'center_beam_metadata' and 'center_calibrated' in record:
+            center = np.asarray(record['center_calibrated'], dtype=float)
+            if center.shape == (2,):
+                record['center_calibrated'] = tuple(-c if q_axes[i] in flip_axes else c for i, c in enumerate(center))
+    if metadata.get('rq_calibration') is not None:
+        from fourdenoise_rq import _reframe_rq_calibration
+        real, reciprocal = np.eye(2), np.eye(2)
+        for a in flip_axes:
+            if a in q_axes:
+                reciprocal[1 - (a - q_axes[0]), 1 - (a - q_axes[0])] = -1
+            elif len(shape) == 4:
+                real[1 - a, 1 - a] = -1
+        result['rq_calibration'] = _reframe_rq_calibration(metadata['rq_calibration'], real=real, reciprocal=reciprocal)
+    else:
+        result['rq_calibration'] = None
+    return result
+
+
+def _rotated_data_metadata(metadata, old_shape, new_shape, *, angle_degrees):
+    """Map beam coordinates through image-centered rotation and reframe R/Q."""
+    if metadata.get('cepstral_metadata') is not None:
+        raise ValueError('Diffraction rotation cannot retain cepstral coordinates.')
+    result = _resized_data_metadata(metadata, old_shape, old_shape, 'real', 'area')
+    from fourdenoise_rq import _reframe_rq_calibration, _rotation_matrix
+    result['rq_calibration'] = _reframe_rq_calibration(
+        metadata.get('rq_calibration'), reciprocal=_rotation_matrix(angle_degrees),
+    )
+    if metadata.get('polar_metadata') is not None:
+        _, _, theta, _, _, _ = _polar_grid(metadata['polar_metadata'], old_shape[-2:])
+        if tuple(old_shape) != tuple(new_shape) or not np.isclose(theta[1] - theta[0], 360):
+            raise ValueError('Polar rotation requires unchanged shape and full-circle angular support.')
+        result['center_beam_metadata'] = None
+    elif result['center_beam_metadata'] is not None:
+        beam = result['center_beam_metadata']
+        if 'radius_px' not in beam:
+            result['center_beam_metadata'] = None
+        else:
+            center, _ = _beam_center_pixels(old_shape[-2:], beam, result['reciprocal_conv_factor'])
+            old_mid = (np.asarray(old_shape[-2:]) - 1) / 2
+            new_mid = (np.asarray(new_shape[-2:]) - 1) / 2
+            # Array rows point down; positive SciPy angles are Cartesian CCW.
+            new_center = _rotation_matrix(angle_degrees) @ (np.asarray(center) - old_mid) + new_mid
+            result['center_beam_metadata'] = _center_beam_metadata_from_pixels(
+                beam['radius_px'], new_center, new_shape[-2:],
+                units=result['reciprocal_units'], conv_factor=result['reciprocal_conv_factor'],
+                source='rotation', parent_source=beam.get('source'),
+            )
+    return result
+
+
+_GEOMETRY_OPERATIONS = {'resize': _resized_data_metadata, 'crop': _cropped_data_metadata,
+                        'flip': _flipped_data_metadata, 'rotation': _rotated_data_metadata}
+
+
+def _transform_geometry(metadata, old_shape, new_shape, operation, **kwargs):
+    """Dispatch operation-specific metadata rules; unsupported operations fail."""
+    if operation == 'values':
+        if tuple(old_shape) != tuple(new_shape):
+            raise ValueError('Value-only geometry preservation requires unchanged shape.')
+        return _resized_data_metadata(metadata, old_shape, old_shape, 'real', 'area')
+    if operation not in _GEOMETRY_OPERATIONS:
+        raise ValueError(f'Unsupported geometry operation: {operation}.')
+    if operation == 'flip':
+        if tuple(old_shape) != tuple(new_shape):
+            raise ValueError('Axis flips cannot change shape.')
+        return _flipped_data_metadata(metadata, old_shape, **kwargs)
+    return _GEOMETRY_OPERATIONS[operation](metadata, old_shape, new_shape, **kwargs)
+
 
 def _polar_grid(metadata, shape):
     """Resolve uniform sample coordinates separately from polar support."""

@@ -1,5 +1,14 @@
 # Data Model
 
+Geometry updates are operation-specific: crop, resize, axis flip and diffraction
+rotation share one internal dispatcher. Value-only preservation requires the
+same shape. Scan origin/spacing, beam centers, polar/cepstral axes and R/Q frames
+are updated together or explicitly invalidated when they no longer represent
+the data. A current stored beam center takes precedence over historical
+mean-fit coordinates; stale shapes are rejected rather than used silently.
+This implementation is private and does not require users to construct a new
+geometry class.
+
 `HyperData` treats the final two axes as an image or diffraction pattern.
 For a 4D-STEM scan, the convention is `(Ry, Rx, Ky, Kx)`: two real-space
 scan coordinates followed by two reciprocal-space detector coordinates.
@@ -33,3 +42,19 @@ Value-only methods generally return a new object rather than altering the
 input. Geometric operations can change calibration or invalidate metadata
 that no longer describes the result. Inspect the method's return value and
 metadata before chaining a shape-changing operation.
+
+## In-Memory Objects and Disk-Backed Sources
+
+`HyperData(path)` loads pixels into RAM. `HyperData.open(path)` instead owns
+a read-only `DiffractionSource` for a 3D/4D file within a `with` block. Its
+shape, dtype and descriptive/calibration metadata are available without
+reading the detector array. `get_dp()` returns a pattern or bounded reduction;
+`iter_chunks()` returns independent, calibrated in-memory HyperData blocks.
+Only `load()` deliberately materializes the complete array, including saved
+unfolding undo payloads. Closing the source invalidates future reads but not
+objects already returned.
+
+This separation prevents implicit full-array conversions from looking like
+lazy analysis. Global tensor decompositions are still in-memory operations.
+See [I/O and calibration](../guides/io-and-calibration.md) for formats,
+memory-budget semantics and explicit full loading.

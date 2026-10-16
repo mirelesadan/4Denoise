@@ -143,26 +143,9 @@ def _reframe_rq_calibration(value, *, real=None, reciprocal=None):
 
 
 def _rq_center(shape, metadata=None, conv_factor=None):
-    """Resolve a rotation pivot without rounding an even-sized image center."""
-    if metadata is not None:
-        if not isinstance(metadata, dict):
-            raise ValueError("center_beam_metadata must be a dictionary or None.")
-        if 'shape' in metadata:
-            try:
-                stored_shape = tuple(metadata['shape'])
-            except TypeError as exc:
-                raise ValueError("center_beam_metadata has an invalid shape.") from exc
-            if stored_shape != tuple(shape):
-                raise ValueError("center_beam_metadata has a stale pattern shape; update it first.")
-        for key in ('center_px', 'mean_fit_center_px'):
-            if metadata.get(key) is not None:
-                return _pair(metadata[key], key), key
-        if metadata.get('center_calibrated') is not None:
-            factor = metadata.get('conv_factor', conv_factor)
-            factor = _finite_number(factor, 'center calibration factor', positive=True)
-            center = _pair(metadata['center_calibrated'], 'center_calibrated')
-            return _calibrated_center_to_pixels(center, factor, shape), 'center_calibrated'
-    return tuple((size - 1) / 2.0 for size in shape), 'image midpoint'
+    """Use the shared canonical beam pivot for R/Q registration."""
+    from fourdenoise_geometry import _beam_center_pixels
+    return _beam_center_pixels(shape, metadata, conv_factor)
 
 
 def _prepare_image(image, options, name, *, reciprocal=False):
