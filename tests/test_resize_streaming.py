@@ -16,6 +16,7 @@ from skimage import transform
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import fourdenoise as fd
+import fourdenoise_streaming as streaming
 import fourdenoise_resampling as resampling
 
 
@@ -264,7 +265,7 @@ class DiskResizeTests(unittest.TestCase):
             kwargs['out'][0, 0, 0, 0] = -1
             raise RuntimeError('injected failure after starting output')
 
-        with patch.object(fd, '_resize_array', side_effect=fail), self.assertRaisesRegex(RuntimeError, 'injected'):
+        with patch.object(streaming, '_resize_array', side_effect=fail), self.assertRaisesRegex(RuntimeError, 'injected'):
             fd.HyperData.resize_hdf5(self.source, output, (3, 4), 'real', overwrite=True, progress=False)
         self.assertEqual(output.read_bytes(), b'original destination')
         self.assertEqual(list(self.folder.glob('.output.h5.*.tmp')), [])

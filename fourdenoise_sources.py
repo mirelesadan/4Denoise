@@ -17,6 +17,7 @@ import numpy as np
 
 from fourdenoise_geometry import (
     _center_beam_metadata_from_pixels, _normalize_real_origin, _real_spacing_pair,
+    _polar_grid, _polar_spec,
 )
 from fourdenoise_io import (
     _HYPERDATA_HDF5_FORMAT, _checked_hyperdata_format_version,
@@ -28,6 +29,8 @@ from fourdenoise_reductions import (
 )
 from fourdenoise_traversals import _clone_unfold_metadata
 from fourdenoise_detectors import _virtual_image
+from fourdenoise_resampling import _normalize_resize_shape
+from fourdenoise_streaming import _stream_resize, _stream_transform
 
 
 _SOURCE_METADATA_KEYS = (
@@ -77,6 +80,14 @@ def _source_metadata(metadata, overrides, hyperdata_type, pattern_shape):
                 units=result['reciprocal_units'], conv_factor=result['reciprocal_conv_factor'],
             ))
     return result
+
+
+def _interpolation_options(order, clip):
+    """Reject invalid interpolation options before reading a probe pattern."""
+    if isinstance(order, (bool, np.bool_)) or not isinstance(order, Integral) or not 0 <= order <= 5:
+        raise ValueError('order must be an integer from 0 to 5.')
+    if not isinstance(clip, (bool, np.bool_)):
+        raise ValueError('clip must be a boolean.')
 
 
 def _chunk_lengths(shape, chunk_shape, dtype, working_memory_mb):
@@ -131,6 +142,11 @@ class DiffractionSource:
     loads the complete dataset. There is deliberately no public ``array``
     property or implicit NumPy conversion. This is disk-backed reading, not
     a promise that all analysis or denoising methods execute lazily.
+
+    ``to_polar``, ``to_cartesian``, ``resize`` and fixed ``remove_bg`` write
+    directly to a distinct, metadata-preserving file and return its path.
+    They borrow this source without closing it and never allocate a complete
+    numerical output in RAM. Global tensor denoising is not implicitly chunked.
 
     ``metadata`` returns a defensive copy of descriptive/calibration records.
     Large unfolding undo payloads are deferred until ``load`` and are not
@@ -412,6 +428,147 @@ class DiffractionSource:
                 self._hyperdata_type,
                 polar_metadata=self._metadata.get('polar_metadata'),
             ),
+        )
+
+    def to_polar(self, center=None, r_max=None, output_shape=None, order=1,
+                 fill_value=0.0, clip=False, *, destination, working_memory_mb=None,
+                 chunk_shape=None, compression='gzip', compression_opts=4,
+                 overwrite=False, atomic=True, progress=True):
+        """Convert Cartesian patterns directly into a saved polar dataset.
+
+        ``center``, ``r_max``, ``output_shape``, ``order``, ``fill_value`` and
+        ``clip`` have the same meanings as :meth:`fourdenoise.HyperData.to_polar`.
+        In particular center/radius are Cartesian pixels, and the default
+        center is the subpixel image midpoint. No fitting or hidden alignment
+        is performed. The saved data retains scan calibration/origin,
+        acquisition and R/Q records; polar metadata replaces Cartesian
+        detector geometry as in the in-memory method.
+
+        ``destination`` is a distinct .4denoise/.h5/.hdf5/.hdf path; no suffix
+        adds .4denoise. Return its path, not an eager HyperData. Read each
+        pattern once, with one optional progress bar. ``working_memory_mb``
+        (default 256 MiB) budgets numerical blocks/interpolation work plus one
+        declared Rosetta reader chunk. Metadata, caches, allocator overhead,
+        caller-owned arrays and plotting are excluded. ``chunk_shape`` can
+        further limit scan positions per block; the memory budget still wins.
+
+        Atomic output is the default: failures preserve an existing file and
+        remove the temporary sibling. Replacing a destination requires
+        ``overwrite=True``. ``atomic=False`` allows incomplete output on error.
+        The source stays open on success/failure and is never modified.
+        """
+        self._require_open()
+        if self._metadata.get('polar_metadata') is not None or self._metadata.get('cepstral_metadata') is not None:
+            raise ValueError('to_polar requires Cartesian diffraction data.')
+        _interpolation_options(order, clip)
+        center, r_max, pattern_shape = _polar_spec(self.pattern_shape, center, r_max, output_shape)
+        return _stream_transform(
+            self, destination, transform=lambda block: block.to_polar(
+                center=center, r_max=r_max, output_shape=pattern_shape, order=order,
+                fill_value=fill_value, clip=clip, progress=False,
+            ), output_pattern_shape=pattern_shape, working_memory_mb=working_memory_mb,
+            chunk_shape=chunk_shape, compression=compression, compression_opts=compression_opts,
+            overwrite=overwrite, atomic=atomic, progress=progress,
+        )
+
+    def to_cartesian(self, output_shape=None, center=None, order=1,
+                     fill_value=0.0, clip=False, *, destination,
+                     working_memory_mb=None, compression='gzip', compression_opts=4,
+                     overwrite=False, atomic=True, progress=True):
+        """Convert saved polar patterns directly into a Cartesian saved file.
+
+        Numerical/coordinate options match :meth:`fourdenoise.HyperData.to_cartesian`.
+        None uses a square of side 2*n_r; ``output_shape='original'`` uses
+        the stored Cartesian canvas/center. Missing cropped annuli/sectors
+        stay filled and only a complete angular domain wraps. Valid polar
+        metadata is required; plain NumPy or vendor pixels do not imply it.
+        The output recalibrates Cartesian detector pixels from the radial
+        scale and retains unchanged scan/acquisition/R/Q metadata.
+
+        Destination, memory budget, compression, atomic publication and source
+        ownership follow :meth:`to_polar`. Return a path, not a full RAM array.
+        """
+        self._require_open()
+        metadata = self._metadata.get('polar_metadata')
+        if metadata is None:
+            raise ValueError('to_cartesian requires saved polar metadata.')
+        _polar_grid(metadata, self.pattern_shape)
+        _interpolation_options(order, clip)
+        if output_shape is None:
+            pattern_shape = (2 * self.pattern_shape[0],) * 2
+        elif isinstance(output_shape, str):
+            if output_shape.lower() != 'original' or metadata.get('cartesian_shape') is None:
+                raise ValueError("output_shape='original' requires a stored Cartesian shape.")
+            pattern_shape = _normalize_resize_shape(metadata['cartesian_shape'], 2)
+        else:
+            pattern_shape = _normalize_resize_shape(output_shape, 2)
+        return _stream_transform(
+            self, destination, transform=lambda block: block.to_cartesian(
+                output_shape=output_shape, center=center, order=order,
+                fill_value=fill_value, clip=clip, progress=False,
+            ), output_pattern_shape=pattern_shape, working_memory_mb=working_memory_mb,
+            compression=compression, compression_opts=compression_opts,
+            overwrite=overwrite, atomic=atomic, progress=progress,
+        )
+
+    def resize(self, shape, domain, method='area', *, destination,
+               working_memory_mb=None, compression='gzip', compression_opts=4,
+               overwrite=False, atomic=True, progress=True):
+        """Resize scan or detector axes into a saved file without seams.
+
+        Shape/domain/method follow :meth:`fourdenoise.HyperData.resize`:
+        real-space resizing supports a 2D 4D scan or the leading axis of a 3D
+        stack; reciprocal resizing changes the final two axes. Area mode
+        downsamples; linear/nearest also upsample. Fractional bins and
+        interpolation halos use global coordinates across processing blocks,
+        not independent local resizes. Polar reciprocal resizing retains the
+        correct sample origins, radial scale and angular periodicity.
+
+        Geometry/calibration are updated identically to in-memory resize.
+        Return a saved path. Memory/publication/compression controls and source
+        ownership follow :meth:`to_polar`. The budget includes one declared
+        Rosetta reader chunk plus tiled numerical work buffers. Unfolding undo
+        payloads are not preserved by this geometry-changing operation.
+        """
+        return _stream_resize(
+            self, destination, shape, domain, method, working_memory_mb=working_memory_mb,
+            compression=compression, compression_opts=compression_opts,
+            overwrite=overwrite, atomic=atomic, progress=progress,
+        )
+
+    def remove_bg(self, background, bg_frac=1, a_min=1, a_max=None, *,
+                  destination, working_memory_mb=None, compression='gzip',
+                  compression_opts=4, overwrite=False, atomic=True, progress=True):
+        """Subtract one fixed detector-sized background directly into a saved file.
+
+        ``background`` is a 2D array or ReciprocalSpace matching pattern_shape.
+        ``bg_frac`` and clipping limits match :meth:`fourdenoise.HyperData.remove_bg`;
+        set ``a_min=None`` to disable lower clipping. No global background
+        estimation, residual inference or denoising is approximated per block.
+        Estimate any common background explicitly first. Coordinate/acquisition
+        metadata is retained; partial-block unfolding undo data is omitted.
+
+        Return a saved path. Destination, numerical memory budget, compression,
+        atomic publication and source ownership follow :meth:`to_polar`. The
+        caller's background array is excluded from the budget and never changed.
+        """
+        self._require_open()
+        background = np.asarray(background.array if isinstance(background, self._reciprocal_type) else background)
+        if background.shape != self.pattern_shape:
+            raise ValueError(f'background must have shape {self.pattern_shape}.')
+        if background.dtype.kind not in 'biufc':
+            raise TypeError('background must contain numeric or Boolean values.')
+        fraction = np.asarray(bg_frac)
+        if fraction.ndim != 0 or fraction.dtype.kind not in 'iuf' or not np.isfinite(fraction) or not 0 <= fraction <= 1:
+            raise ValueError('bg_frac must be a finite number between 0 and 1.')
+        if a_min is not None and a_max is not None and a_min > a_max:
+            raise ValueError('a_min must be less than or equal to a_max.')
+        return _stream_transform(
+            self, destination, transform=lambda block: block.remove_bg(
+                background, bg_frac=bg_frac, a_min=a_min, a_max=a_max,
+            ), output_pattern_shape=self.pattern_shape, working_memory_mb=working_memory_mb,
+            compression=compression, compression_opts=compression_opts,
+            overwrite=overwrite, atomic=atomic, progress=progress,
         )
 
     def _make_block(self, array, scan_slices):

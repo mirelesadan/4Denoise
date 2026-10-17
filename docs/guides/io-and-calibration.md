@@ -370,6 +370,59 @@ and other library workspaces, metadata and OS caches remain outside the budget.
 The source closes discoverable owned file handles, blocks all later reads, and
 keeps returned patterns and chunks independent of those resources.
 
+## Source-to-File Processing
+
+An opened source can process a complete dataset into a saved `.4denoise`
+file without a complete numerical input or output array in RAM. The same
+interface applies to NumPy, native HDF5 and supported RosettaSciIO sources:
+
+```python
+with HyperData.open("experiment.dm4") as source:
+    polar_path = source.to_polar(
+        output_shape=(64, 360), destination="polar.4denoise",
+        working_memory_mb=64, progress=True,
+    )
+
+with HyperData.open(polar_path) as polar_source:
+    cartesian_path = polar_source.to_cartesian(
+        output_shape="original", destination="cartesian.4denoise",
+        working_memory_mb=64,
+    )
+```
+
+Pass reader/dataset/axis-order options and calibration overrides to
+`HyperData.open(...)`, not to each transform. The saved output retains
+descriptive acquisition metadata, scan origin/calibration and applicable R/Q
+records. Coordinate metadata follows the corresponding in-memory operation:
+polar conversion creates radial/angular geometry, Cartesian conversion
+restores its detector calibration, and resizing updates the affected axes.
+No R/Q calibration or beam center is inferred from an unknown vendor field.
+
+These methods **return paths**, not eager `HyperData` objects, and require
+an explicit `destination`. Open the result with `HyperData.open(path)` for
+bounded access; `HyperData(path)` intentionally loads it into RAM. Sources
+remain open after the method returns or raises. The enclosing `with` block
+still owns their lifetime, and neither pixels nor source metadata are mutated.
+
+`to_polar`/`to_cartesian`/`remove_bg` process independent patterns with one
+optional progress bar. `resize` uses global coordinates rather than resampling
+each block separately. `working_memory_mb` defaults to 256 MiB and budgets
+numerical buffers/interpolation work plus one declared Rosetta reader chunk.
+For per-pattern transforms, an insufficient budget fails before reading the
+probe. `chunk_shape` can further limit `to_polar` blocks. Metadata, caller-owned
+arrays, allocator overhead and library/OS caches remain outside the budget;
+this is not a process-RAM limit. Large library workspaces may need more RAM.
+
+Writes use the normal metadata-preserving save schema and are atomic by
+default. A failed atomic write removes its temporary sibling and leaves an
+existing destination intact. Replacing a file requires `overwrite=True`.
+The source itself, symlinks to it and hardlinks to it are invalid destinations.
+Atomic replacement needs disk space for both old and new outputs.
+`atomic=False` explicitly permits an incomplete destination after failure.
+
+The HDF5-specific class methods remain available and delegate to this same
+implementation. Use the source methods for format-independent workflows.
+
 ## Memory-Budgeted Resizing
 
 `HyperData.resize()` and `RealSpace.resize()` use one tiled numerical engine:
@@ -398,11 +451,12 @@ use the disk-output path instead. Too-small budgets raise an informative error
 before allocating the complete output.
 
 ```python
-saved_path = HyperData.resize_hdf5(
-    "experiment.h5", "resized.4denoise", (64, 64), domain="real",
-    method="area", working_memory_mb=64, progress=True,
-)
-with HyperData.open_hdf5(saved_path) as resized_source:
+with HyperData.open("experiment.h5") as source:
+    saved_path = source.resize(
+        (64, 64), domain="real", method="area", destination="resized.4denoise",
+        working_memory_mb=64, progress=True,
+    )
+with HyperData.open(saved_path) as resized_source:
     mean_pattern = resized_source.get_dp(working_memory_mb=64)
 ```
 
@@ -425,21 +479,22 @@ result into RAM. Atomic overwrites need space for both old and new outputs.
 Saved polar data can be converted without holding the full Cartesian output:
 
 ```python
-cartesian_path = HyperData.to_cartesian_hdf5(
-    "polar.4denoise", "cartesian.4denoise",
-    output_shape="original", working_memory_mb=256,
-)
-background_path = HyperData.remove_bg_hdf5(
-    "cartesian.4denoise", "background-corrected.4denoise",
-    background=background_dp, bg_frac=0.8, a_min=None,
-    working_memory_mb=64,
-)
+with HyperData.open("polar.4denoise") as source:
+    cartesian_path = source.to_cartesian(
+        output_shape="original", destination="cartesian.4denoise",
+        working_memory_mb=256,
+    )
+with HyperData.open(cartesian_path) as source:
+    background_path = source.remove_bg(
+        background_dp, bg_frac=0.8, a_min=None,
+        destination="background-corrected.4denoise", working_memory_mb=64,
+    )
 ```
 
-`to_cartesian_hdf5()` requires saved polar metadata and uses the same radius,
+The source's `to_cartesian()` requires saved polar metadata and uses the same radius,
 angle, interpolation, support-fill and output-calibration rules as
 `to_cartesian()`. None chooses `(2*n_r, 2*n_r)`; `"original"` uses its recorded
-Cartesian canvas. `remove_bg_hdf5()` accepts a fixed 2D background matching the
+Cartesian canvas. The source's `remove_bg()` accepts a fixed 2D background matching the
 diffraction axes, not a scan-shaped background stack. Estimate that background
 explicitly first; inferred global/residual backgrounds are not recomputed on
 independent blocks.
@@ -451,7 +506,7 @@ destinations. An insufficient one-pattern workspace budget fails before the
 probe transform. Coordinate/interpolation workspaces, conversion and input/
 output blocks are budgeted; caller data/background, metadata, allocator
 overhead and HDF5 caches are excluded. The estimate is conservative, so the
-required minimum may exceed measured allocations. Use `open_hdf5()` for
+required minimum may exceed measured allocations. Use `HyperData.open()` for
 bounded access to the saved result.
 
 Only independent per-pattern transforms are streamed this way. Splitting

@@ -216,6 +216,7 @@ from fourdenoise_resampling import _normalize_resize_shape, _resize_array, _resi
 from fourdenoise_strain import _StrainFitEngine, _match_peak_candidates, _validate_matching_parameters
 from fourdenoise_streaming import _stream_transform
 from fourdenoise_sources import DiffractionSource, _open_diffraction_source
+from fourdenoise_geometry import _polar_spec
 from fourdenoise_detectors import _virtual_image
 from fourdenoise_rosetta import unpack_reader_metadata
 from fourdenoise_metadata import (
@@ -3831,7 +3832,7 @@ class HyperData:
 
     @classmethod
     def to_polar_hdf5(cls, source, destination, *, hdf5_dataset=None,
-                      chunk_shape=8, center=None, r_max=None,
+                      chunk_shape=8, working_memory_mb=None, center=None, r_max=None,
                       output_shape=None, order=1, fill_value=0.0,
                       clip=False, compression='gzip', compression_opts=4,
                       overwrite=False, atomic=True, progress=True):
@@ -3841,6 +3842,10 @@ class HyperData:
         transform as :meth:`to_polar`, and write each result directly into a
         chunked HyperData HDF5 file. ``chunk_shape`` bounds the number of scan
         positions held in memory; it is a scalar or one value per scan axis.
+        ``working_memory_mb`` further bounds numerical interpolation workspace
+        (default 256 MiB). For NumPy/Rosetta sources and explicit calibration,
+        open a source with ``HyperData.open(...)`` and call
+        ``source.to_polar(destination=...)`` inside the with block.
         The saved result can be opened with ``HyperData.open_hdf5`` for later
         bounded-memory access or loaded fully with ``HyperData(destination)``.
         The destination must differ from the source. Atomic output is the
@@ -3850,112 +3855,14 @@ class HyperData:
         and interpolation meanings. ``hdf5_dataset`` selects an array from a
         generic HDF5 file; saved HyperData files use ``/array`` automatically.
         """
-        source_path = Path(source).expanduser()
-        destination_path = Path(destination).expanduser()
-        if not destination_path.suffix:
-            destination_path = destination_path.with_suffix('.4denoise')
-        if destination_path.suffix.lower() not in {
-            '.4denoise', '.h5', '.hdf5', '.hdf',
-        }:
-            raise ValueError(
-                "destination must end in .4denoise, .h5, .hdf5, or .hdf."
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.to_polar(
+                center=center, r_max=r_max, output_shape=output_shape, order=order,
+                fill_value=fill_value, clip=clip, destination=destination,
+                working_memory_mb=working_memory_mb, chunk_shape=chunk_shape,
+                compression=compression, compression_opts=compression_opts,
+                overwrite=overwrite, atomic=atomic, progress=progress,
             )
-        if source_path.resolve() == destination_path.resolve():
-            raise ValueError("source and destination must be different files.")
-        if destination_path.exists() and not overwrite:
-            raise FileExistsError(
-                f"'{destination_path}' exists; use overwrite=True to replace it."
-            )
-        if not destination_path.parent.is_dir():
-            raise FileNotFoundError(
-                f"Output directory '{destination_path.parent}' does not exist."
-            )
-        for name, value in (('overwrite', overwrite), ('atomic', atomic), ('progress', progress)):
-            if not isinstance(value, (bool, np.bool_)):
-                raise ValueError(f"{name} must be a boolean.")
-        if compression is not None and not isinstance(compression, str):
-            raise ValueError("compression must be a string or None.")
-
-        temporary_path = None
-        if atomic:
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=f'.{destination_path.name}.', suffix='.tmp',
-                dir=destination_path.parent,
-            )
-            os.close(descriptor)
-            temporary_path = Path(temp_name)
-        write_path = temporary_path or destination_path
-
-        try:
-            with cls.open_hdf5(source_path, hdf5_dataset=hdf5_dataset) as reader:
-                scan_shape = reader.shape[:-2]
-                with h5py.File(write_path, 'w' if atomic or overwrite else 'x') as file:
-                    file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
-                    file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
-                    file.attrs['saved_class'] = 'HyperData'
-                    dataset = None
-                    with tqdm(
-                        total=int(np.prod(scan_shape)),
-                        desc='Diffraction patterns', disable=not progress,
-                    ) as bar:
-                        for scan_slices, block in reader.iter_chunks(chunk_shape):
-                            polar_block = block.to_polar(
-                                center=center, r_max=r_max,
-                                output_shape=output_shape, order=order,
-                                fill_value=fill_value, clip=clip,
-                                progress=False,
-                            )
-                            if dataset is None:
-                                output_pattern_shape = polar_block.shape[-2:]
-                                output_shape_full = scan_shape + output_pattern_shape
-                                dataset = file.create_dataset(
-                                    'array', shape=output_shape_full,
-                                    dtype=polar_block.dtype,
-                                    chunks=(1,) * len(scan_shape) + output_pattern_shape,
-                                    **_hdf5_dataset_kwargs(
-                                        polar_block.array, compression,
-                                        compression_opts,
-                                    ),
-                                )
-                                file.attrs['array_ndim'] = polar_block.ndim
-                                file.attrs['array_dtype'] = str(polar_block.dtype)
-                                metadata = {
-                                    'real_units': polar_block.real_units,
-                                    'real_conv_factor': polar_block.real_conv_factor,
-                                    'real_origin': polar_block.real_origin,
-                                    'reciprocal_units': polar_block.reciprocal_units,
-                                    'reciprocal_conv_factor': polar_block.reciprocal_conv_factor,
-                                    'polar_metadata': polar_block.polar_metadata,
-                                    'unfold_metadata': None,
-                                    'acquisition_metadata': polar_block.acquisition_metadata,
-                                    'center_beam_metadata': None,
-                                    'rq_calibration': (
-                                        polar_block.rq_calibration.to_dict()
-                                        if polar_block.rq_calibration is not None else None
-                                    ),
-                                }
-                                metadata_group = file.create_group('metadata')
-                                metadata_group.attrs['kind'] = 'dict'
-                                for key, value in metadata.items():
-                                    _write_hdf5_value(
-                                        metadata_group, key, value,
-                                        compression=compression,
-                                        compression_opts=compression_opts,
-                                    )
-                            dataset[scan_slices + (slice(None), slice(None))] = polar_block.array
-                            bar.update(int(np.prod(polar_block.scan_shape)))
-                    if dataset is None:
-                        raise ValueError("source has no diffraction patterns to transform.")
-
-            if atomic:
-                if overwrite:
-                    os.replace(temporary_path, destination_path)
-                else:
-                    os.link(temporary_path, destination_path)
-            return str(destination_path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
 
     @classmethod
     def resize_hdf5(cls, source, destination, shape, domain, method='area', *,
@@ -3999,69 +3906,13 @@ class HyperData:
             Saved path. Use open_hdf5 for bounded access; HyperData(path)
             explicitly loads the entire output into RAM.
         """
-        source_path = Path(source).expanduser()
-        destination_path = Path(destination).expanduser()
-        if not destination_path.suffix:
-            destination_path = destination_path.with_suffix('.4denoise')
-        if destination_path.suffix.lower() not in {'.4denoise', '.h5', '.hdf5', '.hdf'}:
-            raise ValueError('destination must be a HyperData/HDF5 file path.')
-        if source_path.resolve() == destination_path.resolve() or (
-            source_path.exists() and destination_path.exists() and source_path.samefile(destination_path)
-        ):
-            raise ValueError('source and destination must be different files.')
-        if destination_path.exists() and not overwrite:
-            raise FileExistsError(f"'{destination_path}' exists; use overwrite=True to replace it.")
-        if not destination_path.parent.is_dir():
-            raise FileNotFoundError(f"Output directory '{destination_path.parent}' does not exist.")
-        for name, value in (('overwrite', overwrite), ('atomic', atomic), ('progress', progress)):
-            if not isinstance(value, (bool, np.bool_)):
-                raise ValueError(f'{name} must be a boolean.')
-        if compression is not None and not isinstance(compression, str):
-            raise ValueError('compression must be a string or None.')
-        temporary_path = None
-        try:
-            with cls.open_hdf5(source_path, hdf5_dataset=hdf5_dataset) as reader:
-                axes, full_output_shape = _resize_spec(reader.shape, shape, domain)
-                method = method.lower() if isinstance(method, str) else method
-                polar = reader._metadata.get('polar_metadata') if domain.lower() == 'reciprocal' else None
-                plan = _resize_plan(reader.shape, reader.dtype, full_output_shape, axes, method,
-                                    working_memory_mb=working_memory_mb, polar_metadata=polar)
-                metadata = deepcopy(reader._metadata)
-                metadata.update(_transform_geometry(metadata, reader.shape, full_output_shape, 'resize', domain=domain.lower(), method=method))
-                metadata['unfold_metadata'] = None
-                if atomic:
-                    descriptor, temp_name = tempfile.mkstemp(prefix=f'.{destination_path.name}.', suffix='.tmp', dir=destination_path.parent)
-                    os.close(descriptor)
-                    temporary_path = Path(temp_name)
-                write_path = temporary_path or destination_path
-                with h5py.File(write_path, 'w' if atomic or overwrite else 'x') as file:
-                    file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
-                    file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
-                    file.attrs['saved_class'] = 'HyperData'
-                    file.attrs['array_ndim'] = len(full_output_shape)
-                    file.attrs['array_dtype'] = str(plan['result_dtype'])
-                    options = {} if compression is None else {'compression': compression}
-                    if compression is not None and compression_opts is not None:
-                        options['compression_opts'] = compression_opts
-                    output = file.create_dataset('array', shape=full_output_shape,
-                                                 dtype=plan['result_dtype'], chunks=True, **options)
-                    with tqdm(total=prod(full_output_shape), desc='Resizing', unit='pixels', disable=not progress) as bar:
-                        _resize_array(reader._dataset, full_output_shape, axes, method,
-                                      working_memory_mb=working_memory_mb, polar_metadata=polar,
-                                      out=output, on_tile=bar.update)
-                    group = file.create_group('metadata')
-                    group.attrs['kind'] = 'dict'
-                    for key, value in metadata.items():
-                        _write_hdf5_value(group, key, value, compression=compression, compression_opts=compression_opts)
-            if atomic:
-                if overwrite:
-                    os.replace(temporary_path, destination_path)
-                else:
-                    os.link(temporary_path, destination_path)
-            return str(destination_path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.resize(
+                shape, domain, method, destination=destination,
+                working_memory_mb=working_memory_mb, compression=compression,
+                compression_opts=compression_opts, overwrite=overwrite,
+                atomic=atomic, progress=progress,
+            )
 
     @classmethod
     def to_cartesian_hdf5(cls, source, destination, *, hdf5_dataset=None,
@@ -4085,26 +3936,13 @@ class HyperData:
         must differ. Set progress=False to suppress the single outer bar.
         """
         with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
-            metadata = reader._metadata.get('polar_metadata')
-            if metadata is None:
-                raise ValueError('to_cartesian_hdf5 requires saved polar metadata.')
-            if output_shape is None:
-                pattern_shape = (2 * reader.shape[-2],) * 2
-            elif isinstance(output_shape, str):
-                if output_shape.lower() != 'original' or metadata.get('cartesian_shape') is None:
-                    raise ValueError("output_shape='original' requires a stored Cartesian shape.")
-                pattern_shape = _normalize_resize_shape(metadata['cartesian_shape'], 2)
-            else:
-                pattern_shape = _normalize_resize_shape(output_shape, 2)
-        return _stream_transform(
-            source, destination, reader_factory=cls.open_hdf5,
-            transform=lambda block: block.to_cartesian(
+            return reader.to_cartesian(
                 output_shape=output_shape, center=center, order=order,
-                fill_value=fill_value, clip=clip, progress=False,
-            ), output_pattern_shape=pattern_shape, working_memory_mb=working_memory_mb,
-            hdf5_dataset=hdf5_dataset, compression=compression, compression_opts=compression_opts,
-            overwrite=overwrite, atomic=atomic, progress=progress,
-        )
+                fill_value=fill_value, clip=clip, destination=destination,
+                working_memory_mb=working_memory_mb, compression=compression,
+                compression_opts=compression_opts, overwrite=overwrite,
+                atomic=atomic, progress=progress,
+            )
 
     @classmethod
     def remove_bg_hdf5(cls, source, destination, background, *, hdf5_dataset=None,
@@ -4127,18 +3965,13 @@ class HyperData:
         publication is the default; overwrite=True permits replacement, and
         source/destination must differ. One optional outer progress bar is used.
         """
-        background = np.asarray(background.array if isinstance(background, ReciprocalSpace) else background)
         with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
-            pattern_shape = reader.shape[-2:]
-            if background.shape != pattern_shape:
-                raise ValueError(f'background must have shape {pattern_shape}.')
-        return _stream_transform(
-            source, destination, reader_factory=cls.open_hdf5,
-            transform=lambda block: block.remove_bg(background, bg_frac=bg_frac, a_min=a_min, a_max=a_max),
-            output_pattern_shape=pattern_shape, working_memory_mb=working_memory_mb,
-            hdf5_dataset=hdf5_dataset, compression=compression, compression_opts=compression_opts,
-            overwrite=overwrite, atomic=atomic, progress=progress,
-        )
+            return reader.remove_bg(
+                background, bg_frac=bg_frac, a_min=a_min, a_max=a_max,
+                destination=destination, working_memory_mb=working_memory_mb,
+                compression=compression, compression_opts=compression_opts,
+                overwrite=overwrite, atomic=atomic, progress=progress,
+            )
 
     def save(self, filename, overwrite=False, compression='gzip',
              compression_opts=4, atomic=True):
@@ -10613,36 +10446,9 @@ class HyperData:
         else:
             raise ValueError("HyperData must be 3D (B×C×D) or 4D (A×B×C×D).")
 
-        # Default center at image midpoint
-        cy = (height - 1) / 2.0
-        cx = (width  - 1) / 2.0
-        if center is not None:
-            cy, cx = center
-            cy = float(cy)
-            cx = float(cx)
-
-        if not (0 <= cy <= height - 1 and 0 <= cx <= width - 1):
-            raise ValueError(
-                "center must lie inside the diffraction pattern bounds."
-            )
-
-        if r_max is None:
-            r_max_used = min(cy, cx, height - 1 - cy, width - 1 - cx)
-        else:
-            r_max_used = float(r_max)
-        if not np.isfinite(r_max_used) or r_max_used <= 0:
-            raise ValueError("r_max must be a positive finite value.")
-
-        # 2) Determine output_shape = (n_r, n_theta)
-        if output_shape is None:
-            n_r = max(1, int(np.ceil(r_max_used)))
-            n_theta = max(4, int(np.ceil(2 * np.pi * r_max_used)))
-        else:
-            n_r, n_theta = output_shape
-            n_r = int(n_r)
-            n_theta = int(n_theta)
-        if n_r <= 0 or n_theta <= 0:
-            raise ValueError("output_shape must contain positive integers.")
+        (cy, cx), r_max_used, (n_r, n_theta) = _polar_spec(
+            (height, width), center, r_max, output_shape,
+        )
 
         # 3) Precompute the polar→Cartesian mapping grid
         #    Radial values from 0 to r_max_used in n_r steps

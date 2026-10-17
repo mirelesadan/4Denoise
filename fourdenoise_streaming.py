@@ -1,4 +1,4 @@
-"""Budgeted, per-pattern transforms from an HDF5 source to an HDF5 file.
+"""Budgeted transforms from any diffraction source to a saved HDF5 file.
 
 This is not a chunking adapter for global denoisers or scan-axis operations.
 The transform must preserve the leading scan axes and act independently on
@@ -7,6 +7,7 @@ this module deliberately never imports ``fourdenoise``.
 """
 
 from copy import deepcopy
+from contextlib import nullcontext
 from math import prod
 from numbers import Integral
 from pathlib import Path
@@ -17,11 +18,12 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-from fourdenoise_geometry import _real_spacing_pair
+from fourdenoise_geometry import _transform_geometry
 from fourdenoise_io import (
     _HYPERDATA_HDF5_FORMAT, _HYPERDATA_HDF5_VERSION, _write_hdf5_value,
 )
 from fourdenoise_reductions import _working_memory_bytes
+from fourdenoise_resampling import _resize_array, _resize_plan, _resize_spec
 
 
 # Separate ordinary source workspace from angular padding, whose cost scales
@@ -114,6 +116,24 @@ def _stream_transform_plan(shape, dtype, output_pattern_shape,
     }
 
 
+def _scan_chunk_limits(scan_shape, chunk_shape):
+    """Validate optional scan-block limits independently of the memory plan."""
+    if chunk_shape is None:
+        return scan_shape
+    if isinstance(chunk_shape, Integral) and not isinstance(chunk_shape, (bool, np.bool_)):
+        lengths = (int(chunk_shape),) * len(scan_shape)
+    else:
+        try:
+            lengths = tuple(chunk_shape)
+        except TypeError as exc:
+            raise ValueError('chunk_shape must contain positive integers.') from exc
+    if len(lengths) != len(scan_shape) or any(
+        isinstance(n, (bool, np.bool_)) or not isinstance(n, Integral) or n < 1 for n in lengths
+    ):
+        raise ValueError(f'chunk_shape must contain {len(scan_shape)} positive integer(s).')
+    return tuple(min(int(n), size) for n, size in zip(lengths, scan_shape))
+
+
 def _remaining_scan_slices(scan_shape, chunk_shape):
     """Cover the scan exactly once, excluding the already-written origin probe."""
     if len(scan_shape) == 1:
@@ -133,23 +153,14 @@ def _transformed_block(reader, scan_slices, transform, output_pattern_shape,
                        output_dtype=None):
     """Read one basic slice and construct the same calibrated block as the reader.
 
-    The reader protocol is HyperData.open_hdf5's context-managed reader:
-    shape, dtype, _dataset, _metadata and _hyperdata_type. Direct slices avoid
+    The reader protocol is HyperData.open's context-managed DiffractionSource.
+    An independent copy prevents transforms from mutating a NumPy mapping.
+    Direct slices avoid
     the iter_chunks generator retaining a previous input during the next read.
     """
-    metadata = dict(reader._metadata)
-    origin = metadata.get('real_origin', (0.0, 0.0))
-    if len(scan_slices) == 2:
-        steps = _real_spacing_pair(metadata.get('real_conv_factor'))
-        origin = tuple(
-            value + selection.start * step
-            for value, selection, step in zip(origin, scan_slices, steps)
-        )
-    metadata['real_origin'] = origin
-    metadata.pop('unfold_metadata', None)
-    block = reader._hyperdata_type(
-        reader._dataset[scan_slices + (slice(None), slice(None))], **metadata,
-    )
+    reader._require_open()
+    array = np.array(reader._dataset[scan_slices + (slice(None), slice(None))], copy=True)
+    block = reader._make_block(array, scan_slices)
     transformed = transform(block)
     if not isinstance(transformed, reader._hyperdata_type):
         raise TypeError('transform must return a HyperData object.')
@@ -178,13 +189,111 @@ def _write_block(dataset, reader, scan_slices, transform, output_pattern_shape):
     dataset[scan_slices + (slice(None), slice(None))] = transformed.array
 
 
-def _stream_transform(source, destination, *, reader_factory, transform,
+def _stream_destination(source, destination, *, overwrite, atomic, progress, compression):
+    """Validate publication controls and reject any alias of the source file."""
+    for name, value in (('overwrite', overwrite), ('atomic', atomic), ('progress', progress)):
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'{name} must be a boolean.')
+    if compression is not None and not isinstance(compression, str):
+        raise ValueError('compression must be a string or None.')
+    source, destination = Path(source).expanduser(), Path(destination).expanduser()
+    if not destination.suffix:
+        destination = destination.with_suffix('.4denoise')
+    if destination.suffix.lower() not in {'.4denoise', '.h5', '.hdf5', '.hdf'}:
+        raise ValueError('destination must be a HyperData/HDF5 file path.')
+    if source.resolve() == destination.resolve() or (
+        source.exists() and destination.exists() and source.samefile(destination)
+    ):
+        raise ValueError('source and destination must be different files.')
+    if (destination.exists() or destination.is_symlink()) and not overwrite:
+        raise FileExistsError(f"'{destination}' exists; use overwrite=True to replace it.")
+    if destination.is_dir():
+        raise IsADirectoryError(f"'{destination}' is a directory.")
+    if not destination.parent.is_dir():
+        raise FileNotFoundError(f"Output directory '{destination.parent}' does not exist.")
+    return destination
+
+
+def _create_saved_dataset(file, shape, dtype, metadata, compression, compression_opts, *, chunks=True):
+    """Write the normal HyperData save schema without an eager numerical array."""
+    file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
+    file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
+    file.attrs['saved_class'] = 'HyperData'
+    file.attrs['array_ndim'] = len(shape)
+    file.attrs['array_dtype'] = str(dtype)
+    options = {} if compression is None else {'compression': compression}
+    if compression is not None and compression_opts is not None:
+        options['compression_opts'] = compression_opts
+    dataset = file.create_dataset('array', shape=shape, dtype=dtype, chunks=chunks, **options)
+    group = file.create_group('metadata')
+    group.attrs['kind'] = 'dict'
+    for key, value in metadata.items():
+        _write_hdf5_value(group, key, value, compression=compression, compression_opts=compression_opts)
+    return dataset
+
+
+def _stream_resize(reader, destination, shape, domain, method='area', *,
+                   working_memory_mb=None, compression='gzip', compression_opts=4,
+                   overwrite=False, atomic=True, progress=True):
+    """Resize global scan/detector coordinates into a saved array, never per-block bins.
+
+    Borrow the source without closing it. The tiled resampler spans global
+    fractional bins and halos, including those crossing reader-chunk boundaries.
+    Reserve one Rosetta IO chunk before planning numerical work buffers.
+    """
+    reader._require_open()
+    destination_path = _stream_destination(
+        reader.filename, destination, overwrite=overwrite, atomic=atomic,
+        progress=progress, compression=compression,
+    )
+    axes, full_shape = _resize_spec(reader.shape, shape, domain)
+    domain = domain.lower()
+    effective_memory = reader._reader_working_memory(working_memory_mb)
+    polar = reader._metadata.get('polar_metadata') if domain == 'reciprocal' else None
+    plan = _resize_plan(reader.shape, reader.dtype, full_shape, axes, method,
+                        working_memory_mb=effective_memory, polar_metadata=polar)
+    metadata = reader.metadata
+    metadata.update(_transform_geometry(
+        metadata, reader.shape, full_shape, 'resize', domain=domain, method=plan['method'],
+    ))
+    metadata['unfold_metadata'] = None
+    temporary = None
+    try:
+        if atomic:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f'.{destination_path.name}.', suffix='.tmp', dir=destination_path.parent,
+            )
+            os.close(descriptor)
+            temporary = Path(name)
+        with h5py.File(temporary or destination_path, 'w' if atomic or overwrite else 'x') as file:
+            dataset = _create_saved_dataset(
+                file, full_shape, plan['result_dtype'], metadata, compression, compression_opts,
+            )
+            del metadata
+            with tqdm(total=prod(full_shape), desc='Resizing', unit='pixels', disable=not progress) as bar:
+                _resize_array(reader._dataset, full_shape, axes, plan['method'],
+                              working_memory_mb=effective_memory, polar_metadata=polar,
+                              out=dataset, on_tile=bar.update)
+        if atomic:
+            if overwrite:
+                os.replace(temporary, destination_path)
+            else:
+                os.link(temporary, destination_path)
+        return str(destination_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _stream_transform(source, destination, *, reader_factory=None, transform,
                       output_pattern_shape, working_memory_mb=None,
                       hdf5_dataset=None, compression='gzip', compression_opts=4,
-                      overwrite=False, atomic=True, progress=True):
+                      overwrite=False, atomic=True, progress=True, chunk_shape=None):
     """Write an independent diffraction-pattern transform to disk and return its path.
 
-    ``reader_factory`` is ``HyperData.open_hdf5``. ``transform(block)`` must
+    ``source`` can be an already-open DiffractionSource (borrowed, not closed),
+    or a path with a ``reader_factory`` such as ``HyperData.open``.
+    ``transform(block)`` must
     return HyperData with unchanged scan axes and the supplied diffraction
     shape, a stable numeric dtype, and no internal progress bar. Global scan
     operations and denoisers are not supported. A one-pattern probe discovers
@@ -199,53 +308,48 @@ def _stream_transform(source, destination, *, reader_factory, transform,
     total RAM use. Source/output arrays stay on disk; only current scan blocks
     are held. The default budget is _working_memory_bytes(None)'s 256 MiB.
     Atomic output uses a same-directory temporary file and publishes only
-    after the input reader and output file close. Failed atomic writes remove
+    after the output file closes. Path-owned readers also close before
+    publication; borrowed sources stay open. Failed atomic writes remove
     the temporary file and preserve an existing destination. ``atomic=False``
     explicitly allows an incomplete destination on failure. Existing files
     require ``overwrite=True``; source aliases (including hardlinks) are never
     valid destinations. No eager output object is returned.
     """
-    for name, value in (('overwrite', overwrite), ('atomic', atomic), ('progress', progress)):
-        if not isinstance(value, (bool, np.bool_)):
-            raise ValueError(f'{name} must be a boolean.')
-    if compression is not None and not isinstance(compression, str):
-        raise ValueError('compression must be a string or None.')
-    if not callable(reader_factory) or not callable(transform):
-        raise TypeError('reader_factory and transform must be callable.')
+    opened = not isinstance(source, (str, os.PathLike))
+    if not callable(transform) or (not opened and not callable(reader_factory)):
+        raise TypeError('reader_factory and transform must be callable for path inputs.')
+    if opened:
+        if not callable(getattr(source, '_require_open', None)):
+            raise TypeError('source must be a path or an open DiffractionSource.')
+        source._require_open()
+        if hdf5_dataset is not None or reader_factory is not None:
+            raise ValueError('An opened source already has its reader and dataset selected.')
     output_pattern_shape = _pattern_shape(output_pattern_shape)
     _working_memory_bytes(working_memory_mb)
-    source_path = Path(source).expanduser()
-    destination_path = Path(destination).expanduser()
-    if not destination_path.suffix:
-        destination_path = destination_path.with_suffix('.4denoise')
-    if destination_path.suffix.lower() not in {'.4denoise', '.h5', '.hdf5', '.hdf'}:
-        raise ValueError('destination must be a HyperData/HDF5 file path.')
-    if source_path.resolve() == destination_path.resolve() or (
-        source_path.exists() and destination_path.exists()
-        and source_path.samefile(destination_path)
-    ):
-        raise ValueError('source and destination must be different files.')
-    if (destination_path.exists() or destination_path.is_symlink()) and not overwrite:
-        raise FileExistsError(f"'{destination_path}' exists; use overwrite=True to replace it.")
-    if destination_path.is_dir():
-        raise IsADirectoryError(f"'{destination_path}' is a directory.")
-    if not destination_path.parent.is_dir():
-        raise FileNotFoundError(f"Output directory '{destination_path.parent}' does not exist.")
+    source_path = Path(source.filename if opened else source).expanduser()
+    destination_path = _stream_destination(
+        source_path, destination, overwrite=overwrite, atomic=atomic,
+        progress=progress, compression=compression,
+    )
 
     temporary_path = None
     try:
-        with reader_factory(source_path, hdf5_dataset=hdf5_dataset) as reader:
+        context = nullcontext(source) if opened else reader_factory(source_path, hdf5_dataset=hdf5_dataset)
+        with context as reader:
+            effective_memory = reader._reader_working_memory(working_memory_mb)
+            chunk_limits = _scan_chunk_limits(reader.scan_shape, chunk_shape)
             _stream_transform_plan(
-                reader.shape, reader.dtype, output_pattern_shape, working_memory_mb,
+                reader.shape, reader.dtype, output_pattern_shape, effective_memory,
             )
             scan_shape = tuple(map(int, reader.shape[:-2]))
             first_slices = (slice(0, 1),) * len(scan_shape)
             first = _transformed_block(reader, first_slices, transform, output_pattern_shape)
             output_dtype = first.array.dtype
             plan = _stream_transform_plan(
-                reader.shape, reader.dtype, output_pattern_shape, working_memory_mb,
+                reader.shape, reader.dtype, output_pattern_shape, effective_memory,
                 output_dtype=output_dtype,
             )
+            plan['chunk_shape'] = tuple(min(a, b) for a, b in zip(plan['chunk_shape'], chunk_limits))
             metadata = {key: deepcopy(getattr(first, key)) for key in _METADATA_KEYS}
             metadata['unfold_metadata'] = None
             metadata['rq_calibration'] = (
@@ -262,25 +366,10 @@ def _stream_transform(source, destination, *, reader_factory, transform,
             write_path = temporary_path or destination_path
             with h5py.File(write_path, 'w' if atomic or overwrite else 'x') as file:
                 full_shape = scan_shape + output_pattern_shape
-                file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
-                file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
-                file.attrs['saved_class'] = 'HyperData'
-                file.attrs['array_ndim'] = len(full_shape)
-                file.attrs['array_dtype'] = str(output_dtype)
-                options = {} if compression is None else {'compression': compression}
-                if compression is not None and compression_opts is not None:
-                    options['compression_opts'] = compression_opts
-                dataset = file.create_dataset(
-                    'array', shape=full_shape, dtype=output_dtype,
-                    chunks=(1,) * len(scan_shape) + output_pattern_shape, **options,
+                dataset = _create_saved_dataset(
+                    file, full_shape, output_dtype, metadata, compression, compression_opts,
+                    chunks=(1,) * len(scan_shape) + output_pattern_shape,
                 )
-                group = file.create_group('metadata')
-                group.attrs['kind'] = 'dict'
-                for key, value in metadata.items():
-                    _write_hdf5_value(
-                        group, key, value, compression=compression,
-                        compression_opts=compression_opts,
-                    )
                 del metadata
                 dataset[first_slices + (slice(None), slice(None))] = first.array
                 del first

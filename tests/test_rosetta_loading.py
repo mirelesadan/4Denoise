@@ -164,6 +164,52 @@ class RosettaMockTests(unittest.TestCase):
             with fd.HyperData.open(self.path, reader='DM'):
                 pass
 
+    def test_source_transforms_read_lazy_blocks_and_keep_borrowed_source_open(self):
+        array = self.records[0]['data']
+        with fd.HyperData.open(self.path, real_units='nm', real_conv_factor=(2, -3),
+                               real_origin=(4, 5)) as source:
+            baseline = fd.HyperData(self.values, **source.metadata)
+            path = Path(self.directory.name) / 'transformed.4denoise'
+            with patch.object(source, 'load', side_effect=AssertionError('No full load')):
+                source.to_polar(output_shape=(4, 16), destination=path, chunk_shape=1,
+                                working_memory_mb=0.035, progress=False)
+                expected = baseline.to_polar(output_shape=(4, 16), progress=False)
+                actual = fd.HyperData(path)
+                np.testing.assert_allclose(actual.array, expected.array)
+                self.assertEqual(actual.polar_metadata, expected.polar_metadata)
+                self.assertEqual(actual.acquisition_metadata, baseline.acquisition_metadata)
+                self.assertEqual(actual.real_origin, (4, 5))
+                source.remove_bg(np.full((5, 6), 1.5), a_min=None, destination=path,
+                                 working_memory_mb=0.035, overwrite=True, progress=False)
+                expected = baseline.remove_bg(np.full((5, 6), 1.5), a_min=None)
+                np.testing.assert_allclose(fd.HyperData(path).array, expected.array)
+                source.resize((2, 3), 'real', destination=path, working_memory_mb=0.004,
+                              overwrite=True, progress=False)
+                expected = baseline.resize((2, 3), 'real')
+                actual = fd.HyperData(path)
+                np.testing.assert_allclose(actual.array, expected.array)
+                self.assertEqual(actual.real_conv_factor, expected.real_conv_factor)
+                self.assertEqual(actual.real_origin, expected.real_origin)
+            self.assertFalse(source.closed)
+            self.assertEqual(self.handle.close_count, 0)
+            self.assertGreater(len(array.calls), 2)
+        self.assertEqual(self.handle.close_count, 1)
+
+    def test_transform_reader_chunk_and_workspace_are_both_reserved_before_reads(self):
+        import fourdenoise_streaming as streaming
+        array = self.records[0]['data']
+        path = Path(self.directory.name) / 'too-small.4denoise'
+        with fd.HyperData.open(self.path) as source:
+            plan = streaming._stream_transform_plan(source.shape, source.dtype, (4, 16), 1)
+            minimum = plan['fixed_bytes'] + plan['pattern_bytes']
+            budget = (source.reader_chunk_nbytes + minimum - 16) / 1024 ** 2
+            with self.assertRaisesRegex(ValueError, 'too small'):
+                source.to_polar(output_shape=(4, 16), destination=path, working_memory_mb=budget)
+            with self.assertRaisesRegex(ValueError, 'reader chunk'):
+                source.resize((2, 3), 'real', destination=path, working_memory_mb=0.0001)
+            self.assertEqual(array.calls, [])
+        self.assertFalse(path.exists())
+
     def test_missing_dependency_has_installation_guidance(self):
         original = ros.importlib.import_module
 
@@ -486,6 +532,19 @@ class RosettaRealPluginTests(unittest.TestCase):
             with fd.HyperData.open(path) as source:
                 self.assertEqual(source.shape, values.shape)
                 np.testing.assert_array_equal(source.get_dp(1, 2).array, values[1, 2])
+                baseline = fd.HyperData(values, **source.metadata)
+                streamed = self.folder / 'streamed.4denoise'
+                with patch.object(source, 'load', side_effect=AssertionError('No full load')):
+                    source.to_polar(output_shape=(4, 16), destination=streamed,
+                                    chunk_shape=1, working_memory_mb=1, progress=False)
+                    expected = baseline.to_polar(output_shape=(4, 16), progress=False)
+                    actual = fd.HyperData(streamed)
+                    np.testing.assert_allclose(actual.array, expected.array)
+                    self.assertEqual(actual.acquisition_metadata, baseline.acquisition_metadata)
+                    source.resize((2, 3), 'real', destination=streamed, overwrite=True,
+                                  working_memory_mb=0.01, progress=False)
+                    np.testing.assert_allclose(fd.HyperData(streamed).array,
+                                               baseline.resize((2, 3), 'real').array)
                 loaded = source.load()
                 np.testing.assert_array_equal(loaded.array, values)
                 self.assertEqual(source.metadata['acquisition_metadata']['reader'], 'rsciio.emd')

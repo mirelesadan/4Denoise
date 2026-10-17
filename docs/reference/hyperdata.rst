@@ -40,6 +40,14 @@ Disk-backed source
 
 .. automethod:: fourdenoise.DiffractionSource.virtual_image
 
+.. automethod:: fourdenoise.DiffractionSource.to_polar
+
+.. automethod:: fourdenoise.DiffractionSource.to_cartesian
+
+.. automethod:: fourdenoise.DiffractionSource.resize
+
+.. automethod:: fourdenoise.DiffractionSource.remove_bg
+
 .. automethod:: fourdenoise.DiffractionSource.iter_chunks
 
 .. automethod:: fourdenoise.DiffractionSource.load

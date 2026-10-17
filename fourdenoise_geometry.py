@@ -2,6 +2,7 @@
 
 import numpy as np
 from copy import deepcopy
+from numbers import Integral
 from scipy.ndimage import gaussian_filter, map_coordinates
 
 def _center_beam_metadata_from_pixels(radius_px, center_px, shape, *,
@@ -294,6 +295,45 @@ def _transform_geometry(metadata, old_shape, new_shape, operation, **kwargs):
             raise ValueError('Axis flips cannot change shape.')
         return _flipped_data_metadata(metadata, old_shape, **kwargs)
     return _GEOMETRY_OPERATIONS[operation](metadata, old_shape, new_shape, **kwargs)
+
+
+def _polar_spec(shape, center=None, r_max=None, output_shape=None):
+    """Resolve a Cartesian-to-polar sampling domain without allocating pixels.
+
+    The default center is the subpixel midpoint, and the default radius fits
+    inside the canvas. Returned sizes match HyperData.to_polar defaults.
+    """
+    height, width = shape
+    center = ((height - 1) / 2, (width - 1) / 2) if center is None else center
+    values = np.asarray(center)
+    if values.shape != (2,) or values.dtype.kind not in 'iuf' or not np.all(np.isfinite(values)):
+        raise ValueError('center must contain two finite (y, x) pixel coordinates.')
+    cy, cx = map(float, values)
+    if not (0 <= cy <= height - 1 and 0 <= cx <= width - 1):
+        raise ValueError('center must lie inside the diffraction pattern bounds.')
+    if r_max is None:
+        radius = min(cy, cx, height - 1 - cy, width - 1 - cx)
+    else:
+        value = np.asarray(r_max)
+        if value.ndim != 0 or value.dtype.kind not in 'iuf':
+            raise ValueError('r_max must be a positive finite value.')
+        radius = float(value)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError('r_max must be a positive finite value.')
+    if output_shape is None:
+        sizes = (max(1, int(np.ceil(radius))), max(4, int(np.ceil(2 * np.pi * radius))))
+    else:
+        try:
+            sizes = tuple(output_shape)
+        except TypeError as exc:
+            raise ValueError('output_shape must contain two positive integers.') from exc
+        if len(sizes) != 2 or any(
+            isinstance(size, (bool, np.bool_)) or not isinstance(size, Integral) or size <= 0
+            for size in sizes
+        ):
+            raise ValueError('output_shape must contain two positive integers.')
+        sizes = tuple(map(int, sizes))
+    return (cy, cx), radius, sizes
 
 
 def _polar_grid(metadata, shape):
