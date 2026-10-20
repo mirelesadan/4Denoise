@@ -194,6 +194,7 @@ from fourdenoise_plotting import (
 )
 from fourdenoise_io import (
     _HYPERDATA_HDF5_FORMAT,
+    _PEAK_SCAN_HDF5_FORMAT,
     _HYPERDATA_HDF5_VERSION,
     _HYPERDATA_HDF5_READABLE_VERSIONS,
     _decode_hdf5_value,
@@ -216,6 +217,7 @@ from fourdenoise_resampling import _normalize_resize_shape, _resize_array, _resi
 from fourdenoise_strain import _StrainFitEngine, _match_peak_candidates, _validate_matching_parameters
 from fourdenoise_streaming import _stream_transform
 from fourdenoise_sources import DiffractionSource, _open_diffraction_source
+from fourdenoise_peaks import PeakScanResult, _validate_peak_options
 from fourdenoise_geometry import _polar_spec
 from fourdenoise_detectors import _virtual_image
 from fourdenoise_rosetta import unpack_reader_metadata
@@ -2978,9 +2980,13 @@ def _peak_intensities_from_array(array, r, centers, return_pixel_counts=False):
     for int_idx, radius in enumerate(radii):
         cy, cx = centers[int_idx]
         y0 = max(0, min(array.shape[0], round(cy - (radius + 0.5))))
-        y1 = max(0, min(array.shape[0], round(cy + (radius + 0.5))))
+        y1 = max(0, min(array.shape[0], max(
+            round(cy + (radius + 0.5)), int(np.floor(cy + radius + 1e-10)) + 1,
+        )))
         x0 = max(0, min(array.shape[1], round(cx - (radius + 0.5))))
-        x1 = max(0, min(array.shape[1], round(cx + (radius + 0.5))))
+        x1 = max(0, min(array.shape[1], max(
+            round(cx + (radius + 0.5)), int(np.floor(cx + radius + 1e-10)) + 1,
+        )))
         if y0 >= y1 or x0 >= x1:
             continue
 
@@ -12009,6 +12015,7 @@ class ReciprocalSpace:
                         method='CoM',
                         compute_resBg=False,
                         residual_frac=0.9,
+                        *, _array=None,
                         **resBg_kwargs):
         """
         Integrate Bragg intensities in circular windows around peak centers.
@@ -12017,14 +12024,23 @@ class ReciprocalSpace:
         to the detector boundaries; no pixels wrap around an image edge. When
         subtracting residual background, the correction uses the number of
         pixels actually included in each integration window.
+        The private _array fast path requires supplied centers and does not
+        support residual-background inference; it never changes this object's
+        array, calibration or detector state.
         """
     
+        array = self.array if _array is None else np.asarray(_array)
+        if _array is not None:
+            if array.shape != self.shape or array.ndim != 2 or array.dtype.kind not in 'biuf':
+                raise ValueError('_array must be a real-valued pattern matching the detector shape.')
+            if centers is None or compute_resBg:
+                raise ValueError('_array requires explicit centers and compute_resBg=False.')
         if centers is None:
             centers = self.get_centers(r, ref_coords=ref_coords, method=method)
     
         if compute_resBg:
             ints, pixel_counts = _peak_intensities_from_array(
-                self.array, r, centers, return_pixel_counts=True
+                array, r, centers, return_pixel_counts=True
             )
             res_bg = self.get_residualBg(centers=centers, **resBg_kwargs)
             correction = np.zeros_like(ints)
@@ -12033,7 +12049,7 @@ class ReciprocalSpace:
             )
             ints -= correction * residual_frac
         else:
-            ints = _peak_intensities_from_array(self.array, r, centers)
+            ints = _peak_intensities_from_array(array, r, centers)
                 
         return ints
     
@@ -12347,106 +12363,33 @@ class ReciprocalSpace:
         July 2025
         """
 
-        def _finite_scalar(value, name, *, positive=False, nonnegative=False):
-            if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
-                raise ValueError(f"{name} must be a finite scalar.")
-            try:
-                value = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a finite scalar.") from exc
-            if not np.isfinite(value):
-                raise ValueError(f"{name} must be a finite scalar.")
-            if positive and value <= 0:
-                raise ValueError(f"{name} must be positive.")
-            if nonnegative and value < 0:
-                raise ValueError(f"{name} must be non-negative.")
-            return value
-
         if self.is_polar:
             raise ValueError(
                 "get_peaks requires a Cartesian diffraction pattern; "
                 "convert polar data to Cartesian coordinates first."
             )
         dp = np.asarray(self.array if _array is None else _array)
-        if dp.ndim != 2 or not (
-            np.issubdtype(dp.dtype, np.number)
-            or np.issubdtype(dp.dtype, np.bool_)
-        ) or np.iscomplexobj(dp):
+        if dp.ndim != 2 or dp.dtype.kind not in 'biuf' or np.iscomplexobj(dp):
             raise TypeError("get_peaks requires a real-valued 2D numeric pattern.")
         if dp.shape != self.shape:
             raise ValueError("Peak detector pattern shape differs from its search geometry.")
-        if not isinstance(return_details, (bool, np.bool_)):
-            raise ValueError("return_details must be a Boolean value.")
-
-        radius = _finite_scalar(radius, 'radius', positive=True)
-        trench_width = _finite_scalar(
-            trench_width, 'trench_width', positive=True,
+        parameters = _validate_peak_options(
+            radius, min_distance, trench_width, kernel_amp, trench_amp,
+            threshold_abs, threshold_rel, r_range, n_fold, sym_mode,
+            sym_tolerance_px, center_tolerance_px, orbit_min_fraction,
+            reorder, return_details,
         )
-        kernel_amp = _finite_scalar(kernel_amp, 'kernel_amp')
-        trench_amp = _finite_scalar(trench_amp, 'trench_amp')
-        if kernel_amp <= trench_amp:
-            raise ValueError("kernel_amp must exceed trench_amp.")
-        if isinstance(min_distance, (bool, np.bool_)) or not isinstance(
-            min_distance, (Integral, np.integer)
-        ) or min_distance < 1:
-            raise ValueError("min_distance must be a positive integer.")
-        min_distance = int(min_distance)
-
-        if threshold_abs is not None:
-            threshold_abs = _finite_scalar(threshold_abs, 'threshold_abs')
-        if threshold_rel is not None:
-            threshold_rel = _finite_scalar(
-                threshold_rel, 'threshold_rel', nonnegative=True,
-            )
-            if threshold_rel > 1:
-                raise ValueError("threshold_rel must be between 0 and 1.")
-
+        radius = parameters['radius']
+        min_distance = parameters['min_distance']
+        trench_width = parameters['trench_width']
+        kernel_amp, trench_amp = parameters['kernel_amp'], parameters['trench_amp']
+        threshold_abs, threshold_rel = parameters['threshold_abs'], parameters['threshold_rel']
+        r_range, n_fold = parameters['r_range'], parameters['n_fold']
+        sym_tolerance_px = parameters['sym_tolerance_px']
+        center_tolerance_px = parameters['center_tolerance_px']
+        orbit_min_fraction = parameters['orbit_min_fraction']
         if r_range is not None:
-            try:
-                limits = np.asarray(r_range, dtype=float)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "r_range must be a finite (r_min, r_max) pair."
-                ) from exc
-            if (
-                limits.shape != (2,) or not np.all(np.isfinite(limits))
-                or limits[0] < 0 or limits[0] >= limits[1]
-            ):
-                raise ValueError(
-                    "r_range must satisfy 0 <= r_min < r_max."
-                )
-            r_min, r_max = map(float, limits)
-
-        if n_fold is not None and (
-            isinstance(n_fold, (bool, np.bool_))
-            or not isinstance(n_fold, (Integral, np.integer))
-            or n_fold < 1
-        ):
-            raise ValueError("n_fold must be a positive integer or None.")
-        if not isinstance(sym_mode, str) or sym_mode not in (
-            'none', 'repair', 'prune', 'both'
-        ):
-            raise ValueError(
-                "sym_mode must be 'none', 'repair', 'prune', or 'both'."
-            )
-        if sym_mode != 'none' and (n_fold is None or n_fold < 2):
-            raise ValueError("sym_mode requires n_fold >= 2.")
-        if not isinstance(reorder, (bool, np.bool_)):
-            raise ValueError("reorder must be a Boolean value.")
-        if reorder and (n_fold is None or n_fold < 2):
-            raise ValueError("reorder=True requires n_fold >= 2.")
-        sym_tolerance_px = _finite_scalar(
-            sym_tolerance_px, 'sym_tolerance_px', positive=True,
-        )
-        center_tolerance_px = _finite_scalar(
-            center_tolerance_px, 'center_tolerance_px', nonnegative=True,
-        )
-        orbit_min_fraction = _finite_scalar(
-            orbit_min_fraction, 'orbit_min_fraction', positive=True,
-        )
-        if orbit_min_fraction > 1:
-            raise ValueError("orbit_min_fraction must be in (0, 1].")
-
+            r_min, r_max = r_range
         Cy, Cx = self._peak_search_center(center)
 
         def _enforce_nfold_symmetry(coords, is_valid):

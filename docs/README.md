@@ -1,6 +1,6 @@
-# 4Denoise documentation plan
+# 4Denoise Documentation Maintenance
 
-This is the editorial map for the documentation work, not a user-facing guide
+This is the editorial map and maintenance checklist, not a user-facing guide
 page. The guide entry is `docs/index.md`; the Sphinx/MyST website is published
 at https://mirelesadan.github.io/4Denoise/ from validated `main` commits.
 This plan does not appear in site navigation.
@@ -22,7 +22,8 @@ The documentation serves three audiences:
 
 ## Support boundary
 
-The core guide covers `HyperData`, `RealSpace`, and `ReciprocalSpace` for
+The core guide covers `HyperData`, `DiffractionSource`, `RealSpace`,
+`ReciprocalSpace`, and structured analysis results for
 loading/saving, calibration, preprocessing, visualization, denoising,
 unfolding, peak analysis, and strain results. Explain which operations accept
 2D images, 3D stacks, or 4D scans instead of implying they all accept every
@@ -37,13 +38,15 @@ Private implementation classes and unfinished helpers are not public API.
 | Home | `docs/index.md` | What 4Denoise does; where to begin; links to the guide, API, and study. |
 | Getting started | `docs/getting-started/install.md` | Supported Python environment, core install, optional extras, and import check. |
 | Getting started | `docs/getting-started/quickstart.md` | A short, clean-kernel workflow using the included `mini_dataset_binned.npy`. |
-| Concepts | `docs/concepts/data-model.md` | `(Ry, Rx, Ky, Kx)`, 2D/3D/4D distinctions, units, metadata, and mutation/copy behavior. |
-| Guides | `docs/guides/io-and-calibration.md` | Supported file formats, HDF5 selection/chunks, saving, and coordinate calibration. |
+| Getting started | `docs/getting-started/streaming.md` | An executable full-mini-data source workflow with virtual imaging, peak files, and disk-output polar/Cartesian transforms. |
+| Tutorials | `docs/tutorials/index.md` | Downloadable, independently executable synthetic lessons; only completed notebooks are linked. |
+| Concepts | `docs/concepts/data-model.md` | `(Ry, Rx, Ky, Kx)`, object/return types, units, active geometry versus acquisition records, and memory ownership. |
+| Guides | `docs/guides/io-and-calibration.md` | Native/Rosetta readers, dataset/axis selection, validation boundaries, source-to-file processing, metadata, and saving. |
 | Guides | `docs/guides/visualization.md` | Diffraction patterns, virtual images, real-space views, masks, and polar views. |
 | Guides | `docs/guides/denoising-and-unfolding.md` | Choosing a denoiser, 4D-to-3D traversal, reversible folding, and rank diagnostics. |
 | Guides | `docs/guides/peaks-and-strain.md` | Peak detection/refinement, intensity integration, strain inputs, and interpretation. |
 | API reference | `docs/reference/hyperdata.rst` | Public `HyperData` methods and their exact signatures. |
-| API reference | `docs/reference/views-and-results.rst` | `RealSpace`, `ReciprocalSpace`, `PeakDetectionResult`, and `StrainResult`. |
+| API reference | `docs/reference/views-and-results.rst` | Image views, `PeakDetectionResult`, ragged `PeakScanResult`, Braggness, R/Q, and strain results. |
 | API reference | `docs/reference/utilities.rst` | Selected public standalone functions, including `read_4D` and `plot_traversals`. |
 | Case study | `docs/case-studies/3d-strain-mapping.md` | Data citation, assumptions, processing notebook, reconstruction, and MATLAB GUI. |
 | Help | `docs/troubleshooting.md` | Installation, environment selection, file loading, calibration, and memory issues. |
@@ -68,6 +71,25 @@ can have their own reference page after their supported API is reviewed.
   historical notebook, which still needs migration and full validation.
 - The simulation notebook and MATLAB GUI remain linked from the case study.
   They are not prerequisites for the core quickstart.
+- Curated notebooks in `tutorials/` are small, self-contained lessons using
+  explicitly synthetic data. Tutorial 1 covers loading/calibration,
+  Tutorial 2 covers visualization/virtual detectors on hexagonal patterns,
+  Tutorial 3 covers alignment/coordinate transforms with known motion, and
+  Tutorial 4 covers denoising/unfolding with selectable inputs and diagnostics,
+  Tutorial 5 covers ragged peak analysis and detection-independent Braggness,
+  Tutorial 6 covers strain fitting and verified R/Q reporting, including
+  unequal peak sets, diagnostics, exact tensor checks, and calibrated coordinates.
+  Tutorial 7 covers file-based bounded processing, incremental peak tables,
+  direct-to-disk transforms, global bin-center calibration, and resource safety.
+  All default to synthetic data. Tutorials 1-6 accept a file, array, or existing
+  HyperData without inheriting synthetic calibration; Tutorial 7 deliberately
+  accepts only files and never loads a complete diffraction/peak collection.
+  Tutorials 1-3 keep known-truth exercises separate; Tutorials 4-6 process the selected input
+  throughout and omit reference metrics unless a suitable reference is available.
+  Input-cell branch tests cover supplied arrays/files, metadata, and conflicts.
+  Large-data lesson tests forbid full loads and exercise actual chunk/transform cells.
+  These lessons do not replace the
+  experimental DEMO or claim to validate a new original acquisition.
 - API pages describe supported public classes and functions. Private helpers
   such as `_DenoisingMethods` and `_DenoiseEngine` remain implementation
   details. Signatures and docstrings are the source for API facts; guides
@@ -83,6 +105,13 @@ can have their own reference page after their supported API is reviewed.
   calibration, or keeps cropped-out data only in unfolding metadata.
 - Keep the distinction between an included example, an external dataset, and
   a synthetic illustration visible to the reader.
+- Preserve the distinction between optional reader availability, generated
+  reader fixtures, experimental mini-data smoke tests, and validation of an
+  original microscope acquisition. Do not claim the last from the first three.
+- Document memory budgets as estimates of managed temporary buffers, not
+  process-RAM guarantees. State retained result sizes and explicit full loads.
+- Keep active geometry separate from archived vendor settings. Field names
+  alone are not evidence for a beam center, axis handedness, or R/Q calibration.
 - Preserve the study's attribution and data citation when moving content.
   Avoid embedding multi-gigabyte data or large executed outputs in the site.
 
@@ -110,29 +139,74 @@ Run these from the repository root in an isolated Python 3.11 environment:
 python -m pip install -e ".[docs,docs-test]"
 python -m pip check
 python -m unittest discover -s tests
-python -m sphinx -b html -W --keep-going docs docs/_build/html
-python -m sphinx -b linkcheck -W --keep-going docs docs/_build/linkcheck
 python scripts/execute_demo.py
+python scripts/execute_tutorials.py
+python -m sphinx -b html -W --keep-going docs docs/_build/html
+python scripts/streaming_example.py
+python -m sphinx -b linkcheck -W --keep-going docs docs/_build/linkcheck
 ```
 
 The documentation workflow runs on every pull request and push to `main`.
-`docs-build` treats Sphinx warnings as errors; `docs-links` checks external
+`docs-build` waits for `demo-notebook`, downloads the validated tutorial
+reports from that same workflow run, treats Sphinx warnings as errors, and runs the native streaming
+tutorial on the complete included mini dataset; `docs-links` checks external
 destinations with bounded retries; unavailable HTTP links must not silently
 pass as ignored. The HTML build checks internal document
 references. Fix invalid destinations rather than broadly ignoring failures;
 external sites can also fail temporarily, in which case inspect the report
 before retrying the check.
 
+`scripts/streaming_example.py` is the code displayed through `literalinclude`
+on the streaming tutorial page, not a second hand-maintained copy. It runs
+without optional Rosetta or notebook packages, uses temporary output files
+by default, and never edits input data or research notebooks. Unit tests
+exercise that same function on a small synthetic fixture, reject accidental
+full-source loads, and check output/overwrite/shape contracts. To inspect
+the actual mini-data outputs locally, supply a fresh `--output DIRECTORY`.
+Polar/Cartesian shape restoration is not a claim of numerical invertibility.
+
 GitHub file links without fragments or queries are checked against the same
 file on `raw.githubusercontent.com`, avoiding GitHub HTML-page rate limits.
 Their visible links are unchanged; a missing file still fails with HTTP 404.
 Other external links (including any with anchors) are checked as written.
 
-`demo-notebook` executes only `DEMO_exp_4dstem_ripple_processing.ipynb` and the
-included full mini dataset. It starts a fresh kernel using the runner's Python
+`demo-notebook` executes `DEMO_exp_4dstem_ripple_processing.ipynb` with the
+included full mini dataset and the explicit tutorial registry in
+`scripts/execute_tutorials.py`. It never globs for research notebooks.
+Every notebook starts a separate fresh kernel using the runner's Python
 interpreter, discards cached outputs, and rejects cell errors or skipped code.
 Cells have a 120-second timeout (`--timeout` can override it locally), and each
-CI job has a ten-minute limit. The tracked notebook is never overwritten.
+CI job has a ten-minute limit. Source notebooks are never overwritten.
+
+Tutorial reports go to `docs/_build/tutorials/` and a separate CI artifact,
+including partial output on execution failure. MyST-NB renders complete lessons
+with explanations, code, and static figures under `tutorials/notebooks/` in
+the built site. Overview pages retain their existing URLs and clean notebook
+downloads. Generated notebook sources in `docs/tutorials/notebooks/` are
+ignored by Git; never edit or commit those derived copies.
+
+The shared executor records successful execution, normalized source/code
+fingerprints, output digests, Python, and numerical package versions. An HTML
+build rejects missing, incomplete, stale, changed, or failed reports. Package
+modules, packaging metadata, and execution infrastructure invalidate receipts;
+ordinary guide edits do not. Dependency versions are recorded for traceability,
+not required to match a separate static-rendering environment. These checks
+detect accidental stale artifacts, not maliciously forged reports or an
+invalid scientific model. Keep experimental validation separate.
+
+`scripts/render_tutorials.py` validates all seven reports before updating any
+derived pages, adjusts relative Markdown links, and removes interactive-widget
+payloads from generated copies. It does not execute code or modify source
+notebooks/reports. `nb_execution_mode='off'` is enforced globally and on each
+generated notebook. HTML and other publication builds require executed reports;
+linkcheck uses explicitly source-only copies so it never depends on cached
+figures or starts a kernel. Run HTML after linkcheck to regenerate output-bearing
+sources. Unit tests cover these contracts and are also run in the HTML CI job.
+
+See the [MyST-NB configuration reference](https://myst-nb.readthedocs.io/en/latest/configuration.html)
+for static rendering options. No original acquisition or long research notebook
+is executed to build these pages. Notebook structure/runner contracts and their
+support files are included in installed-wheel testing too.
 
 Download the HTML preview, link report, and executed notebook from the
 workflow's artifacts (retained seven days). On notebook failure, the report

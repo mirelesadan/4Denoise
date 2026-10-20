@@ -1,5 +1,10 @@
 # Concentrated Sharp Diffraction Contrast
 
+For a fresh-kernel example with maps and an explicit formula check, use
+[Tutorial 5](../tutorials/peak-analysis-and-braggness.md). It compares peak
+detection with this separate intensity-based measurement and demonstrates
+reuse of alignment metadata without overwriting the original analysis.
+
 `HyperData.get_braggness()` measures how much sharp positive contrast is
 concentrated in the brightest residual pixels of a detector annulus. It does
 not require peak coordinates and does not compute an FFT or identify a phase.

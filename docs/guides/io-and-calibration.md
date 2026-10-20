@@ -4,6 +4,13 @@ Load an array or a supported file path with `HyperData(...)`. Generic file
 loading preserves stored values by default: clipping below one and repairing
 NaNs are explicit `clip_on_load` and `repair_nans` choices.
 
+For a complete, runnable native-source workflow, use the
+[streaming tutorial](../getting-started/streaming.md). The
+[data model](../concepts/data-model.md) compares return types and retained
+output sizes; opening a file lazily does not make all methods lazy.
+For a guided notebook with generated NumPy/HDF5/MATLAB/raw examples, use
+[Tutorial 1: Loading and calibration](../tutorials/loading-and-calibration.md).
+
 ## Raw Detector Data
 
 For a binary file with known layout, provide the full stored shape and dtype:
@@ -28,8 +35,9 @@ data with two stored metadata rows. Rectangular scans need an explicit
 
 For `.raw` files, `HyperData` looks for **legacy EMPAD XML** files in the same
 directory by default. A sidecar must explicitly name the raw file; its XML
-filename need not match the raw filename. Other metadata formats are not yet
-imported automatically.
+filename need not match the raw filename. This native sidecar loader does not
+interpret other XML families. Optional RosettaSciIO readers have a separate
+[axis-calibration and vendor-metadata path](#calibration-and-metadata).
 
 ```python
 data = HyperData("scan_x256_y256.raw")  # metadata_path="auto" is the default
@@ -249,8 +257,26 @@ EMD/DE5, HyperSpy, EMPAD, FEI, MRC, Blockfile, Ripple, Quantum Detector,
 TIFF, TVIPS and NumPy. This is a curated initial subset, not a promise to
 read every RosettaSciIO format, every vendor variant, or 2D images. Reader
 errors are not hidden and unsupported lazy readers have no eager fallback.
-Actual EMD, HyperSpy and Ripple fixtures are exercised by the optional tests;
-other vendor acquisitions still need validation against your files.
+
+### Reader Support and Validation Boundary
+
+Reader availability is distinct from independent acquisition validation:
+
+| Path | Current evidence | What is not implied |
+| --- | --- | --- |
+| Native NumPy, generic HDF5, saved HyperData | Regression tests cover slicing, reductions, metadata, streamed transforms, and peak extraction | Generic HDF5 attributes are not automatically understood as vendor calibration |
+| Rosetta EMD, HyperSpy, Ripple | Optional tests exercise the actual installed reader/writer plugins and generated fixtures | Every instrument-specific variant has not been validated |
+| Experimental mini data through NumPy and generated EMD | Streamed peaks agree with the eager detector; disk-output and metadata paths have been smoke-tested | The generated EMD is not an original microscope acquisition |
+| Other enabled lazy plugins | Registry/adapter contracts are covered, including selection, axes, ownership, and budgets | Digital Micrograph, EMPAD, FEI, MRC, Blockfile, Quantum Detector, TIFF, and TVIPS acquisitions still need file-specific verification |
+
+For an original acquisition, verify the dataset, y/x ordering, detector
+orientation, dtype/value range, representative patterns, and calibration
+against the acquisition software or a trusted reference. Record the reader
+version and options. Preserved metadata and a successful file open alone do
+not establish physical calibration. A 2D image, unsupported signal layout,
+or eager-only plugin remains outside this source interface.
+
+### Open a Microscopy Source
 
 ```python
 with HyperData.open("scan.dm4") as source:
@@ -303,11 +329,10 @@ with HyperData.open("scan.emd", axis_order=(1, 0, 3, 2)) as source:
 The permutation lists original array indices in target
 `(Ry, Rx, Ky, Kx)` or `(N, Ky, Kx)` order. Reordering happens on selected
 blocks; it never requires transposing or loading the complete source.
-Source `get_dp()` selections default to pixel indices; request
-`selection_units="calibrated"` for physical scan coordinates. After `load()`,
-the resulting HyperData follows its existing `selection_units="auto"` default,
-which uses imported calibration when present. Use `selection_units="pixels"`
-explicitly when selecting scan indices on that loaded object.
+Both source and in-memory `get_dp()` selections default to pixel indices,
+including after `load()`. Request `selection_units="calibrated"` for physical
+scan coordinates, or `"auto"` to use calibration when available. Display
+`axis_units="auto"` is separate and does not change selection units.
 
 ### Calibration and Metadata
 
@@ -344,6 +369,32 @@ decoding works for saved files even when the optional RosettaSciIO/Dask
 packages are not installed. Original acquisition records are descriptive;
 cropping or resizing does not rewrite the vendor's original axes.
 
+### Active Calibration Versus Acquisition Records
+
+Only verified interpretations should drive coordinates and numerical results:
+
+| Record | Active interpretation |
+| --- | --- |
+| Uniform compatible scan axes | Import signed spacing and offsets as scan calibration/origin |
+| Compatible isotropic detector axes | Import positive reciprocal sampling magnitude |
+| Detector axis offset or a vendor field named `center` | Preserve descriptively; do not assume a beam center |
+| Vendor scan, image, or instrument rotation | Preserve descriptively; do not automatically populate `rq_calibration` |
+| Nominal camera length or field of view | Preserve available acquisition values; do not infer pixel calibration from these alone |
+
+The current Rosetta adapter archives normalized and original metadata; it
+does not promote arbitrary similarly named vendor fields into beam or R/Q
+geometry. Native legacy EMPAD XML normalization is separate and retains its
+field-level source records. Missing fields remain absent rather than becoming
+zeros or guessed defaults.
+
+Explicit unit/scale pairs on `HyperData.open(...)` override imported pairs
+in returned objects; they do not edit the file or erase the original reader
+archive. Alignment establishes current beam geometry, while a verified
+`set_rq_calibration` or `compare_rq(...).apply()` establishes the R/Q frame.
+Later geometric operations update current geometry without rewriting the
+historical experiment. Review archived paths and instrument identifiers
+before sharing a saved file.
+
 ### Lazy Reader Memory
 
 Rosetta readers are always called with `lazy=True`. Selected Dask slices are
@@ -371,6 +422,11 @@ The source closes discoverable owned file handles, blocks all later reads, and
 keeps returned patterns and chunks independent of those resources.
 
 ## Source-to-File Processing
+
+Disk-backed sources also support [streamed peak extraction](peaks-and-strain.md#peak-extraction-from-disk-backed-sources)
+with ragged coordinates, optional integrated intensities and incremental
+numeric peak-file output. Peak files have their own schema and load with
+`PeakScanResult.load`, not `HyperData(path)`.
 
 An opened source can process a complete dataset into a saved `.4denoise`
 file without a complete numerical input or output array in RAM. The same

@@ -31,6 +31,7 @@ from fourdenoise_traversals import _clone_unfold_metadata
 from fourdenoise_detectors import _virtual_image
 from fourdenoise_resampling import _normalize_resize_shape
 from fourdenoise_streaming import _stream_resize, _stream_transform
+from fourdenoise_peaks import _get_source_peaks, _validate_peak_options
 
 
 _SOURCE_METADATA_KEYS = (
@@ -428,6 +429,96 @@ class DiffractionSource:
                 self._hyperdata_type,
                 polar_metadata=self._metadata.get('polar_metadata'),
             ),
+        )
+
+    def get_peaks(self, radius, min_distance, trench_width=1.0, kernel_amp=1.0,
+                  trench_amp=-0.5, threshold_abs=1.0, threshold_rel=None,
+                  r_range=None, n_fold=None, sym_mode='none', sym_tolerance_px=2.0,
+                  center_tolerance_px=2.0, orbit_min_fraction=0.5, reorder=False,
+                  real_mask=None, center=None, *, intensity_radius=None,
+                  coords_units='pixels', working_memory_mb=None, chunk_size=None,
+                  destination=None, overwrite=False, atomic=True, progress=True):
+        """Detect peaks in Cartesian patterns without loading the whole scan.
+
+        Detection options have the same pixel meanings as
+        :meth:`fourdenoise.HyperData.get_peaks` and use its existing
+        ReciprocalSpace kernel. Parameters are validated before pixel reads.
+        One detector wrapper/template is reused, one progress bar is shown,
+        and blocks are discarded before the next read. No center refinement,
+        intensity normalization, background subtraction or alignment is implied.
+        Center defaults to valid stored beam metadata, then the image midpoint.
+        ``real_mask`` is a Boolean (Ry, Rx) selection for 4D scans; fully masked
+        read blocks are skipped. Mixed blocks can contain unselected patterns,
+        but the detector is never applied to them. 3D stacks retain (N,) indexing.
+        Polar and cepstral data must be converted appropriately before use.
+
+        Returns
+        -------
+        fourdenoise.PeakScanResult or str
+            Without destination, a ragged result with scan-shaped object arrays:
+            coords[index] is (n_peaks, 2), in (y, x) order; scores, synthetic_mask
+            and orbit_ids align with its rows. processed_mask distinguishes
+            excluded scans from evaluated patterns having zero peaks.
+            Metadata includes source calibration, resolved pixel center and
+            detector settings. This owned result survives source closure.
+            With destination, return the atomically published peak-file path
+            instead; never retain a complete peak collection in RAM. Load it
+            explicitly with PeakScanResult.load(path), or read selected numeric
+            /starts, /counts and /coords/... slices with h5py. Peak files are
+            distinct from saved HyperData arrays and use .h5/.hdf5/.hdf;
+            no suffix appends .peaks.h5.
+
+        Other Parameters
+        ----------------
+        intensity_radius : float or None
+            Optional positive integration radius in detector pixels. Sum raw
+            circular windows in float64 about measured integer peak positions
+            using the existing intensity kernel, clipped at image boundaries.
+            None does not integrate intensities. Correlation scores are *not*
+            integrated intensity. Symmetry-generated rows have NaN scores and
+            intensities, not fabricated observations; inspect synthetic_mask.
+        coords_units : {'pixels', 'auto', 'calibrated'}
+            Output coordinates only. Default pixels means array (y-down,x-right).
+            Calibrated means reciprocal units, y-up/x-right about the geometric
+            midpoint, not the fitted beam center. Auto uses calibration if
+            available. Search/template/integration parameters remain pixels.
+        working_memory_mb : float or None
+            Temporary-buffer budget, default 256 MiB. Reserve a declared Rosetta
+            IO chunk plus conservative template/FFT/candidate/symmetry workspace
+            and two raw read/copy buffers. Too small raises before pixel reads.
+            Metadata, existing detector/library/OS caches, Python allocator
+            overhead and retained result arrays are excluded; not a RAM limit.
+            Symmetry options can require a substantially larger budget.
+        chunk_size : int or None
+            Maximum patterns per read, additionally limited by the budget.
+            4D reads stay within one scan row; the complete source is not flattened.
+        destination : path or None
+            Incremental numeric peak-file output. Atomic publication is default;
+            overwrite=True permits replacement, atomic=False permits a partial
+            file on failure. Source aliases are forbidden. This source stays
+            open on success/failure and pixels/metadata are never modified.
+        progress : bool
+            Show one optional scan-progress bar, default True.
+
+        Examples
+        --------
+        >>> with HyperData.open('scan.h5') as source:
+        ...     peaks = source.get_peaks(3, 5, intensity_radius=3, progress=False)
+        >>> counts = peaks.observed_peak_counts
+        >>> positions = peaks.coords[0, 0]
+        """
+        self._require_open()
+        options = _validate_peak_options(
+            radius, min_distance, trench_width, kernel_amp, trench_amp,
+            threshold_abs, threshold_rel, r_range, n_fold, sym_mode,
+            sym_tolerance_px, center_tolerance_px, orbit_min_fraction,
+            reorder, True,
+        )
+        return _get_source_peaks(
+            self, options, center=center, real_mask=real_mask,
+            intensity_radius=intensity_radius, coords_units=coords_units,
+            working_memory_mb=working_memory_mb, chunk_size=chunk_size,
+            destination=destination, overwrite=overwrite, atomic=atomic, progress=progress,
         )
 
     def to_polar(self, center=None, r_max=None, output_shape=None, order=1,

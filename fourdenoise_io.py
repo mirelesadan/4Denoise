@@ -7,6 +7,7 @@ from fourdenoise_traversals import _unfold_payload_arrays
 
 
 _HYPERDATA_HDF5_FORMAT = '4denoise.hyperdata'
+_PEAK_SCAN_HDF5_FORMAT = '4denoise.peak_scan'
 
 
 _HYPERDATA_HDF5_VERSION = '1.1'
@@ -274,6 +275,8 @@ def _format_hdf5_dataset_listing(dataset_info):
 def _select_hdf5_dataset(file, dataset_path=None, *,
                          selector_name='hdf5_dataset', exclude_internal=False):
     """Select a numeric dataset without loading it into memory."""
+    if _decode_hdf5_value(file.attrs.get('fourdenoise_format')) == _PEAK_SCAN_HDF5_FORMAT:
+        raise ValueError('This file contains a peak collection; use PeakScanResult.load(...) instead of HyperData.')
     path = Path(file.filename)
     dataset_info = []
 

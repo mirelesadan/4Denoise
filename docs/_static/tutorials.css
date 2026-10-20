@@ -1,0 +1,11 @@
+/* Keep diagnostic text compact without putting figures in scroll boxes. */
+.cell_output .output.stream pre,
+.cell_output .output.text_plain pre {
+  max-height: 18rem;
+  overflow: auto;
+}
+
+.cell_output img {
+  max-width: 100%;
+  height: auto;
+}

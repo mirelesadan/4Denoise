@@ -60,5 +60,20 @@ Analysis results
 .. autoclass:: fourdenoise.PeakDetectionResult
    :members: observed_mask
 
+.. autoclass:: fourdenoise.PeakScanResult
+   :members: scan_shape, peak_counts, observed_peak_counts
+
+.. automethod:: fourdenoise.PeakScanResult.load
+
+.. automethod:: fourdenoise.PeakScanResult.copy
+
+``PeakDetectionResult`` describes one pattern's detections. ``PeakScanResult``
+contains scan-indexed ragged arrays and optional integrated intensities;
+it is not itself a :class:`fourdenoise.RealSpace` image. A file produced by
+``DiffractionSource.get_peaks(destination=...)`` uses a separate peak schema,
+not the saved diffraction-array format. See the
+:doc:`peak guide <../guides/peaks-and-strain>` for coordinates, provenance,
+masked entries, and selective numeric-table reads.
+
 .. autoclass:: fourdenoise.StrainResult
    :members: valid_mask, as_real_space

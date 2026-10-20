@@ -1,8 +1,14 @@
-"""Execute only the included mini-data DEMO, never the research notebooks."""
+"""Execute the included mini-data DEMO and share fresh-kernel validation."""
 
 import argparse
+import os
 from pathlib import Path
 import sys
+
+if __package__:
+    from .notebook_reports import REPORT_KEY, complete_report, new_report_provenance
+else:
+    from notebook_reports import REPORT_KEY, complete_report, new_report_provenance
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,12 +31,12 @@ def validate_execution(notebook):
         if cell['cell_type'] != 'code' or not cell['source'].strip():
             continue
         if cell.get('execution_count') is None:
-            raise RuntimeError(f'DEMO code cell {index} was not executed.')
+            raise RuntimeError(f'Notebook code cell {index} was not executed.')
         if any(output.get('output_type') == 'error' for output in cell.get('outputs', [])):
-            raise RuntimeError(f'DEMO code cell {index} contains an error.')
+            raise RuntimeError(f'Notebook code cell {index} contains an error.')
         executed += 1
     if executed == 0:
-        raise RuntimeError('The DEMO has no executable code cells.')
+        raise RuntimeError('The notebook has no executable code cells.')
     return executed
 
 
@@ -46,33 +52,45 @@ def resolve_output(root, output=None):
     return path
 
 
-def execute_demo(root=ROOT, *, output=None, timeout=120):
-    """Run the full mini-data tutorial with this Python and save a separate report.
+def execute_notebook(source, *, root, output, timeout=120):
+    """Run one explicit notebook with this Python and save a separate report.
 
     Errors and per-cell timeouts are fatal. The source file is never written;
     the report retains partial output if execution fails. Kernel selection is
     independent of user-installed Jupyter kernel names or notebook metadata.
+    ``root`` sets the kernel's working directory. This helper never discovers
+    notebooks; callers select only their explicitly supported examples.
     """
+    root = Path(root).resolve()
+    source = Path(source).resolve()
+    output = Path(output).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f'Notebook does not exist: {source}')
+    if source.suffix != '.ipynb' or output.suffix != '.ipynb':
+        raise ValueError('Source and output must use the .ipynb extension.')
+    if source == output or (
+        output.exists() and source.samefile(output)
+    ):
+        raise ValueError('The executed report must not overwrite the source notebook.')
+    if not root.is_dir():
+        raise FileNotFoundError(f'Notebook working directory does not exist: {root}')
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise ValueError('timeout must be a positive integer number of seconds.')
+
     import nbformat
     from jupyter_client import KernelManager
     from jupyter_client.kernelspec import KernelSpec, KernelSpecManager, NoSuchKernel
     from nbclient import NotebookClient
 
-    root = Path(root).resolve()
-    source = root / DEMO
-    output = resolve_output(root, output)
-    if not source.is_file() or not (root / 'mini_dataset_binned.npy').is_file():
-        raise FileNotFoundError('The repository must contain the DEMO and mini_dataset_binned.npy.')
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
-        raise ValueError('timeout must be a positive integer number of seconds.')
     notebook = nbformat.read(source, as_version=4)
     nbformat.validate(notebook)
     clear_execution_state(notebook)
+    notebook['metadata'][REPORT_KEY] = new_report_provenance(source, root)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     class InterpreterKernelSpecs(KernelSpecManager):
         def get_kernel_spec(self, name):
-            if name != '4denoise-demo':
+            if name != '4denoise-validation':
                 raise NoSuchKernel(name)
             return KernelSpec(
                 argv=[sys.executable, '-m', 'ipykernel_launcher', '-f', '{connection_file}'],
@@ -80,7 +98,7 @@ def execute_demo(root=ROOT, *, output=None, timeout=120):
             )
 
     manager = KernelManager(
-        kernel_name='4denoise-demo', kernel_spec_manager=InterpreterKernelSpecs(),
+        kernel_name='4denoise-validation', kernel_spec_manager=InterpreterKernelSpecs(),
     )
     client = NotebookClient(
         notebook, km=manager, resources={'metadata': {'path': str(root)}},
@@ -88,9 +106,15 @@ def execute_demo(root=ROOT, *, output=None, timeout=120):
         record_timing=True,
     )
     print(f'Executing {source.name} with {sys.executable}', flush=True)
+    kernel_env = os.environ.copy()
+    module_root = root.parent if root.name == 'tutorials' else root
+    if (module_root / 'fourdenoise.py').is_file():
+        # Execute this checkout, not an older installation in the same Python.
+        kernel_env['PYTHONPATH'] = str(module_root) + os.pathsep + kernel_env.get('PYTHONPATH', '')
     try:
-        client.execute(cleanup_kc=True)
+        client.execute(cleanup_kc=True, env=kernel_env)
         count = validate_execution(notebook)
+        complete_report(notebook, source, root)
     finally:
         try:
             if manager.has_kernel:
@@ -100,6 +124,16 @@ def execute_demo(root=ROOT, *, output=None, timeout=120):
             print(f'Executed notebook report: {output}', flush=True)
     print(f'Passed: all {count} nonempty code cells executed.', flush=True)
     return output
+
+
+def execute_demo(root=ROOT, *, output=None, timeout=120):
+    """Run the full included mini-data DEMO, never the research notebooks."""
+    root = Path(root).resolve()
+    source = root / DEMO
+    output = resolve_output(root, output)
+    if not source.is_file() or not (root / 'mini_dataset_binned.npy').is_file():
+        raise FileNotFoundError('The repository must contain the DEMO and mini_dataset_binned.npy.')
+    return execute_notebook(source, root=root, output=output, timeout=timeout)
 
 
 def main():

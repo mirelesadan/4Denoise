@@ -33,6 +33,7 @@ MODULE_NAMES = (
     "fourdenoise_plotting",
     "fourdenoise_io",
     "fourdenoise_sources",
+    "fourdenoise_peaks",
     "fourdenoise_detectors",
     "fourdenoise_rosetta",
     "abTEM_helpers",
@@ -56,8 +57,9 @@ def copy_support(source_root, target):
     """Copy only tests and their support, never checkout package modules."""
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "_build",
                                     ".pytest_cache", ".ipynb_checkpoints")
-    for directory in ("tests", "scripts", "docs"):
+    for directory in ("tests", "scripts", "docs", "tutorials", ".github"):
         shutil.copytree(source_root / directory, target / directory, ignore=ignore)
+    shutil.copy2(source_root / ".gitignore", target / ".gitignore")
 
 
 def assert_installed_origins(target):

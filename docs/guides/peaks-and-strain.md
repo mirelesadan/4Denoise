@@ -1,5 +1,16 @@
 # Peaks and Strain Results
 
+For an independently executable synthetic example, see
+[Tutorial 6: Strain mapping and R/Q calibration](../tutorials/strain-mapping-and-rq-calibration.md).
+It checks coordinate ordering and known real-frame components without using
+an arbitrary 90-degree basis correction, and distinguishes residuals from
+confidence and reciprocal-stretch strain from finite direct-lattice strain.
+
+[Tutorial 5](../tutorials/peak-analysis-and-braggness.md) provides a runnable
+synthetic and replaceable-input lesson on independent detection, ragged
+centers/intensities, threshold sensitivity, and Braggness. It keeps detection
+scores, intensity windows, and sharp-contrast scores distinct.
+
 The [DEMO notebook](https://github.com/mirelesadan/4Denoise/blob/main/DEMO_exp_4dstem_ripple_processing.ipynb) shows
 one verified path from a reference diffraction pattern through peak
 detection, center refinement, intensity integration, and a relative strain
@@ -24,6 +35,124 @@ measured = data.get_centers(r=5, ref_coords=reference_peaks)
 These thresholds illustrate the included mini dataset, not general detector
 defaults. Inspect an overlay before fitting strain and adjust the peak set
 for your material and calibration.
+
+The [streaming tutorial](../getting-started/streaming.md) runs the independent
+detector on the included mini dataset and writes a numeric peak file. This is
+separate from reference-based center refinement: no shared reference or
+fixed peak count is assumed.
+
+## Peak Extraction From Disk-Backed Sources
+
+`DiffractionSource.get_peaks()` uses the same detector as in-memory peak
+finding, with bounded input blocks and one reused detector/template:
+
+```python
+with HyperData.open("experiment.h5") as source:
+    peaks = source.get_peaks(
+        radius=3, min_distance=7, threshold_rel=0.1, r_range=(10, 61),
+        intensity_radius=3, coords_units="pixels",
+        working_memory_mb=64, progress=True,
+    )
+
+counts = peaks.observed_peak_counts        # (Ry, Rx), excluding repaired peaks
+positions = peaks.coords[0, 0]             # (n_peaks, 2), ordered (y, x)
+intensities = peaks.intensities[0, 0]       # raw circular-window sums
+```
+
+The result is a `PeakScanResult`, not a diffraction tensor or RealSpace image.
+Its ragged **object arrays** share the original scan shape: `(Ry, Rx)` for 4D
+or `(N,)` for a 3D stack. `coords`, `scores`, `synthetic_mask`, `orbit_ids` and
+optional `intensities` align row-by-row in each pattern. `processed_mask`
+distinguishes masked-out positions from evaluated patterns containing no
+peaks. Use `real_mask` for a Boolean 4D scan selection; fully masked read
+blocks are skipped, while unselected patterns inside mixed blocks are never
+evaluated. Returned arrays/metadata survive source closure independently.
+
+Detection radii, separation, radial ranges, centers and integration radii
+remain **pixels**. `coords_units` affects only output: `"pixels"` is the
+default; `"auto"` uses reciprocal calibration when available; `"calibrated"`
+requires it. Calibrated coordinates are y-up/x-right relative to the geometric
+detector midpoint, consistent with diffraction display. The search center
+uses current beam metadata (or an explicit pixel override), but does not
+change that coordinate origin. The result records both settings and source
+scan/detector calibration. Pixel results can be passed as reference positions
+for subsequent center refinement; streamed detection itself does not refine
+coordinates, align images, normalize intensities or estimate background.
+
+`scores` are template-correlation responses, **not integrated intensities**.
+`intensity_radius` requests raw sums in circular windows, accumulated in
+float64 and clipped to the detector edges. Supply background-subtracted
+patterns beforehand when that is scientifically appropriate. Counts above
+float64's exact-integer range can lose precision. Symmetry repair adds
+coordinates, not observations: generated peaks have True `synthetic_mask`
+and NaN scores/intensities. `peak_counts` includes repaired rows;
+`observed_peak_counts` excludes them. Neither count is a crystalline fraction.
+
+### Incremental Peak Files
+
+For large peak collections, write directly to a distinct peak file:
+
+```python
+from fourdenoise import PeakScanResult
+
+with HyperData.open("experiment.dm4") as source:
+    peak_path = source.get_peaks(
+        radius=3, min_distance=7, intensity_radius=3,
+        destination="peaks.h5", working_memory_mb=64,
+    )
+
+# Explicitly materialize the peak collection, not the diffraction dataset.
+peaks = PeakScanResult.load(peak_path, max_memory_mb=256)
+```
+
+Peak files use append-only numeric `/coords`, `/scores`, `/synthetic_mask`,
+`/orbit_ids` and optional `/intensities` tables, plus scan-shaped `/starts`,
+`/counts` and `/processed_mask`. They do not use pickle or variable-length
+object datasets. For a selected scan index, use h5py to read its start/count
+and only the corresponding numeric table slices. Metadata includes coordinate
+convention, detection/integration settings, resolved search center and the
+source calibration/acquisition record. These files are not HyperData saves:
+use `PeakScanResult.load`, not `HyperData(path)`.
+
+File mode returns a path and never allocates the full ragged collection. The
+source remains open and unmodified. Atomic publication is default: failures
+remove the temporary sibling and preserve an existing destination. Replacement
+requires `overwrite=True`; `atomic=False` explicitly permits partial output.
+Use `.h5`/`.hdf5`/`.hdf`; no suffix appends `.peaks.h5`.
+
+The temporary `working_memory_mb` budget defaults to 256 MiB and reserves one
+Rosetta reader chunk plus conservative FFT/template/candidate/symmetry
+workspace and two raw read/copy buffers. Too-small budgets fail before pixel
+reads. `chunk_size` further limits patterns per read; 4D reads stay within a
+scan row. Metadata, existing caches, allocator overhead and retained results
+are outside the estimate, which is not a process-RAM limit. Symmetry can need
+larger budgets. Without file mode, result memory grows with scan size and peak
+count. `PeakScanResult.load` explicitly materializes the full peak collection;
+its cap excludes metadata and Python/NumPy object-header overhead.
+
+To read one entry without materializing the complete peak collection:
+
+```python
+import h5py
+
+scan_index = (0, 0)  # use (i,) for a 3D stack
+with h5py.File(peak_path, "r") as file:
+    processed = bool(file["processed_mask"][scan_index])
+    start = int(file["starts"][scan_index])
+    count = int(file["counts"][scan_index])
+    positions = file["coords"][start:start + count]
+    synthetic = file["synthetic_mask"][start:start + count]
+    measured_positions = positions[~synthetic]
+```
+
+The slices own their returned values after the file closes. This is a
+low-level read of a known peak schema, not a dedicated lazy peak-file object.
+Use `PeakScanResult.load` for schema validation and whole-collection access.
+For a `PeakScanResult` from memory, inspect `processed_mask` before interpreting
+a zero in `observed_peak_counts`. Repair-generated rows must not be counted
+as measured peaks or passed as measured intensity observations.
+
+## Strain Results
 
 `HyperData.get_strains(centers=measured, ref_centers=reference)` returns a
 `StrainResult` with named maps and fit diagnostics:

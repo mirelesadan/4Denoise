@@ -34,11 +34,23 @@ Loading and metadata
 Disk-backed source
 ------------------
 
+Obtain a read-only source inside ``with HyperData.open(path) as source:``.
+Source reductions return independent in-memory views; disk-output transforms
+return saved paths, not full tensors. ``get_peaks`` returns a
+:class:`fourdenoise.PeakScanResult` unless a destination is supplied.
+See the :doc:`streaming tutorial <../getting-started/streaming>` and
+:doc:`I/O guide <../guides/io-and-calibration>` for ownership, memory budgets,
+optional readers, and the distinction between acquisition records and active
+calibration. Global tensor denoising is not implicitly streamed.
+
 .. autoclass:: fourdenoise.DiffractionSource
+   :members: shape, ndim, dtype, nbytes, scan_shape, pattern_shape, real_shape, backend, filename, dataset_path, metadata, reader_metadata, reader_chunk_nbytes, has_unfold_metadata, closed
 
 .. automethod:: fourdenoise.DiffractionSource.get_dp
 
 .. automethod:: fourdenoise.DiffractionSource.virtual_image
+
+.. automethod:: fourdenoise.DiffractionSource.get_peaks
 
 .. automethod:: fourdenoise.DiffractionSource.to_polar
 
@@ -81,6 +93,8 @@ Preprocessing and denoising
 ---------------------------
 
 .. automethod:: fourdenoise.HyperData.clip
+
+.. automethod:: fourdenoise.HyperData.remove_bg
 
 .. automethod:: fourdenoise.HyperData.alignment
 

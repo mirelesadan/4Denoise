@@ -7,10 +7,17 @@ radii below are in pixels; the mini-data example does not require physical
 calibration. The full runnable version is the
 [DEMO notebook](https://github.com/mirelesadan/4Denoise/blob/main/DEMO_exp_4dstem_ripple_processing.ipynb).
 
+For a slower introduction to shapes, formats, units, metadata, and disk-backed
+sources, try [Tutorial 1](../tutorials/loading-and-calibration.md). It generates
+its own synthetic data and does not need the included mini dataset.
+
 ## Load and Inspect
 
 Start Jupyter from the repository root. The scan axes are `(Ry, Rx)` and the
 last two axes are the diffraction pattern `(Ky, Kx)`.
+`HyperData(path)` deliberately loads the full array into RAM. This is suitable
+for the mini dataset; the [streaming tutorial](streaming.md) shows the
+read-only source alternative for larger inputs.
 
 ```python
 from fourdenoise import HyperData
@@ -97,3 +104,8 @@ print(int(strain.valid_mask.sum()), "valid scan positions")
 See [peaks and strain](../guides/peaks-and-strain.md) for fit-quality
 interpretation, or the [case study](../case-studies/3d-strain-mapping.md)
 for the separate full-data workflow.
+
+To detect independent, varying peak sets without loading all diffraction
+pixels, continue with the [streaming tutorial](streaming.md). Its
+`PeakScanResult` is a ragged collection, not the fixed shared-reference
+center array used above. It does not automatically refine centers or fit strain.

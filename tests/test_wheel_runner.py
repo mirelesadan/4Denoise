@@ -27,11 +27,14 @@ class WheelRunnerTests(unittest.TestCase):
 
     def make_fixture(self, *, missing=None, fail=False):
         repo = self.root / "checkout"
-        for directory in ("tests", "scripts", "docs"):
+        for directory in ("tests", "scripts", "docs", "tutorials", ".github/workflows"):
             (repo / directory).mkdir(parents=True)
+        (repo / ".gitignore").write_text("/docs/_build/\n", encoding="utf-8")
+        (repo / ".github/workflows/docs.yml").write_text("name: docs\n", encoding="utf-8")
         shutil.copy2(SCRIPT, repo / "scripts" / SCRIPT.name)
         (repo / "scripts" / "support.py").write_text("VALUE = 'support'\n", encoding="utf-8")
         (repo / "docs" / "conf.py").write_text("VALUE = 'docs'\n", encoding="utf-8")
+        (repo / "tutorials" / "example.ipynb").write_text('{"cells": []}', encoding="utf-8")
         for name in runner.MODULE_NAMES:
             (repo / f"{name}.py").write_text("raise RuntimeError('checkout imported')\n", encoding="utf-8")
         assertion = "self.fail('deliberate wheel-suite failure')" if fail else "self.assertEqual(fd.VALUE, 'wheel')"
@@ -50,7 +53,10 @@ class WheelRunnerTests(unittest.TestCase):
             "            spec = importlib.util.spec_from_file_location('fixture_support', ROOT / directory / filename)\n"
             "            module = importlib.util.module_from_spec(spec)\n"
             "            spec.loader.exec_module(module)\n"
-            "            self.assertEqual(module.VALUE, expected)\n",
+            "            self.assertEqual(module.VALUE, expected)\n"
+            "        self.assertTrue((ROOT / 'tutorials' / 'example.ipynb').is_file())\n"
+            "        self.assertEqual((ROOT / '.gitignore').read_text(), '/docs/_build/\\n')\n"
+            "        self.assertEqual((ROOT / '.github/workflows/docs.yml').read_text(), 'name: docs\\n')\n",
             encoding="utf-8",
         )
         wheel = self.root / "fourdenoise_main-1.0.0-py3-none-any.whl"
@@ -100,15 +106,19 @@ class WheelRunnerTests(unittest.TestCase):
         (repo / "tests" / "__pycache__").mkdir()
         (repo / "tests" / "__pycache__" / "test_stale.pyc").write_bytes(b"stale")
         (repo / "docs" / "_build").mkdir()
+        (repo / "tutorials" / ".ipynb_checkpoints").mkdir()
+        (repo / "tutorials" / ".ipynb_checkpoints" / "stale.ipynb").write_text("{}", encoding="utf-8")
         target = self.root / "installed"
         target.mkdir()
         runner.copy_support(repo, target)
         self.assertTrue((target / "tests" / "test_fixture.py").is_file())
         self.assertTrue((target / "scripts" / "support.py").is_file())
         self.assertTrue((target / "docs" / "conf.py").is_file())
+        self.assertTrue((target / "tutorials" / "example.ipynb").is_file())
         self.assertFalse((target / "fourdenoise.py").exists())
         self.assertFalse((target / "tests" / "__pycache__").exists())
         self.assertFalse((target / "docs" / "_build").exists())
+        self.assertFalse((target / "tutorials" / ".ipynb_checkpoints").exists())
 
     def test_wheel_directory_requires_exactly_one_wheel(self):
         with self.assertRaisesRegex(ValueError, "exactly one"):

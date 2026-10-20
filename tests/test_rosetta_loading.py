@@ -127,6 +127,48 @@ class RosettaMockTests(unittest.TestCase):
             with fd.HyperData.open(self.path, backend='native'):
                 pass
 
+    def test_streamed_peaks_preserve_calibration_and_ragged_file_results(self):
+        y, x = np.ogrid[:33, :39]
+        image = np.full((33, 39), 5.0)
+        image[(y - 10) ** 2 + (x - 12) ** 2 <= 4] += 50
+        values = np.stack((image, np.full_like(image, 5), image)).reshape(1, 3, 33, 39)
+        self.records = [record(values, handle=self.handle)]
+        array = self.records[0]['data']
+        path = Path(self.directory.name) / 'peaks.h5'
+        with fd.HyperData.open(self.path, real_units='nm', real_conv_factor=(2, 3),
+                               reciprocal_units='mrad', reciprocal_conv_factor=0.25) as source:
+            with self.assertRaisesRegex(ValueError, 'reader chunk'):
+                source.get_peaks(2, 3, working_memory_mb=0.0001, progress=False)
+            self.assertEqual(array.calls, [])
+            result = source.get_peaks(2, 3, intensity_radius=2, coords_units='auto',
+                                       chunk_size=1, working_memory_mb=2, progress=False)
+            self.assertEqual(result.scan_shape, (1, 3))
+            np.testing.assert_array_equal(result.peak_counts, [[1, 0, 1]])
+            np.testing.assert_array_equal(result.coords[0, 0], [[1.5, -1.75]])
+            self.assertEqual(result.metadata['source_metadata']['real_units'], 'nm')
+            self.assertEqual(result.metadata['source_metadata']['acquisition_metadata']['reader'], 'rsciio.digitalmicrograph')
+            with patch.object(source, 'load', side_effect=AssertionError('No full load')):
+                source.get_peaks(2, 3, intensity_radius=2, coords_units='auto', chunk_size=1,
+                                 destination=path, working_memory_mb=2, progress=False)
+            loaded = fd.PeakScanResult.load(path)
+            for index in np.ndindex(result.scan_shape):
+                np.testing.assert_array_equal(result.coords[index], loaded.coords[index])
+                np.testing.assert_array_equal(result.intensities[index], loaded.intensities[index])
+            self.assertFalse(source.closed)
+        self.assertEqual(self.handle.close_count, 1)
+        self.assertTrue(all(scheduler == 'synchronous' for kind, scheduler in array.calls if kind == 'compute'))
+
+    def test_peak_workspace_and_reader_chunk_are_both_checked_before_io(self):
+        import fourdenoise_peaks as peaks
+        array = self.records[0]['data']
+        options = peaks._validate_peak_options(1, 2)
+        with fd.HyperData.open(self.path) as source:
+            plan = peaks._peak_source_plan(source.shape, source.dtype, options, 1, None)
+            budget = (source.reader_chunk_nbytes + plan['fixed_bytes'] + plan['pattern_bytes'] - 16) / 1024 ** 2
+            with self.assertRaisesRegex(ValueError, 'too small'):
+                source.get_peaks(1, 2, working_memory_mb=budget, progress=False)
+            self.assertEqual(array.calls, [])
+
     def test_streamed_virtual_image_matches_eager_and_reserves_reader_chunk(self):
         array = self.records[0]['data']
         weights = np.linspace(-0.25, 1.5, 30).reshape(5, 6)
@@ -533,6 +575,11 @@ class RosettaRealPluginTests(unittest.TestCase):
                 self.assertEqual(source.shape, values.shape)
                 np.testing.assert_array_equal(source.get_dp(1, 2).array, values[1, 2])
                 baseline = fd.HyperData(values, **source.metadata)
+                peak_result = source.get_peaks(1, 2, threshold_abs=1, intensity_radius=1,
+                                                chunk_size=1, working_memory_mb=1, progress=False)
+                for index in np.ndindex(values.shape[:2]):
+                    expected_peaks = fd.ReciprocalSpace(values[index]).get_peaks(1, 2, threshold_abs=1)
+                    np.testing.assert_array_equal(peak_result.coords[index], expected_peaks)
                 streamed = self.folder / 'streamed.4denoise'
                 with patch.object(source, 'load', side_effect=AssertionError('No full load')):
                     source.to_polar(output_shape=(4, 16), destination=streamed,
