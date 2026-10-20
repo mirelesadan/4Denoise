@@ -1,13 +1,17 @@
 """Notebook validation contracts that do not require optional Jupyter packages."""
 
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
+
+from scripts import execute_tutorials as tutorials
 
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('execute_demo', ROOT / 'scripts' / 'execute_demo.py')
+spec = importlib.util.spec_from_file_location('scripts.execute_demo', ROOT / 'scripts' / 'execute_demo.py')
 demo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(demo)
 conf_spec = importlib.util.spec_from_file_location('docs_conf', ROOT / 'docs' / 'conf.py')
@@ -79,8 +83,86 @@ class LinkValidationTests(unittest.TestCase):
     def test_validation_hooks_are_registered(self):
         app = Mock()
         docs_conf.setup(app)
+        app.connect.assert_any_call('builder-inited', docs_conf._prepare_tutorial_pages)
         app.connect.assert_any_call('linkcheck-process-uri', docs_conf._github_file_check_uri)
         app.connect.assert_any_call('build-finished', docs_conf._require_verified_external_links)
+
+
+class TutorialValidationTests(unittest.TestCase):
+    def test_registered_notebook_has_clean_state_and_declared_synthetic_origin(self):
+        for name in tutorials.TUTORIALS:
+            with self.subTest(notebook=name):
+                notebook = json.loads((ROOT / 'tutorials' / name).read_text(encoding='utf-8'))
+                self.assertEqual(notebook['nbformat'], 4)
+                self.assertEqual(notebook['metadata']['4denoise']['data_origin'], 'synthetic')
+                self.assertFalse(notebook['metadata']['4denoise']['requires_external_data'])
+                ids = [cell['id'] for cell in notebook['cells']]
+                self.assertEqual(len(ids), len(set(ids)))
+                code = [cell for cell in notebook['cells'] if cell['cell_type'] == 'code']
+                self.assertGreater(len(code), 10)
+                for cell in code:
+                    self.assertIsNone(cell['execution_count'])
+                    self.assertEqual(cell['outputs'], [])
+                parameter_cells = [cell for cell in code if 'microscope-input' in cell['metadata'].get('tags', [])]
+                self.assertEqual(len(parameter_cells), 1)
+                self.assertIn('microscope_path = None', ''.join(parameter_cells[0]['source']))
+                self.assertIn('input_data = None', ''.join(parameter_cells[0]['source']))
+                self.assertIn("input_origin = 'experimental'", ''.join(parameter_cells[0]['source']))
+
+    def test_only_registered_tutorials_are_dispatched_to_separate_reports(self):
+        outputs = [ROOT / 'docs' / '_build' / 'tutorials' / name for name in tutorials.TUTORIALS]
+        with patch.object(tutorials, 'execute_notebook', side_effect=outputs) as execute:
+            self.assertEqual(tutorials.execute_tutorials(ROOT, timeout=15), outputs)
+        self.assertEqual(execute.call_args_list, [
+            call(ROOT / 'tutorials' / name, root=ROOT / 'tutorials', output=output, timeout=15)
+            for name, output in zip(tutorials.TUTORIALS, outputs)
+        ])
+
+    def test_explicit_selection_does_not_run_other_tutorials(self):
+        selected = tutorials.TUTORIALS[-1]
+        output = ROOT / 'docs' / '_build' / 'tutorials' / selected
+        with patch.object(tutorials, 'execute_notebook', return_value=output) as execute:
+            self.assertEqual(tutorials.execute_tutorials(ROOT, notebooks=[selected]), [output])
+        execute.assert_called_once_with(
+            ROOT / 'tutorials' / selected, root=ROOT / 'tutorials', output=output, timeout=120,
+        )
+
+    def test_research_paths_empty_and_duplicate_selections_are_rejected(self):
+        for selected in ([], ['../' + demo.DEMO], [demo.DEMO],
+                         [tutorials.TUTORIALS[0], tutorials.TUTORIALS[0]]):
+            with self.subTest(selected=selected), patch.object(tutorials, 'execute_notebook') as execute:
+                with self.assertRaises(ValueError):
+                    tutorials.execute_tutorials(ROOT, notebooks=selected)
+                execute.assert_not_called()
+
+    def test_missing_tutorial_is_reported_before_any_kernel_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(tutorials, 'execute_notebook') as execute:
+                with self.assertRaisesRegex(FileNotFoundError, 'Missing registered'):
+                    tutorials.execute_tutorials(directory)
+                execute.assert_not_called()
+
+    def test_shared_runner_rejects_source_overwrite_and_bad_paths_before_imports(self):
+        source = ROOT / 'tutorials' / tutorials.TUTORIALS[0]
+        with self.assertRaisesRegex(ValueError, 'overwrite'):
+            demo.execute_notebook(source, root=ROOT, output=source)
+        with self.assertRaisesRegex(ValueError, 'extension'):
+            demo.execute_notebook(source, root=ROOT, output=ROOT / 'report.txt')
+        with self.assertRaisesRegex(FileNotFoundError, 'Notebook does not exist'):
+            demo.execute_notebook(ROOT / 'absent.ipynb', root=ROOT, output=ROOT / 'report.ipynb')
+        for timeout in (True, 0, -1, 1.5):
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(ValueError, 'timeout'):
+                demo.execute_notebook(source, root=ROOT, output=ROOT / 'report.ipynb', timeout=timeout)
+
+    def test_existing_demo_uses_the_shared_executor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / demo.DEMO).write_text('{}', encoding='utf-8')
+            (root / 'mini_dataset_binned.npy').write_bytes(b'fixture')
+            output = demo.resolve_output(root)
+            with patch.object(demo, 'execute_notebook', return_value=output) as execute:
+                self.assertEqual(demo.execute_demo(root, timeout=30), output)
+            execute.assert_called_once_with(root / demo.DEMO, root=root, output=output, timeout=30)
 
 
 if __name__ == '__main__':

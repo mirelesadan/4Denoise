@@ -27,11 +27,35 @@ from time import perf_counter
 # =============================================================================
 
 def eDiff_Wavenumber(kev):
+    """Return the electron wave number ``2*pi / wavelength`` in inverse angstroms.
+
+    Parameters
+    ----------
+    kev : float or numpy.ndarray
+        Electron kinetic energy in keV.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Wave number in inverse angstroms, matching the shape of ``kev``.
+    """
     wav = electronwavelength(kev)
     k = 2*np.pi / wav
     return k
 
 def electronwavelength(kev):
+    """Calculate the relativistic electron wavelength in angstroms.
+
+    Parameters
+    ----------
+    kev : float or numpy.ndarray
+        Electron kinetic energy in keV; values must be positive.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Wavelength in angstroms, matching the shape of ``kev``.
+    """
     wav = 12.3986/np.sqrt((2*511.0 + kev)*kev)
     return wav
 
@@ -91,6 +115,26 @@ def f_element(q, element):
     return F
 
 def eDiff_ScatteringVector(k, qx, qy, phi, theta):
+    """Construct scattering vectors from Ewald-sphere intersections.
+
+    Parameters
+    ----------
+    k : float
+        Incident electron wave number in inverse angstroms.
+    qx, qy : float
+        In-plane reciprocal-space coordinates in inverse angstroms.
+    phi : float
+        Azimuth of the beam tilt in radians.
+    theta : one-dimensional array_like
+        Beam-tilt magnitudes in radians. One vector is produced per value;
+        wrap a scalar in a one-element array.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of ``(qx, qy, qz)`` scattering vectors with shape ``(N, 3)``,
+        where ``N`` is the number of tilt values.
+    """
     #The Ewald Sphere has an origin that changes with tilt and rotation
     qzo = k*np.cos(theta)
     qxo = k*np.sin(theta)*np.cos(phi)
@@ -110,7 +154,36 @@ def eDiff_ScatteringVector(k, qx, qy, phi, theta):
     return q
 
 def BraggRod(h, k, keV, phi, theta, a, material='MoSe2',):
-    
+    """Evaluate a binary-material Bragg rod at one diffraction index.
+
+    Parameters
+    ----------
+    h, k : int
+        Two-dimensional reciprocal-lattice indices; ``k`` here is an index,
+        not the electron wave number.
+    keV : float
+        Electron kinetic energy in keV.
+    phi : float
+        Tilt azimuth in radians.
+    theta : one-dimensional array_like
+        Tilt magnitudes in radians; wrap a scalar in a one-element array.
+    a : float
+        In-plane lattice parameter in angstroms.
+    material : str, optional
+        Binary chemical formula interpreted by ``get_chemical_composition``.
+
+    Returns
+    -------
+    q : numpy.ndarray
+        Scattering vectors in inverse angstroms with shape ``(N, 3)``.
+    intensity : numpy.ndarray
+        Calculated rod intensities for the ``N`` tilt values.
+
+    Notes
+    -----
+    The implemented intensity expression assumes two chemical species.
+    """
+
     K0 = eDiff_Wavenumber( keV )
     b = 4*np.pi/(np.sqrt(3)*a)
     L =  a/2      # in Ang
@@ -475,6 +548,13 @@ domain2 = [Real(np.pi, 2*np.pi, name='phi'), Real(np.radians(min_theta), np.radi
 
 # Define objective function
 def objective(params, target, criterion='mse', **function_kwargs):
+    """Score a simulated intensity vector against a target for minimization.
+
+    ``params`` contains ``(phi, theta)`` in radians. ``criterion`` may be
+    ``'mse'``, ``'euclidean_distance'``, ``'cosine_similarity'``, or
+    ``'modified_cosine'``; similarity scores are negated so smaller is better.
+    Additional keywords are passed to :func:`compute_intensities`.
+    """
     phi, theta = params
     sim_vector = compute_intensities(phi, theta, **function_kwargs)
     
@@ -491,6 +571,27 @@ def objective(params, target, criterion='mse', **function_kwargs):
 
 # Optimization function
 def optimize_target(target, criterion, domain, initial_guess=None, **function_kwargs):
+    """Minimize the intensity mismatch over one ``(phi, theta)`` domain.
+
+    Parameters
+    ----------
+    target : array_like
+        Measured intensity vector to match.
+    criterion : str
+        Loss name accepted by :func:`objective`.
+    domain : sequence of skopt.space.Real
+        Search bounds named ``phi`` and ``theta``, both in radians.
+    initial_guess : sequence of float or None, optional
+        Optional initial ``(phi, theta)`` point in the domain.
+    **function_kwargs
+        Additional parameters forwarded to :func:`compute_intensities`.
+
+    Returns
+    -------
+    skopt.OptimizeResult
+        Optimization result containing ``x`` and ``fun``. The current search
+        uses only two objective evaluations, so results may be coarse.
+    """
     # if initial_guess is not None:
     #     validate_initial_guess(initial_guess, domain)
     
@@ -510,6 +611,29 @@ def optimize_target(target, criterion, domain, initial_guess=None, **function_kw
 
 # Main function to process input and find optimal (phi, theta)
 def find_optimal_params(input_data, domain1, domain2=None, criterion='mse', initial_guess1=None, initial_guess2=None, **function_kwargs, ):
+    """Fit tilt azimuth and magnitude for one or more intensity vectors.
+
+    Parameters
+    ----------
+    input_data : numpy.ndarray
+        Measured intensities with shape ``(features,)``, ``(N, features)``, or
+        ``(Ry, Rx, features)``.
+    domain1, domain2 : sequence of skopt.space.Real or None
+        Candidate ``(phi, theta)`` search regions in radians. ``domain1`` is
+        required; when ``domain2`` is provided, the lower-loss fit is kept.
+    criterion : str, optional
+        Loss name accepted by :func:`objective`.
+    initial_guess1, initial_guess2 : sequence of float or None, optional
+        Initial ``(phi, theta)`` values for each candidate domain.
+    **function_kwargs
+        Additional parameters forwarded to :func:`compute_intensities`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Fitted ``(phi, theta)`` pairs in radians. The underlying array has
+        shape ``(A, B, 2)``; singleton axes are removed with ``squeeze``.
+    """
     # Ensure the input data is 3D
     if input_data.ndim == 1:
         input_data = input_data.reshape(1, 1, -1)
@@ -574,7 +698,30 @@ if __name__ == '__main__':
 import matplotlib.pyplot as plt
 
 def optimize_and_plot(phi_test, theta_test, criteria, initial_guess1=None, initial_guess2=None, **function_kwargs):
+    """Plot recovered versus input tilt for several optimization losses.
+
+    Parameters
+    ----------
+    phi_test, theta_test : sequence of float
+        Equal-length azimuth and tilt angles in radians used to synthesize
+        target intensity vectors.
+    criteria : sequence of str
+        Nonempty loss names accepted by :func:`objective`; each gets a panel.
+    initial_guess1, initial_guess2 : sequence of float or None, optional
+        Initial ``(phi, theta)`` guesses for the module-level ``domain1`` and
+        ``domain2`` search regions.
+    **function_kwargs
+        Settings forwarded to :func:`compute_intensities` during simulation
+        and fitting.
+
+    Notes
+    -----
+    The plot shows input versus fitted ``theta`` in degrees, colored by fitted
+    ``phi`` in degrees. It uses this module's ``domain1`` and ``domain2`` and
+    calls ``plt.show()``; it does not return the fitted parameters.
+    """
     fig, axes = plt.subplots(1, len(criteria), figsize=(20, 5))
+    axes = np.atleast_1d(axes)
 
     for i, criterion in enumerate(criteria):
         theta_input = []
@@ -583,8 +730,13 @@ def optimize_and_plot(phi_test, theta_test, criteria, initial_guess1=None, initi
         
         for phi, theta in zip(phi_test, theta_test):
             data = compute_intensities(phi, theta, **function_kwargs)
-            optimal_params = find_optimal_params(data, criterion, initial_guess1, initial_guess2, **function_kwargs)
-            optimal_phi, optimal_theta = optimal_params[0, 0]  # Assuming a single (phi, theta) pair output
+            optimal_params = find_optimal_params(
+                data, domain1, domain2, criterion=criterion,
+                initial_guess1=initial_guess1,
+                initial_guess2=initial_guess2,
+                **function_kwargs,
+            )
+            optimal_phi, optimal_theta = np.asarray(optimal_params).reshape(-1, 2)[0]
             
             theta_input.append(np.degrees(theta))
             theta_output.append(np.degrees(optimal_theta))

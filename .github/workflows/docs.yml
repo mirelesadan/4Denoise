@@ -21,6 +21,7 @@ env:
 
 jobs:
   docs-build:
+    needs: demo-notebook
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -40,8 +41,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[docs]"
           python -m pip check
+      - name: Download validated tutorial outputs from this run
+        uses: actions/download-artifact@v8
+        with:
+          name: executed-tutorial-notebooks
+          path: docs/_build/tutorials
+      - name: Test notebook rendering and stale-report guards
+        run: python -m unittest discover -s tests -p test_tutorial_rendering.py
       - name: Build HTML with warnings treated as errors
         run: python -m sphinx -b html -W --keep-going docs docs/_build/html
+      - name: Execute the documented native streaming example
+        run: python scripts/streaming_example.py
       - name: Configure GitHub Pages
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/configure-pages@v6
@@ -108,12 +118,23 @@ jobs:
           python -m pip check
       - name: Execute the mini-data DEMO in a fresh kernel
         run: python scripts/execute_demo.py
+      - name: Execute curated synthetic tutorials in fresh kernels
+        run: python scripts/execute_tutorials.py
       - name: Save executed DEMO (including partial output on failure)
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: executed-mini-data-demo
           path: docs/_build/demo/*.ipynb
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Save executed tutorials (including partial output on failure)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: executed-tutorial-notebooks
+          path: docs/_build/tutorials/*.ipynb
           retention-days: 7
           if-no-files-found: warn
 
@@ -144,7 +165,7 @@ jobs:
         env:
           SITE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
-          for page in index.html getting-started/quickstart.html reference/hyperdata.html _static/styles/furo.css searchindex.js; do
+          for page in index.html getting-started/quickstart.html reference/hyperdata.html tutorials/notebooks/01_loading_and_calibration.html tutorials/notebooks/07_large_data_processing.html _static/styles/furo.css _static/tutorials.css searchindex.js; do
             echo "Checking ${SITE_URL%/}/$page"
             curl --fail --silent --show-error --location --retry 5 --retry-delay 5 --retry-all-errors --max-time 10 "${SITE_URL%/}/$page" --output /dev/null
           done

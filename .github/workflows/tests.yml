@@ -10,8 +10,25 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: ${{ matrix.os }} / Python ${{ matrix.python }} / editable + wheel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+            rosetta: false
+          - os: ubuntu-latest
+            python: '3.11'
+            rosetta: true
+          - os: ubuntu-latest
+            python: '3.12'
+            rosetta: false
+          - os: windows-latest
+            python: '3.11'
+            rosetta: true
     env:
       MPLBACKEND: Agg
       OMP_NUM_THREADS: "1"
@@ -23,13 +40,32 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install package
+      - name: Install editable package and dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip check
-      - name: Run regression tests
+      - name: Install optional RosettaSciIO backend
+        if: matrix.rosetta
+        run: |
+          python -m pip install -e ".[rosetta]"
+          python -m pip check
+      - name: Run complete editable regression suite
         run: python -m unittest discover -s tests
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --wheel-dir wheelhouse
+      - name: Run complete installed-wheel regression suite
+        run: python scripts/test_installed_wheel.py wheelhouse
+
+  test-summary:
+    # Preserve the original required-check name when expanding to a matrix.
+    name: test
+    needs: test
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every platform and installation variant to pass
+        run: test "${{ needs.test.result }}" = "success"

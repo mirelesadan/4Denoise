@@ -10,6 +10,7 @@ htmlcov/
 build/
 dist/
 /docs/_build/
+/docs/tutorials/notebooks/
 *.egg-info/
 .venv/
 venv/

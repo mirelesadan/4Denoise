@@ -1,9 +1,11 @@
 """
 The 4denoise data structures:
     - HyperData
+    - DiffractionSource
     - ReciprocalSpace
     - RealSpace
     - StrainResult
+    - BraggnessResult
     - _DenoisingMethods
     - _DenoiseEngine
 
@@ -106,30 +108,157 @@ from tensorly.decomposition import parafac_power_iteration as parafac_power_iter
 from tensorly.decomposition import symmetric_parafac_power_iteration as sym_parafac_power_iter
 
 from pathlib import Path
+from fourdenoise_traversals import (
+    _row_major_indices,
+    _serpentine_indices,
+    _spiral_indices,
+    _diagonal_zigzag_indices,
+    _hilbert_d2yx,
+    _hilbert_indices,
+    _morton_code,
+    _morton_indices,
+    _peano_indices,
+    _opposite_corner,
+    _peano_base_path,
+    _peano_next_entry_corner,
+    _peano_path,
+    _corner_coordinate,
+    _compatible_corner_pairs,
+    _base_meander_path,
+    _meander_block_template,
+    _peano_meander_path,
+    _peano_meander_indices,
+    _MEANDER4_BLOCK_SIZE,
+    _MEANDER4_CORNERS,
+    _MEANDER4_SIDE_EXIT_CORNERS,
+    _MEANDER4_DIRECTION_TO_SIDE,
+    _MEANDER4_NEXT_ENTRY,
+    _MEANDER4_BASE_NW_NE,
+    _meander4_transform_path,
+    _meander4_corner_name,
+    _meander4_tile_paths,
+    _MEANDER4_TILE_PATHS,
+    _meander4_corners_are_adjacent,
+    _meander4_choose_exit_corner,
+    _meander4_indices,
+    _MEANDER5_BLOCK_SIZE,
+    _MEANDER5_SIDE_COORDS,
+    _MEANDER5_DIRECTION_TO_SIDE,
+    _MEANDER5_OPPOSITE_SIDE,
+    _MEANDER5_STEP_DIRECTIONS,
+    _MEANDER5_SPIRAL_RANK,
+    _meander5_block_path,
+    _meander5_indices,
+    _moore_indices,
+    _FULL_SHAPE_TRAVERSAL_METHODS,
+    _CURVE_TRAVERSAL_METHODS,
+    _BLOCK_TRAVERSAL_METHODS,
+    _TRAVERSAL_INDEX_GENERATORS,
+    _TRAVERSAL_METHOD_ALIASES,
+    _is_power_of,
+    _largest_power_leq,
+    _largest_multiple_leq,
+    _smallest_power_geq,
+    _nearest_power,
+    _curve_base_for_method,
+    _block_size_for_method,
+    _normalize_traversal_method,
+    _validate_unfold_shape,
+    _normalize_unfold_request,
+    _validate_resize_side,
+    _select_resize_side,
+    _center_crop_metadata,
+    _excess_indices_for_crop,
+    _validate_traversal_indices,
+    _get_traversal_indices,
+    _inverse_transpose_order,
+    _copy_traversal_metadata,
+    _build_unfold_metadata,
+    _require_metadata,
+    _validate_unfolded_shape,
+    _extract_excess_values,
+    _unfold_payload_arrays,
+    _clone_unfold_metadata,
+    _crop_restore_shape,
+    _local_crop_indices,
+    _restore_real_stack,
+    _restore_reciprocal_stack,
+    _restore_both_matrix,
+    _infer_square_side,
+    _infer_row_major_original_shape,
+    _build_row_major_undo_metadata,
+    _unfold_array,
+)
+from fourdenoise_plotting import (
+    plot_traversals,
+)
+from fourdenoise_io import (
+    _HYPERDATA_HDF5_FORMAT,
+    _PEAK_SCAN_HDF5_FORMAT,
+    _HYPERDATA_HDF5_VERSION,
+    _HYPERDATA_HDF5_READABLE_VERSIONS,
+    _decode_hdf5_value,
+    _hdf5_dataset_kwargs,
+    _write_hdf5_value,
+    _read_hdf5_value,
+    _is_hyperdata_hdf5_file,
+    _checked_hyperdata_format_version,
+    _migrate_hyperdata_metadata,
+    _load_hyperdata_hdf5,
+    _format_hdf5_dataset_listing,
+    _select_hdf5_dataset,
+    _read_hdf5_file,
+)
 from typing import Union, Sequence, Tuple
+from fourdenoise_reductions import (
+    _get_dp_array,
+)
+from fourdenoise_resampling import _normalize_resize_shape, _resize_array, _resize_plan, _resize_spec
+from fourdenoise_strain import _StrainFitEngine, _match_peak_candidates, _validate_matching_parameters
+from fourdenoise_streaming import _stream_transform
+from fourdenoise_sources import DiffractionSource, _open_diffraction_source
+from fourdenoise_peaks import PeakScanResult, _validate_peak_options
+from fourdenoise_geometry import _polar_spec
+from fourdenoise_detectors import _virtual_image
+from fourdenoise_rosetta import unpack_reader_metadata
+from fourdenoise_metadata import (
+    _acquisition_summary,
+    _copy_acquisition_metadata,
+    _load_acquisition_metadata,
+    _validate_acquisition_shape,
+)
 from fourdenoise_rq import (
     RQCalibration,
     RQComparison,
     _coerce_rq_calibration,
     _reframe_rq_calibration,
+    _rq_center,
     _rotation_matrix as _rq_rotation_matrix,
 )
 from fourdenoise_geometry import (
+    _center_beam_metadata_from_pixels,
+    _resampled_center_beam_metadata,
+    _resized_data_metadata,
+    _transform_geometry,
+    _beam_center_pixels,
     _calibrated_center_to_pixels,
     _center_to_calibrated,
     _normalize_real_origin,
     _normalize_real_spacing,
     _normalize_unit_mode,
+    _parse_reciprocal_crop_limits,
     _parse_real_selection,
+    _polar_grid,
+    _reciprocal_crop_shape,
     _real_spacing_pair,
+    _resampled_cepstral_metadata,
+    _resampled_polar_metadata,
+    _resample_reciprocal_crop,
     _resolve_unit_mode,
     _scaled_real_spacing,
 )
 
 _SCALE_UNSET = object()
-_HYPERDATA_HDF5_FORMAT = '4denoise.hyperdata'
-_HYPERDATA_HDF5_VERSION = '1.1'
-_HYPERDATA_HDF5_READABLE_VERSIONS = ('1.0', '1.1')
 
 
 @dataclass(frozen=True)
@@ -152,94 +281,6 @@ class PeakDetectionResult:
         return ~self.synthetic_mask
 
 
-def _center_beam_metadata_from_pixels(radius_px, center_px, shape, *,
-                                      units=None, conv_factor=None,
-                                      **extra_metadata):
-    """Build direct-beam metadata from pixel-space beam parameters."""
-    shape = tuple(int(v) for v in shape)
-    if len(shape) != 2:
-        raise ValueError("Direct-beam metadata requires a 2D reciprocal shape.")
-
-    radius_px = float(radius_px)
-    center_px = tuple(float(v) for v in center_px)
-    if not np.isfinite(radius_px) or radius_px <= 0:
-        raise ValueError("Direct-beam radius must be positive and finite.")
-    if len(center_px) != 2 or not np.all(np.isfinite(center_px)):
-        raise ValueError("Direct-beam center must contain two finite values.")
-
-    metadata = {
-        'radius_px': radius_px,
-        'center_px': center_px,
-        'shape': shape,
-        'coordinate_convention': (
-            "center_px is an array-coordinate (ky, kx) pair. "
-            "center_calibrated, when present, is relative to the diffraction "
-            "origin with positive ky upward and positive kx to the right."
-        ),
-    }
-
-    has_units = units is not None
-    has_factor = conv_factor is not None
-    if has_units != has_factor:
-        raise ValueError(
-            "Direct-beam metadata cannot use a partial reciprocal-space "
-            "calibration. Define both units and conv_factor, or clear both."
-        )
-    if has_units:
-        if not np.isscalar(conv_factor) or conv_factor <= 0:
-            raise ValueError("conv_factor must be a positive scalar.")
-        metadata.update({
-            'calibrated_units': str(units).strip(),
-            'conv_factor': float(conv_factor),
-            'radius_calibrated': radius_px * float(conv_factor),
-            'center_calibrated': _center_to_calibrated(
-                center_px,
-                shape,
-                conv_factor,
-            ),
-        })
-
-    for key, value in extra_metadata.items():
-        if value is not None:
-            metadata[key] = deepcopy(value)
-
-    return metadata
-
-
-def _resampled_center_beam_metadata(metadata, old_shape, new_shape, *,
-                                    crop_origin=(0, 0), crop_shape=None,
-                                    units=None, conv_factor=None):
-    """Map a circular beam through an integer crop and isotropic resampling.
-
-    Return None when the old geometry is stale, the beam center is cropped out,
-    or unequal axis scales would turn the circle into an ellipse. Historical
-    alignment coordinates are not copied because they describe the old image.
-    """
-    if metadata is None:
-        return None
-    old_shape = tuple(old_shape)
-    new_shape = tuple(new_shape)
-    crop_shape = tuple(crop_shape) if crop_shape is not None else old_shape
-    if tuple(metadata.get('shape', ())) != old_shape:
-        return None
-    if 'center_px' not in metadata or 'radius_px' not in metadata:
-        return None
-
-    scales = np.asarray(new_shape, dtype=float) / np.asarray(crop_shape, dtype=float)
-    if not np.isclose(scales[0], scales[1]):
-        return None
-    center = np.asarray(metadata['center_px'], dtype=float)
-    origin = np.asarray(crop_origin, dtype=float)
-    new_center = (center - origin + 0.5) * scales - 0.5
-    if not np.all(np.isfinite(new_center)) or np.any(new_center < 0) or np.any(
-        new_center > np.asarray(new_shape) - 1
-    ):
-        return None
-    return _center_beam_metadata_from_pixels(
-        float(metadata['radius_px']) * scales[0], new_center, new_shape,
-        units=units, conv_factor=conv_factor,
-        source='resampling', parent_source=metadata.get('source'),
-    )
 
 
 def _validate_center_pair(value, name):
@@ -352,458 +393,10 @@ def _resolve_center_beam_parameters(shape, metadata=None, *, radius=None,
     return center_px, radius_px, resolved_metadata
 
 
-def _decode_hdf5_value(value):
-    """Convert HDF5 byte strings and NumPy scalars to Python values."""
-    if isinstance(value, bytes):
-        return value.decode('utf-8')
-    if isinstance(value, np.ndarray) and value.dtype.kind == 'S':
-        return value.astype(str)
-    if isinstance(value, np.ndarray) and value.dtype == object:
-        flat_values = value.ravel()
-        if all(isinstance(item, (bytes, str)) for item in flat_values):
-            decoded = [
-                item.decode('utf-8') if isinstance(item, bytes) else item
-                for item in flat_values
-            ]
-            return np.array(decoded, dtype=str).reshape(value.shape)
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
 
 
-def _hdf5_dataset_kwargs(value, compression, compression_opts):
-    """Return compression kwargs only when HDF5 supports them for the value."""
-    array = np.asarray(value)
-    if compression is None or array.shape == ():
-        return {}
-    kwargs = {'compression': compression}
-    if compression_opts is not None:
-        kwargs['compression_opts'] = compression_opts
-    return kwargs
 
 
-def _write_hdf5_value(parent, name, value, compression=None,
-                      compression_opts=None):
-    """Recursively write a Python metadata value into an HDF5 group."""
-    if value is None:
-        group = parent.create_group(name)
-        group.attrs['kind'] = 'none'
-        return
-
-    if isinstance(value, dict):
-        group = parent.create_group(name)
-        group.attrs['kind'] = 'dict'
-        for key, item in value.items():
-            key_name = str(key)
-            if '/' in key_name:
-                raise ValueError(
-                    "Metadata dictionary keys cannot contain '/'. "
-                    f"Got key {key_name!r}."
-                )
-            _write_hdf5_value(
-                group,
-                key_name,
-                item,
-                compression=compression,
-                compression_opts=compression_opts,
-            )
-        return
-
-    if isinstance(value, (list, tuple)):
-        group = parent.create_group(name)
-        group.attrs['kind'] = 'tuple' if isinstance(value, tuple) else 'list'
-        group.attrs['length'] = len(value)
-        for idx, item in enumerate(value):
-            _write_hdf5_value(
-                group,
-                f'item_{idx:08d}',
-                item,
-                compression=compression,
-                compression_opts=compression_opts,
-            )
-        return
-
-    if isinstance(value, str):
-        dtype = h5py.string_dtype(encoding='utf-8')
-        dataset = parent.create_dataset(name, data=value, dtype=dtype)
-        dataset.attrs['kind'] = 'str'
-        return
-
-    if isinstance(value, bytes):
-        dtype = h5py.string_dtype(encoding='utf-8')
-        dataset = parent.create_dataset(
-            name,
-            data=value.decode('utf-8'),
-            dtype=dtype,
-        )
-        dataset.attrs['kind'] = 'str'
-        return
-
-    if isinstance(value, np.ndarray):
-        if value.dtype == object:
-            group = parent.create_group(name)
-            group.attrs['kind'] = 'ndarray-object'
-            group.attrs['shape'] = value.shape
-            flat_values = value.ravel()
-            group.attrs['length'] = flat_values.size
-            for idx, item in enumerate(flat_values):
-                _write_hdf5_value(
-                    group,
-                    f'item_{idx:08d}',
-                    item,
-                    compression=compression,
-                    compression_opts=compression_opts,
-                )
-            return
-
-        if value.dtype.kind in {'U', 'S'}:
-            dtype = h5py.string_dtype(encoding='utf-8')
-            dataset = parent.create_dataset(
-                name,
-                data=value.astype(str),
-                dtype=dtype,
-            )
-        else:
-            dataset = parent.create_dataset(
-                name,
-                data=value,
-                **_hdf5_dataset_kwargs(value, compression, compression_opts),
-            )
-        dataset.attrs['kind'] = 'ndarray'
-        return
-
-    if np.isscalar(value):
-        dataset = parent.create_dataset(name, data=value)
-        dataset.attrs['kind'] = 'scalar'
-        return
-
-    raise TypeError(
-        f"Cannot save metadata value {name!r} with unsupported type "
-        f"{type(value).__name__}."
-    )
-
-
-def _read_hdf5_value(parent, name):
-    """Recursively read a Python metadata value from an HDF5 group."""
-    obj = parent[name]
-    kind = _decode_hdf5_value(obj.attrs.get('kind', 'ndarray'))
-
-    if kind == 'none':
-        return None
-
-    if isinstance(obj, h5py.Dataset):
-        value = obj[()]
-        return _decode_hdf5_value(value)
-
-    if kind == 'dict':
-        return {
-            key: _read_hdf5_value(obj, key)
-            for key in obj.keys()
-        }
-
-    if kind in {'list', 'tuple'}:
-        length = int(obj.attrs.get('length', len(obj.keys())))
-        values = [
-            _read_hdf5_value(obj, f'item_{idx:08d}')
-            for idx in range(length)
-        ]
-        return tuple(values) if kind == 'tuple' else values
-
-    if kind == 'ndarray-object':
-        shape = tuple(int(v) for v in obj.attrs['shape'])
-        length = int(obj.attrs.get('length', np.prod(shape)))
-        values = [
-            _read_hdf5_value(obj, f'item_{idx:08d}')
-            for idx in range(length)
-        ]
-        return np.array(values, dtype=object).reshape(shape)
-
-    raise ValueError(f"Unsupported HDF5 metadata kind {kind!r}.")
-
-
-def _is_hyperdata_hdf5_file(filename):
-    """Return True if filename is a 4Denoise HyperData HDF5 file."""
-    path = Path(filename).expanduser()
-    if not path.exists() or not path.is_file():
-        return False
-    try:
-        with h5py.File(path, 'r') as file:
-            file_format = _decode_hdf5_value(
-                file.attrs.get('fourdenoise_format', None)
-            )
-            return file_format == _HYPERDATA_HDF5_FORMAT
-    except OSError:
-        return False
-
-
-def _checked_hyperdata_format_version(file, path):
-    """Validate the on-disk schema before reading saved HyperData metadata."""
-    version = _decode_hdf5_value(file.attrs.get('format_version'))
-    if version is None:
-        raise ValueError(
-            f"'{path}' is missing its 4Denoise format_version; the saved "
-            "metadata schema cannot be determined safely."
-        )
-    if version not in _HYPERDATA_HDF5_READABLE_VERSIONS:
-        raise ValueError(
-            f"'{path}' uses unsupported 4Denoise format version "
-            f"{version!r}; this installation can read versions "
-            f"{', '.join(_HYPERDATA_HDF5_READABLE_VERSIONS)}."
-        )
-    return version
-
-
-def _migrate_hyperdata_metadata(metadata, version):
-    """Normalize each supported file schema to the current in-memory form."""
-    if version in _HYPERDATA_HDF5_READABLE_VERSIONS:
-        migrated = dict(metadata)
-        migrated.setdefault('real_origin', (0.0, 0.0))
-        if version == '1.0' and isinstance(migrated.get('unfold_metadata'), dict):
-            unfolded = dict(migrated['unfold_metadata'])
-            unfolded.setdefault(
-                'preserved_values_nbytes',
-                sum(values.nbytes for values in _unfold_payload_arrays(unfolded)),
-            )
-            migrated['unfold_metadata'] = unfolded
-        return migrated
-    raise ValueError(f"No metadata migration is defined for version {version!r}.")
-
-
-def _load_hyperdata_hdf5(filename):
-    """Load array and metadata from a 4Denoise HyperData HDF5 file."""
-    path = Path(filename).expanduser()
-    with h5py.File(path, 'r') as file:
-        file_format = _decode_hdf5_value(
-            file.attrs.get('fourdenoise_format', None)
-        )
-        if file_format != _HYPERDATA_HDF5_FORMAT:
-            raise ValueError(
-                f"'{path}' is not a 4Denoise HyperData file."
-            )
-        if 'array' not in file:
-            raise ValueError(f"'{path}' does not contain a saved data array.")
-
-        version = _checked_hyperdata_format_version(file, path)
-        array = file['array'][()]
-        metadata = {}
-        if 'metadata' in file:
-            metadata_group = file['metadata']
-            metadata = {
-                key: _read_hdf5_value(metadata_group, key)
-                for key in metadata_group.keys()
-            }
-    return array, _migrate_hyperdata_metadata(metadata, version)
-
-
-def _format_hdf5_dataset_listing(dataset_info):
-    """Format discovered HDF5 datasets for selection and error messages."""
-    if not dataset_info:
-        return '  (no datasets found)'
-
-    return '\n'.join(
-        f"  {info['path']}: shape={info['shape']}, "
-        f"ndim={info['ndim']}, dtype={info['dtype']}"
-        for info in dataset_info
-    )
-
-
-def _select_hdf5_dataset(file, dataset_path=None, *,
-                         selector_name='hdf5_dataset', exclude_internal=False):
-    """Select a numeric dataset without loading it into memory."""
-    path = Path(file.filename)
-    dataset_info = []
-
-    def _collect_dataset(name, obj):
-        if isinstance(obj, h5py.Dataset):
-            dataset_info.append({
-                'path': f'/{name}', 'shape': tuple(obj.shape),
-                'ndim': obj.ndim, 'dtype': str(obj.dtype),
-                'is_candidate': obj.ndim >= 2 and (
-                    np.issubdtype(obj.dtype, np.number)
-                    or np.issubdtype(obj.dtype, np.bool_)
-                ),
-            })
-
-    file.visititems(_collect_dataset)
-    if dataset_path is not None:
-        if not isinstance(dataset_path, (str, Path)):
-            raise TypeError(
-                f"{selector_name} must be a string or pathlib.Path."
-            )
-        selected_path = str(dataset_path).replace('\\', '/')
-        if not selected_path.strip('/'):
-            raise ValueError(f"{selector_name} must name a dataset.")
-        if not selected_path.startswith('/'):
-            selected_path = f'/{selected_path}'
-        try:
-            selected = file[selected_path]
-        except KeyError as exc:
-            listing = _format_hdf5_dataset_listing(dataset_info)
-            raise KeyError(
-                f"HDF5 dataset '{selected_path}' was not found in "
-                f"'{path}'.\nAvailable datasets:\n{listing}"
-            ) from exc
-        if not isinstance(selected, h5py.Dataset):
-            raise ValueError(
-                f"HDF5 path '{selected_path}' refers to a group, not a dataset."
-            )
-        if selected.ndim < 2:
-            raise ValueError(
-                f"HDF5 dataset '{selected_path}' has {selected.ndim} "
-                "dimension(s); HyperData requires at least 2."
-            )
-        if not (
-            np.issubdtype(selected.dtype, np.number)
-            or np.issubdtype(selected.dtype, np.bool_)
-        ):
-            raise TypeError(
-                f"HDF5 dataset '{selected_path}' has non-numeric dtype "
-                f"{selected.dtype}."
-            )
-        return selected
-
-    candidates = [
-        info for info in dataset_info
-        if info['is_candidate'] and (
-            not exclude_internal
-            or not any(
-                part.startswith('#') for part in info['path'].split('/')
-            )
-        )
-    ]
-    if len(candidates) == 1:
-        return file[candidates[0]['path']]
-    if not candidates:
-        listing = _format_hdf5_dataset_listing(dataset_info)
-        raise ValueError(
-            f"No numeric dataset with at least 2 dimensions was found "
-            f"in '{path}'.\nAvailable datasets:\n{listing}"
-        )
-    listing = _format_hdf5_dataset_listing(candidates)
-    raise ValueError(
-        f"{len(candidates)} numeric multidimensional datasets were "
-        f"found in '{path}'. Select one with "
-        f"HyperData(filename, {selector_name}='/path/to/dataset').\n"
-        f"Candidate datasets:\n{listing}"
-    )
-
-
-def _read_hdf5_file(filename, dataset_path=None):
-    """Load a selected generic HDF5 dataset into a NumPy array."""
-    path = Path(filename).expanduser()
-    if not path.exists():
-        raise FileNotFoundError(f"'{path}' does not exist.")
-    if not path.is_file():
-        raise ValueError(f"'{path}' is not a file.")
-    try:
-        with h5py.File(path, 'r') as file:
-            return _select_hdf5_dataset(file, dataset_path)[()]
-    except OSError as exc:
-        raise ValueError(f"Could not open '{path}' as an HDF5 file.") from exc
-
-
-class _HDF5ChunkReader:
-    """Read-only, bounded-memory access to 3D/4D HDF5 diffraction data."""
-
-    def __init__(self, dataset, hyperdata_type, metadata=None):
-        if dataset.ndim not in (3, 4):
-            raise ValueError(
-                "Chunked HDF5 access requires a 3D stack or 4D-STEM dataset."
-            )
-        self._dataset = dataset
-        self._hyperdata_type = hyperdata_type
-        self._metadata = metadata or {}
-        self._closed = False
-        self.shape = tuple(dataset.shape)
-        self.dtype = dataset.dtype
-        self.ndim = dataset.ndim
-
-    def _require_open(self):
-        if self._closed:
-            raise RuntimeError("The HDF5 reader is closed; use it inside the with block.")
-
-    def get_dp(self, *scan_indices):
-        """Load one diffraction pattern at a scan index without reading the stack."""
-        self._require_open()
-        expected = self.ndim - 2
-        if len(scan_indices) != expected:
-            raise ValueError(f"Expected {expected} scan index/indices.")
-        for index, size in zip(scan_indices, self.shape[:expected]):
-            if isinstance(index, (bool, np.bool_)) or not isinstance(
-                index, (Integral, np.integer)
-            ):
-                raise TypeError("Scan indices must be integers.")
-            if not 0 <= index < size:
-                raise IndexError(f"Scan index {index} is outside [0, {size}).")
-        pattern = self._dataset[scan_indices + (slice(None), slice(None))]
-        return ReciprocalSpace(
-            pattern,
-            units=self._metadata.get('reciprocal_units'),
-            conv_factor=self._metadata.get('reciprocal_conv_factor'),
-            polar_metadata=self._metadata.get('polar_metadata'),
-            center_beam_metadata=self._metadata.get('center_beam_metadata'),
-        )
-
-    def iter_chunks(self, chunk_shape=16):
-        """Yield ``(scan_slices, HyperData)`` blocks bounded by chunk_shape.
-
-        A scalar selects that many scan positions along each leading axis.
-        Pass a two-tuple for 4D data or a one-tuple for a 3D stack. Returned
-        chunks own their NumPy data and remain usable after the reader closes.
-        """
-        self._require_open()
-        n_scan_axes = self.ndim - 2
-        if isinstance(chunk_shape, (Integral, np.integer)) and not isinstance(
-            chunk_shape, (bool, np.bool_)
-        ):
-            lengths = (int(chunk_shape),) * n_scan_axes
-        else:
-            try:
-                lengths = tuple(chunk_shape)
-            except TypeError as exc:
-                raise ValueError("chunk_shape must contain positive integers.") from exc
-        if len(lengths) != n_scan_axes or any(
-            isinstance(length, (bool, np.bool_))
-            or not isinstance(length, (Integral, np.integer)) or length < 1
-            for length in lengths
-        ):
-            raise ValueError(
-                f"chunk_shape must contain {n_scan_axes} positive integer(s)."
-            )
-
-        scan_shape = self.shape[:n_scan_axes]
-        grid_shape = tuple(
-            (size + length - 1) // length
-            for size, length in zip(scan_shape, lengths)
-        )
-        for block_index in np.ndindex(*grid_shape):
-            self._require_open()
-            scan_slices = tuple(
-                slice(index * length, min((index + 1) * length, size))
-                for index, length, size in zip(block_index, lengths, scan_shape)
-            )
-            block = self._dataset[scan_slices + (slice(None), slice(None))]
-            origin = self._metadata.get('real_origin', (0.0, 0.0))
-            if self.ndim == 4:
-                real_step = _real_spacing_pair(
-                    self._metadata.get('real_conv_factor')
-                )
-                origin = tuple(
-                    value + scan_slice.start * step
-                    for value, scan_slice, step in zip(origin, scan_slices, real_step)
-                )
-            yield scan_slices, self._hyperdata_type(
-                block,
-                real_units=self._metadata.get('real_units'),
-                real_conv_factor=self._metadata.get('real_conv_factor'),
-                real_origin=origin,
-                reciprocal_units=self._metadata.get('reciprocal_units'),
-                reciprocal_conv_factor=self._metadata.get('reciprocal_conv_factor'),
-                polar_metadata=self._metadata.get('polar_metadata'),
-                center_beam_metadata=self._metadata.get('center_beam_metadata'),
-                rq_calibration=self._metadata.get('rq_calibration'),
-            )
-    
 #%%
 
 # =============================================================================
@@ -1292,10 +885,10 @@ def add_poisson_noise(array, counts):
     noisy_array = np.copy(array)
     noisy_array[noisy_array < 0] = 0
     noisy_array /= np.sum(noisy_array)
-    
+
     # Apply Poisson noise
-    noisy_array = np.random.default_rng().poisson(noisy_array * counts,) 
-    
+    noisy_array = np.random.default_rng().poisson(noisy_array * counts,)
+
     return noisy_array
 
 def get_surface_tilt_and_direction(surface, units='rad', show_results=True, figsize=(8, 5)):
@@ -1328,15 +921,15 @@ def get_surface_tilt_and_direction(surface, units='rad', show_results=True, figs
     magnitude and direction are set based on the boundary conditions and may not accurately
     represent the actual tilt due to the lack of neighboring data.
     """
-    
+
     # Compute gradients along x and y axes
     gy, gx = np.gradient(surface)
-    
+
     # Calculate gradient magnitude and then calculate arctan of this magnitude
     gradient_magnitude = np.sqrt(gx**2 + gy**2)
     tilt_magnitude = np.arctan(gradient_magnitude)
     tilt_direction = np.arctan2(gy, gx) + np.pi
-    
+
     # Convert tilt magnitude and direction to degrees if required
     if units == 'deg':
         tilt_magnitude = np.degrees(tilt_magnitude)
@@ -1344,7 +937,7 @@ def get_surface_tilt_and_direction(surface, units='rad', show_results=True, figs
         unit_label = '(°)'
     else:
         unit_label = '(rad)'
-    
+
     if show_results:
         fig, axs = plt.subplots(1, 2, figsize=figsize)
 
@@ -1354,18 +947,18 @@ def get_surface_tilt_and_direction(surface, units='rad', show_results=True, figs
         axs[0].set_title('Azimuthal\nAngle', fontsize=8)
         cbar1 = fig.colorbar(im1, ax=axs[0],)
         cbar1.ax.set_title(r'$\phi$ '+unit_label, fontsize=8, pad=5)
-        
+
         # Second subplot
         im2 = axs[1].imshow(tilt_magnitude, cmap='gray')
         axs[1].axis('off')
         axs[1].set_title('Elevation\nAngle', fontsize=8)
         cbar2 = fig.colorbar(im2, ax=axs[1],)
         cbar2.ax.set_title(r'$\theta$ '+unit_label, fontsize=8, pad=5)
-        
+
         # Adjust layout to make the subplots fit well
         plt.tight_layout()
         plt.show()
-    
+
     return tilt_direction, tilt_magnitude
 
 
@@ -1391,21 +984,21 @@ def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
     -------
     rgb_image : ndarray
         An array representing the RGB visualization of the input field.
-    
+
     Notes
     -----
     This code is based on the MATLAB code written by [author] in [date].
     """
-    
+
     if isinstance(field, tuple):
         phase, amplitude = field
     else:
         phase = np.angle(field)
         amplitude = np.abs(field)
-    
+
     # Normalize amplitude
     amplitude = amplitude/np.max(amplitude)
-    
+
     if Amp == 'uniform':
         amplitude = np.ones_like(amplitude)
     elif Amp == 'log':
@@ -1425,7 +1018,7 @@ def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
         plt.axis('off')
         plt.imshow(rgb_image)
         plt.show()
-    
+
     if scale:
         # Color wheel
         phase = np.linspace(0, 2 * np.pi, 256)
@@ -1440,13 +1033,13 @@ def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
         mask = x**2 + y**2 > 1
         z[mask] = np.nan
 
-        hue = np.angle(z)     
+        hue = np.angle(z)
         idx = np.clip(((hue + np.pi) / (2 * np.pi) * 255).astype(int), 0, 255)
         color_wheel = colorwheel[idx]
         color_wheel = (color_wheel.T * np.abs(z)).T
         color_wheel = np.rot90(color_wheel, 2)
         color_wheel[np.isnan(color_wheel)] = 1.0
-            
+
         if subplot:
             fig, axs = plt.subplots(1, 2, figsize=(12, 6))  # Unified figure creation
             axs[0].imshow(rgb_image)
@@ -1469,2008 +1062,17 @@ def visualize_field_phase_amplitude(field, Amp='raw', scale=True, subplot=True):
 
     return rgb_image
 
-def _row_major_indices(shape):
-    """Return row-major ``(y, x)`` traversal indices for a 2D grid."""
-    y_size, x_size = shape
-    return np.array(
-        [(y_idx, x_idx) for y_idx in range(y_size) for x_idx in range(x_size)],
-        dtype=int,
-    )
 
 
-def _serpentine_indices(shape):
-    """
-    Return left-to-right/right-to-left alternating row traversal indices.
 
-    This keeps consecutive elements adjacent when crossing from one row to the
-    next, which is useful for scan paths that physically snake through the grid.
-    """
-    y_size, x_size = shape
-    indices = []
-    for y_idx in range(y_size):
-        if y_idx % 2 == 0:
-            x_range = range(x_size)
-        else:
-            x_range = range(x_size - 1, -1, -1)
-        indices.extend((y_idx, x_idx) for x_idx in x_range)
-    return np.array(indices, dtype=int)
 
 
-def _spiral_indices(shape):
-    """
-    Return top-left clockwise inward spiral traversal indices for a 2D grid.
 
-    The path starts across the top row, moves down the right column, then left
-    across the bottom row, up the left column, and repeats inward.
-    """
-    y_size, x_size = shape
-    top = 0
-    bottom = y_size - 1
-    left = 0
-    right = x_size - 1
-    indices = []
 
-    while top <= bottom and left <= right:
-        for x_idx in range(left, right + 1):
-            indices.append((top, x_idx))
-        top += 1
 
-        for y_idx in range(top, bottom + 1):
-            indices.append((y_idx, right))
-        right -= 1
 
-        if top <= bottom:
-            for x_idx in range(right, left - 1, -1):
-                indices.append((bottom, x_idx))
-            bottom -= 1
 
-        if left <= right:
-            for y_idx in range(bottom, top - 1, -1):
-                indices.append((y_idx, left))
-            left += 1
 
-    return np.array(indices, dtype=int)
-
-
-def _diagonal_zigzag_indices(shape):
-    """
-    Traverse anti-diagonals while alternating direction on each diagonal.
-
-    This is not a fractal space-filling curve, but it is a simple
-    locality-preserving baseline used in image compression and scanning.
-    """
-    y_size, x_size = shape
-    indices = []
-    for diag in range(y_size + x_size - 1):
-        y_start = max(0, diag - x_size + 1)
-        y_stop = min(y_size - 1, diag)
-        diagonal = [(y_idx, diag - y_idx) for y_idx in range(y_start, y_stop + 1)]
-        if diag % 2 == 0:
-            diagonal.reverse()
-        indices.extend(diagonal)
-    return np.array(indices, dtype=int)
-
-
-def _hilbert_d2yx(side, distance):
-    """
-    Convert Hilbert distance to ``(y, x)`` for a power-of-2 square.
-
-    This is the standard iterative d2xy Hilbert algorithm. It is written in
-    ``(x, y)`` internally and returned as ``(y, x)`` to match array indexing.
-    """
-    x_coord = 0
-    y_coord = 0
-    t_val = int(distance)
-    scale = 1
-
-    while scale < side:
-        rx = 1 & (t_val // 2)
-        ry = 1 & (t_val ^ rx)
-        if ry == 0:
-            if rx == 1:
-                x_coord = scale - 1 - x_coord
-                y_coord = scale - 1 - y_coord
-            x_coord, y_coord = y_coord, x_coord
-
-        x_coord += scale * rx
-        y_coord += scale * ry
-        t_val //= 4
-        scale *= 2
-
-    return y_coord, x_coord
-
-
-def _hilbert_indices(shape):
-    """Return a discrete Hilbert traversal for a power-of-2 square."""
-    side_y, side_x = shape
-    if side_y != side_x or not _is_power_of(side_y, 2):
-        raise ValueError("Hilbert traversal requires a power-of-2 square.")
-    return np.array(
-        [_hilbert_d2yx(side_y, distance) for distance in range(side_y * side_y)],
-        dtype=int,
-    )
-
-
-def _morton_code(y_idx, x_idx):
-    """Interleave the binary bits of ``y`` and ``x`` into a Morton code."""
-    code = 0
-    bit = 0
-    max_val = max(int(y_idx), int(x_idx))
-    while (1 << bit) <= max_val:
-        code |= ((x_idx >> bit) & 1) << (2 * bit)
-        code |= ((y_idx >> bit) & 1) << (2 * bit + 1)
-        bit += 1
-    return code
-
-
-def _morton_indices(shape):
-    """
-    Return Morton/Z-order traversal for a power-of-2 square.
-
-    Coordinates are sorted by interleaving the binary bits of row and column
-    indices. This is less continuous than Hilbert, but useful as a hierarchical
-    locality-preserving baseline.
-    """
-    side_y, side_x = shape
-    if side_y != side_x or not _is_power_of(side_y, 2):
-        raise ValueError("Morton/Z-order traversal requires a power-of-2 square.")
-    coords = [(y_idx, x_idx) for y_idx in range(side_y) for x_idx in range(side_x)]
-    coords.sort(key=lambda coord: _morton_code(coord[0], coord[1]))
-    return np.array(coords, dtype=int)
-
-
-def _peano_indices(shape):
-    """
-    Return a recursive Peano traversal for a power-of-3 square.
-
-    The first-order path traverses a 3x3 square in a ``2``-shaped motif. Higher
-    orders recursively orient each child block so adjacent children connect by a
-    nearest-neighbor step. This alternates ``2``- and ``S``-like motifs across
-    the grid, avoiding the disconnected repeated-block pattern that a naive
-    serpentine recursion would produce.
-    """
-    side_y, side_x = shape
-    if side_y != side_x or not _is_power_of(side_y, 3):
-        raise ValueError("Peano traversal requires a power-of-3 square.")
-
-    order = 0
-    side = side_y
-    while side > 1:
-        side //= 3
-        order += 1
-
-    return np.array(_peano_path(order), dtype=int)
-
-
-def _opposite_corner(corner):
-    """Return the diagonally opposite corner name for a square block."""
-    opposites = {
-        'NW': 'SE',
-        'SE': 'NW',
-        'NE': 'SW',
-        'SW': 'NE',
-    }
-    return opposites[corner]
-
-
-def _peano_base_path(start_corner='NW', end_corner='SE'):
-    """
-    Return an oriented 3x3 Peano base path between opposite corners.
-
-    The canonical orientation starts at ``NW`` and ends at ``SE``:
-    right, right, down, left, left, down, right, right. Reflections provide the
-    other opposite-corner orientations while preserving nearest-neighbor steps.
-    """
-    if _opposite_corner(start_corner) != end_corner:
-        raise ValueError(
-            "Peano child curves require opposite start and end corners."
-        )
-
-    path = np.array(
-        [
-            (0, 0), (0, 1), (0, 2),
-            (1, 2), (1, 1), (1, 0),
-            (2, 0), (2, 1), (2, 2),
-        ],
-        dtype=int,
-    )
-
-    if start_corner in {'SW', 'SE'}:
-        path[:, 0] = 2 - path[:, 0]
-    if start_corner in {'NE', 'SE'}:
-        path[:, 1] = 2 - path[:, 1]
-
-    return path
-
-
-def _peano_next_entry_corner(direction, exit_corner):
-    """Return the child entry corner compatible with a neighboring block step."""
-    compatible_entries = {
-        (0, 1): {'NE': 'NW', 'SE': 'SW'},
-        (0, -1): {'NW': 'NE', 'SW': 'SE'},
-        (1, 0): {'SW': 'NW', 'SE': 'NE'},
-        (-1, 0): {'NW': 'SW', 'NE': 'SE'},
-    }
-    direction = tuple(int(v) for v in direction)
-    if direction not in compatible_entries:
-        raise ValueError(f"Invalid Peano block direction {direction}.")
-    if exit_corner not in compatible_entries[direction]:
-        raise ValueError(
-            f"Peano child exit corner '{exit_corner}' is incompatible with "
-            f"block direction {direction}."
-        )
-    return compatible_entries[direction][exit_corner]
-
-
-def _peano_path(order, start_corner='NW', end_corner='SE'):
-    """Return recursive Peano coordinates for a ``3**order`` square."""
-    if order < 0:
-        raise ValueError("order must be non-negative.")
-    if order == 0:
-        return ((0, 0),)
-
-    macro_path = _peano_base_path(start_corner, end_corner)
-    if order == 1:
-        return tuple(map(tuple, macro_path))
-
-    sub_side = 3 ** (order - 1)
-    coords = []
-    child_start = start_corner
-
-    for block_idx, block in enumerate(macro_path):
-        if block_idx < len(macro_path) - 1:
-            direction = macro_path[block_idx + 1] - block
-            child_end = _opposite_corner(child_start)
-            next_child_start = _peano_next_entry_corner(direction, child_end)
-        else:
-            child_end = end_corner
-            next_child_start = None
-            if _opposite_corner(child_start) != child_end:
-                raise RuntimeError(
-                    "Could not orient the final Peano child block continuously."
-                )
-
-        child = _peano_path(order - 1, child_start, child_end)
-        offset = block * sub_side
-        coords.extend(
-            (y_idx + offset[0], x_idx + offset[1])
-            for y_idx, x_idx in child
-        )
-        child_start = next_child_start
-
-    return tuple(coords)
-
-
-def _corner_coordinate(corner, side):
-    """Return the local ``(y, x)`` coordinate of a named square corner."""
-    corners = {
-        'NW': (0, 0),
-        'NE': (0, side - 1),
-        'SW': (side - 1, 0),
-        'SE': (side - 1, side - 1),
-    }
-    return corners[corner]
-
-
-def _compatible_corner_pairs(direction):
-    """Return adjacent exit/entry corner pairs for neighboring 3x3 blocks."""
-    if direction == (0, 1):
-        return [('NE', 'NW'), ('SE', 'SW')]
-    if direction == (0, -1):
-        return [('NW', 'NE'), ('SW', 'SE')]
-    if direction == (1, 0):
-        return [('SW', 'NW'), ('SE', 'NE')]
-    if direction == (-1, 0):
-        return [('NW', 'SW'), ('NE', 'SE')]
-    raise ValueError(f"Invalid block direction {direction}.")
-
-
-def _base_meander_path(start_corner, end_corner):
-    """Find a 3x3 Hamiltonian path between two square corners."""
-    start = _corner_coordinate(start_corner, 3)
-    end = _corner_coordinate(end_corner, 3)
-    if start == end:
-        raise ValueError("start_corner and end_corner must differ.")
-
-    path = [start]
-    visited = {start}
-
-    def neighbor_score(cell):
-        y_idx, x_idx = cell
-        onward = 0
-        for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
-            neighbor = (y_idx + dy, x_idx + dx)
-            if (
-                0 <= neighbor[0] < 3
-                and 0 <= neighbor[1] < 3
-                and neighbor not in visited
-            ):
-                onward += 1
-        distance_to_end = abs(y_idx - end[0]) + abs(x_idx - end[1])
-        return onward, distance_to_end
-
-    def dfs(cell):
-        if len(path) == 9:
-            return cell == end
-
-        y_idx, x_idx = cell
-        candidates = []
-        for dy, dx in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
-            neighbor = (y_idx + dy, x_idx + dx)
-            if 0 <= neighbor[0] < 3 and 0 <= neighbor[1] < 3:
-                if neighbor in visited:
-                    continue
-                if neighbor == end and len(path) != 8:
-                    continue
-                candidates.append(neighbor)
-
-        candidates.sort(key=neighbor_score)
-        for neighbor in candidates:
-            visited.add(neighbor)
-            path.append(neighbor)
-            if dfs(neighbor):
-                return True
-            path.pop()
-            visited.remove(neighbor)
-        return False
-
-    if not dfs(start):
-        raise RuntimeError(
-            f"Could not construct 3x3 meander path from {start_corner} to {end_corner}."
-        )
-    return tuple(path)
-
-
-def _meander_block_template(start_corner, end_corner):
-    """
-    Build a 3x3 block traversal with corner-aware child orientations.
-
-    This alternates local 2-like and S-like motifs so neighboring child curves
-    connect continuously across block boundaries.
-    """
-    corner_blocks = {
-        'NW': (0, 0),
-        'NE': (0, 2),
-        'SW': (2, 0),
-        'SE': (2, 2),
-    }
-    start_block = corner_blocks[start_corner]
-    end_block = corner_blocks[end_corner]
-    path = [(start_block, start_corner, None)]
-    visited = {start_block}
-
-    def ordered_neighbors(block):
-        y_idx, x_idx = block
-        if y_idx % 2 == 0:
-            directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]
-        else:
-            directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
-
-        for direction in directions:
-            neighbor = (y_idx + direction[0], x_idx + direction[1])
-            if 0 <= neighbor[0] < 3 and 0 <= neighbor[1] < 3:
-                yield neighbor, direction
-
-    def dfs(current_block, current_start):
-        if len(path) == 9:
-            if current_block != end_block or current_start == end_corner:
-                return False
-            path[-1] = (current_block, current_start, end_corner)
-            return True
-
-        for next_block, direction in ordered_neighbors(current_block):
-            if next_block in visited:
-                continue
-            remaining = 9 - len(path)
-            if next_block == end_block and remaining != 1:
-                continue
-
-            for exit_corner, entry_corner in _compatible_corner_pairs(direction):
-                if exit_corner == current_start:
-                    continue
-                path[-1] = (current_block, current_start, exit_corner)
-                visited.add(next_block)
-                path.append((next_block, entry_corner, None))
-                if dfs(next_block, entry_corner):
-                    return True
-                path.pop()
-                visited.remove(next_block)
-                path[-1] = (current_block, current_start, None)
-
-        return False
-
-    if not dfs(start_block, start_corner):
-        raise RuntimeError(
-            f"Could not construct meander block from {start_corner} to {end_corner}."
-        )
-    return tuple(path)
-
-
-def _peano_meander_path(order, start_corner='NW', end_corner='SE'):
-    """
-    Return a recursive Peano-meander path for ``3**order`` square grids.
-
-    This is not a mathematically strict Peano curve. It is a Peano-like
-    ternary meander that fills powers-of-3 grids with continuous nearest-neighbor
-    steps while alternating child-curve orientation for better block-to-block
-    continuity.
-    """
-    if order == 1:
-        return _base_meander_path(start_corner, end_corner)
-
-    sub_side = 3 ** (order - 1)
-    coords = []
-    for (block_y, block_x), child_start, child_end in _meander_block_template(
-        start_corner,
-        end_corner,
-    ):
-        child = _peano_meander_path(order - 1, child_start, child_end)
-        coords.extend(
-            (y_idx + block_y * sub_side, x_idx + block_x * sub_side)
-            for y_idx, x_idx in child
-        )
-    return tuple(coords)
-
-
-def _peano_meander_indices(shape):
-    """
-    Return a Peano-like ternary meander traversal for a power-of-3 square.
-
-    This curve is useful when a continuous power-of-3 locality-preserving path is
-    desired, while avoiding the repeated local motif in the simpler Peano-style
-    implementation.
-    """
-    side_y, side_x = shape
-    if side_y != side_x or not _is_power_of(side_y, 3):
-        raise ValueError("Peano-meander traversal requires a power-of-3 square.")
-
-    order = 0
-    side = side_y
-    while side > 1:
-        side //= 3
-        order += 1
-
-    return np.array(_peano_meander_path(order), dtype=int)
-
-
-_MEANDER4_BLOCK_SIZE = 4
-_MEANDER4_CORNERS = {
-    'NW': (0, 0),
-    'NE': (0, _MEANDER4_BLOCK_SIZE - 1),
-    'SW': (_MEANDER4_BLOCK_SIZE - 1, 0),
-    'SE': (_MEANDER4_BLOCK_SIZE - 1, _MEANDER4_BLOCK_SIZE - 1),
-}
-_MEANDER4_SIDE_EXIT_CORNERS = {
-    'N': ('NW', 'NE'),
-    'E': ('NE', 'SE'),
-    'S': ('SW', 'SE'),
-    'W': ('NW', 'SW'),
-}
-_MEANDER4_DIRECTION_TO_SIDE = {
-    (0, 1): 'E',
-    (0, -1): 'W',
-    (1, 0): 'S',
-    (-1, 0): 'N',
-}
-_MEANDER4_NEXT_ENTRY = {
-    ((0, 1), 'NE'): 'NW',
-    ((0, 1), 'SE'): 'SW',
-    ((0, -1), 'NW'): 'NE',
-    ((0, -1), 'SW'): 'SE',
-    ((1, 0), 'SW'): 'NW',
-    ((1, 0), 'SE'): 'NE',
-    ((-1, 0), 'NW'): 'SW',
-    ((-1, 0), 'NE'): 'SE',
-}
-_MEANDER4_BASE_NW_NE = np.array(
-    [
-        (0, 0),
-        (1, 0), (2, 0), (3, 0),
-        (3, 1), (3, 2), (3, 3),
-        (2, 3), (1, 3),
-        (1, 2),
-        (2, 2),
-        (2, 1),
-        (1, 1), (0, 1),
-        (0, 2), (0, 3),
-    ],
-    dtype=int,
-)
-
-
-def _meander4_transform_path(path, transform_name):
-    """Apply a square symmetry transform to a 4x4 meander tile path."""
-    size = _MEANDER4_BLOCK_SIZE
-    y_idx = path[:, 0]
-    x_idx = path[:, 1]
-
-    if transform_name == 'identity':
-        transformed = np.column_stack([y_idx, x_idx])
-    elif transform_name == 'rot90':
-        transformed = np.column_stack([x_idx, size - 1 - y_idx])
-    elif transform_name == 'rot180':
-        transformed = np.column_stack([size - 1 - y_idx, size - 1 - x_idx])
-    elif transform_name == 'rot270':
-        transformed = np.column_stack([size - 1 - x_idx, y_idx])
-    elif transform_name == 'flip_y':
-        transformed = np.column_stack([size - 1 - y_idx, x_idx])
-    elif transform_name == 'flip_x':
-        transformed = np.column_stack([y_idx, size - 1 - x_idx])
-    elif transform_name == 'diag':
-        transformed = np.column_stack([x_idx, y_idx])
-    elif transform_name == 'anti_diag':
-        transformed = np.column_stack([size - 1 - x_idx, size - 1 - y_idx])
-    else:
-        raise ValueError(f"Unknown meander-4 transform '{transform_name}'.")
-
-    return transformed.astype(int)
-
-
-def _meander4_corner_name(coord):
-    """Return the named 4x4 block corner at ``coord``."""
-    coord = tuple(int(v) for v in coord)
-    for name, corner in _MEANDER4_CORNERS.items():
-        if coord == corner:
-            return name
-    return None
-
-
-def _meander4_tile_paths():
-    """
-    Return oriented 4x4 meander tile paths between adjacent corners.
-
-    The canonical tile is the user-specified path from ``NW`` to ``NE``:
-    down x3, right x3, up x2, left, down, left, up x2, right x2. Direct square
-    symmetries generate the remaining orientations while preserving that motif.
-    """
-    transforms = (
-        'identity',
-        'rot90',
-        'rot180',
-        'rot270',
-        'flip_y',
-        'flip_x',
-        'diag',
-        'anti_diag',
-    )
-    tile_paths = {}
-    for transform_name in transforms:
-        path = _meander4_transform_path(_MEANDER4_BASE_NW_NE, transform_name)
-        start_corner = _meander4_corner_name(path[0])
-        end_corner = _meander4_corner_name(path[-1])
-        tile_paths[(start_corner, end_corner)] = path
-    return tile_paths
-
-
-_MEANDER4_TILE_PATHS = _meander4_tile_paths()
-
-
-def _meander4_corners_are_adjacent(first_corner, second_corner):
-    """Return True when two 4x4 block corners share a block side."""
-    first_y, first_x = _MEANDER4_CORNERS[first_corner]
-    second_y, second_x = _MEANDER4_CORNERS[second_corner]
-    distance = abs(first_y - second_y) + abs(first_x - second_x)
-    return distance == _MEANDER4_BLOCK_SIZE - 1
-
-
-def _meander4_choose_exit_corner(entry_corner, direction):
-    """Choose the exit corner for a block-to-block step."""
-    side = _MEANDER4_DIRECTION_TO_SIDE[direction]
-    for exit_corner in _MEANDER4_SIDE_EXIT_CORNERS[side]:
-        if (
-            exit_corner != entry_corner
-            and _meander4_corners_are_adjacent(entry_corner, exit_corner)
-        ):
-            return exit_corner
-    raise ValueError(
-        f"No meander-4 exit corner for entry='{entry_corner}', direction={direction}."
-    )
-
-
-def _meander4_indices(shape):
-    """
-    Return a 4x4 Greek-key meander traversal for dimensions divisible by 4.
-
-    The array is divided into 4x4 tiles. The first tile follows the exact local
-    step pattern ``down x3, right x3, up x2, left, down, left, up x2, right x2``.
-    Tiles are then visited along an inward spiral, with each tile orientation
-    chosen so neighboring tiles connect by a one-pixel step. Rectangular
-    ``4*Ny`` by ``4*Nx`` grids are supported.
-    """
-    height, width = tuple(int(v) for v in shape)
-    if height <= 0 or width <= 0:
-        raise ValueError("meander-4 traversal shape must be positive.")
-    if height % _MEANDER4_BLOCK_SIZE != 0 or width % _MEANDER4_BLOCK_SIZE != 0:
-        raise ValueError(
-            "meander-4 traversal requires both dimensions to be multiples of 4."
-        )
-
-    block_rows = height // _MEANDER4_BLOCK_SIZE
-    block_cols = width // _MEANDER4_BLOCK_SIZE
-    block_order = [tuple(coord) for coord in _spiral_indices((block_rows, block_cols))]
-    coords = []
-    entry_corner = 'NW'
-
-    for block_idx, (block_y, block_x) in enumerate(block_order):
-        if block_idx < len(block_order) - 1:
-            next_block = block_order[block_idx + 1]
-            direction_to_next = (
-                next_block[0] - block_y,
-                next_block[1] - block_x,
-            )
-            exit_corner = _meander4_choose_exit_corner(
-                entry_corner,
-                direction_to_next,
-            )
-            next_entry_corner = _MEANDER4_NEXT_ENTRY[
-                (direction_to_next, exit_corner)
-            ]
-        else:
-            for candidate_corner in ('NE', 'SE', 'SW', 'NW'):
-                if (
-                    candidate_corner != entry_corner
-                    and _meander4_corners_are_adjacent(
-                        entry_corner,
-                        candidate_corner,
-                    )
-                ):
-                    exit_corner = candidate_corner
-                    break
-            next_entry_corner = None
-
-        local_path = _MEANDER4_TILE_PATHS[(entry_corner, exit_corner)]
-        offset = np.array(
-            [
-                block_y * _MEANDER4_BLOCK_SIZE,
-                block_x * _MEANDER4_BLOCK_SIZE,
-            ]
-        )
-        coords.extend(
-            (y_idx + offset[0], x_idx + offset[1])
-            for y_idx, x_idx in local_path
-        )
-        entry_corner = next_entry_corner
-
-    return np.array(coords, dtype=int)
-
-
-_MEANDER5_BLOCK_SIZE = 5
-_MEANDER5_SIDE_COORDS = {
-    'N': (0, 2),
-    'E': (2, 4),
-    'S': (4, 2),
-    'W': (2, 0),
-    'C': (2, 2),
-}
-_MEANDER5_DIRECTION_TO_SIDE = {
-    (0, 1): 'E',
-    (0, -1): 'W',
-    (1, 0): 'S',
-    (-1, 0): 'N',
-}
-_MEANDER5_OPPOSITE_SIDE = {
-    'N': 'S',
-    'S': 'N',
-    'E': 'W',
-    'W': 'E',
-}
-_MEANDER5_STEP_DIRECTIONS = ((0, 1), (1, 0), (0, -1), (-1, 0))
-_MEANDER5_SPIRAL_RANK = {
-    tuple(coord): idx
-    for idx, coord in enumerate(_spiral_indices((_MEANDER5_BLOCK_SIZE, _MEANDER5_BLOCK_SIZE)))
-}
-
-
-@lru_cache(maxsize=None)
-def _meander5_block_path(entry_side, exit_side):
-    """
-    Return a 5x5 Greek-key block traversal between two block endpoints.
-
-    The endpoints lie on side midpoints, or on the center for the final block.
-    A small depth-first Hamiltonian search is used once per entry/exit pair and
-    cached; the scoring favors perimeter-to-interior squared turns, giving the
-    Greek-key hook motif while preserving one-pixel steps.
-    """
-    if entry_side not in _MEANDER5_SIDE_COORDS:
-        raise ValueError(f"Invalid meander-5 entry side '{entry_side}'.")
-    if exit_side not in _MEANDER5_SIDE_COORDS:
-        raise ValueError(f"Invalid meander-5 exit side '{exit_side}'.")
-
-    block_size = _MEANDER5_BLOCK_SIZE
-    start = _MEANDER5_SIDE_COORDS[entry_side]
-    end = _MEANDER5_SIDE_COORDS[exit_side]
-    if start == end:
-        raise ValueError("meander-5 entry and exit endpoints must differ.")
-
-    total = block_size * block_size
-    visited = {start}
-    path = [start]
-
-    def connectivity_ok():
-        remaining = {
-            (y_idx, x_idx)
-            for y_idx in range(block_size)
-            for x_idx in range(block_size)
-            if (y_idx, x_idx) not in visited
-        }
-        if not remaining:
-            return True
-
-        stack = [next(iter(remaining))]
-        seen = {stack[0]}
-        while stack:
-            y_idx, x_idx = stack.pop()
-            for dy, dx in _MEANDER5_STEP_DIRECTIONS:
-                neighbor = (y_idx + dy, x_idx + dx)
-                if neighbor in remaining and neighbor not in seen:
-                    seen.add(neighbor)
-                    stack.append(neighbor)
-        return len(seen) == len(remaining)
-
-    def onward_count(cell):
-        y_idx, x_idx = cell
-        count = 0
-        for dy, dx in _MEANDER5_STEP_DIRECTIONS:
-            neighbor = (y_idx + dy, x_idx + dx)
-            if (
-                0 <= neighbor[0] < block_size
-                and 0 <= neighbor[1] < block_size
-                and neighbor not in visited
-            ):
-                if neighbor == end and len(path) != total - 1:
-                    continue
-                count += 1
-        return count
-
-    def neighbor_score(cell, previous):
-        py, px = previous
-        cy, cx = cell
-        straight_penalty = 0
-        if len(path) >= 2:
-            ay, ax = path[-2]
-            old_direction = (py - ay, px - ax)
-            new_direction = (cy - py, cx - px)
-            straight_penalty = int(old_direction == new_direction)
-
-        return (
-            onward_count(cell),
-            _MEANDER5_SPIRAL_RANK[cell],
-            straight_penalty,
-            abs(cy - end[0]) + abs(cx - end[1]),
-        )
-
-    def dfs(cell):
-        if len(path) == total:
-            return cell == end
-
-        y_idx, x_idx = cell
-        candidates = []
-        for dy, dx in _MEANDER5_STEP_DIRECTIONS:
-            neighbor = (y_idx + dy, x_idx + dx)
-            if not (0 <= neighbor[0] < block_size and 0 <= neighbor[1] < block_size):
-                continue
-            if neighbor in visited:
-                continue
-            if neighbor == end and len(path) != total - 1:
-                continue
-            candidates.append(neighbor)
-
-        candidates.sort(key=lambda neighbor: neighbor_score(neighbor, cell))
-        for neighbor in candidates:
-            visited.add(neighbor)
-            path.append(neighbor)
-            if connectivity_ok() and dfs(neighbor):
-                return True
-            path.pop()
-            visited.remove(neighbor)
-        return False
-
-    if not dfs(start):
-        raise RuntimeError(
-            f"Could not construct meander-5 block path {entry_side}->{exit_side}."
-        )
-    return tuple(path)
-
-
-def _meander5_indices(shape):
-    """
-    Return a Greek-key meander traversal for dimensions divisible by 5.
-
-    The array is divided into 5x5 tiles. Tiles are visited along an inward
-    spiral, and each tile is filled by a small squared Greek-key hook whose
-    entry and exit sides are oriented to connect continuously to neighboring
-    tiles. Rectangular ``5*Ny`` by ``5*Nx`` grids are supported.
-    """
-    height, width = tuple(int(v) for v in shape)
-    if height <= 0 or width <= 0:
-        raise ValueError("meander-5 traversal shape must be positive.")
-    if height % _MEANDER5_BLOCK_SIZE != 0 or width % _MEANDER5_BLOCK_SIZE != 0:
-        raise ValueError(
-            "meander-5 traversal requires both dimensions to be multiples of 5."
-        )
-
-    block_rows = height // _MEANDER5_BLOCK_SIZE
-    block_cols = width // _MEANDER5_BLOCK_SIZE
-    block_order = [tuple(coord) for coord in _spiral_indices((block_rows, block_cols))]
-    coords = []
-
-    for block_idx, (block_y, block_x) in enumerate(block_order):
-        if len(block_order) == 1:
-            entry_side = 'W'
-            exit_side = 'C'
-        elif block_idx == 0:
-            next_block = block_order[block_idx + 1]
-            direction_to_next = (
-                next_block[0] - block_y,
-                next_block[1] - block_x,
-            )
-            exit_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_next]
-            entry_side = _MEANDER5_OPPOSITE_SIDE[exit_side]
-        else:
-            previous_block = block_order[block_idx - 1]
-            direction_to_previous = (
-                previous_block[0] - block_y,
-                previous_block[1] - block_x,
-            )
-            entry_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_previous]
-            if block_idx < len(block_order) - 1:
-                next_block = block_order[block_idx + 1]
-                direction_to_next = (
-                    next_block[0] - block_y,
-                    next_block[1] - block_x,
-                )
-                exit_side = _MEANDER5_DIRECTION_TO_SIDE[direction_to_next]
-            else:
-                exit_side = 'C'
-
-        local_path = _meander5_block_path(entry_side, exit_side)
-        offset = np.array(
-            [
-                block_y * _MEANDER5_BLOCK_SIZE,
-                block_x * _MEANDER5_BLOCK_SIZE,
-            ]
-        )
-        coords.extend(
-            (y_idx + offset[0], x_idx + offset[1])
-            for y_idx, x_idx in local_path
-        )
-
-    return np.array(coords, dtype=int)
-
-
-def _moore_indices(shape):
-    """
-    Placeholder for a closed Hilbert-like Moore traversal.
-
-    Moore curves are useful, but implementing a clear closed discrete variant is
-    a separate step from the current unfolding refactor.
-    """
-    raise NotImplementedError(
-        "method='moore' is registered but not implemented yet. "
-        "Use method='hilbert' for an open Hilbert traversal."
-    )
-
-
-_FULL_SHAPE_TRAVERSAL_METHODS = {
-    'row_major',
-    'serpentine',
-    'spiral',
-    'diagonal_zigzag',
-}
-
-_CURVE_TRAVERSAL_METHODS = {
-    'hilbert',
-    'morton',
-    'peano',
-    'peano_meander',
-    'moore',
-}
-
-_BLOCK_TRAVERSAL_METHODS = {
-    'meander-4',
-    'meander-5',
-}
-
-_TRAVERSAL_INDEX_GENERATORS = {
-    'row_major': _row_major_indices,
-    'serpentine': _serpentine_indices,
-    'spiral': _spiral_indices,
-    'diagonal_zigzag': _diagonal_zigzag_indices,
-    'hilbert': _hilbert_indices,
-    'morton': _morton_indices,
-    'peano': _peano_indices,
-    'peano_meander': _peano_meander_indices,
-    'meander-4': _meander4_indices,
-    'meander-5': _meander5_indices,
-    'moore': _moore_indices,
-}
-
-_TRAVERSAL_METHOD_ALIASES = {
-    'z_order': 'morton',
-    'meander_4': 'meander-4',
-    'meander_5': 'meander-5',
-}
-
-
-def _is_power_of(value, base):
-    """Return True when ``value`` is an integer power of ``base``."""
-    value = int(value)
-    if value < 1:
-        return False
-    while value % base == 0:
-        value //= base
-    return value == 1
-
-
-def _largest_power_leq(value, base):
-    """Return the largest power of ``base`` less than or equal to ``value``."""
-    value = int(value)
-    if value < 1:
-        raise ValueError("value must be positive.")
-    power = 1
-    while power * base <= value:
-        power *= base
-    return power
-
-
-def _largest_multiple_leq(value, factor):
-    """Return the largest positive multiple of ``factor`` not exceeding ``value``."""
-    value = int(value)
-    factor = int(factor)
-    if value < factor:
-        raise ValueError(
-            f"value must be at least {factor} for this traversal method."
-        )
-    return (value // factor) * factor
-
-
-def _smallest_power_geq(value, base):
-    """Return the smallest power of ``base`` greater than or equal to ``value``."""
-    value = int(value)
-    if value < 1:
-        raise ValueError("value must be positive.")
-    power = 1
-    while power < value:
-        power *= base
-    return power
-
-
-def _nearest_power(value, base):
-    """
-    Return the nearest power of ``base`` to ``value``.
-
-    Ties choose the smaller side to avoid introducing interpolated data unless
-    the user explicitly requests upsampling.
-    """
-    lower = _largest_power_leq(value, base)
-    upper = _smallest_power_geq(value, base)
-    if abs(value - lower) <= abs(upper - value):
-        return lower
-    return upper
-
-
-def _curve_base_for_method(method):
-    """Return the natural integer base for a square-compatible traversal."""
-    if method == 'peano':
-        return 3
-    if method == 'peano_meander':
-        return 3
-    return 2
-
-
-def _block_size_for_method(method):
-    """Return the required tile size for block-compatible traversals."""
-    if method == 'meander-4':
-        return _MEANDER4_BLOCK_SIZE
-    if method == 'meander-5':
-        return _MEANDER5_BLOCK_SIZE
-    raise ValueError(f"method='{method}' is not a block traversal method.")
-
-
-def _normalize_traversal_method(method):
-    """Normalize method aliases such as ``z_order`` to their implementation."""
-    if not isinstance(method, str):
-        raise ValueError("method must be a string.")
-    method = method.lower()
-    return _TRAVERSAL_METHOD_ALIASES.get(method, method)
-
-
-def _validate_unfold_shape(shape):
-    """Validate and normalize a 4D-STEM tensor shape."""
-    if shape is None:
-        raise ValueError("original_shape is required to undo an unfolding.")
-    if len(shape) != 4:
-        raise ValueError(
-            "Unfolding expects a 4D-STEM shape in the convention "
-            "(Ry, Rx, Ky, Kx)."
-        )
-    shape = tuple(int(v) for v in shape)
-    if any(v <= 0 for v in shape):
-        raise ValueError("All original_shape dimensions must be positive.")
-    return shape
-
-
-def _normalize_unfold_request(domain='real', method='row_major'):
-    """Validate the modern unfolding API: separate domain and method names."""
-    if domain is None:
-        domain = 'real'
-    if method is None:
-        method = 'row_major'
-    if not isinstance(domain, str):
-        raise ValueError("domain must be a string.")
-
-    domain = domain.lower()
-    method = _normalize_traversal_method(method)
-    if domain not in ('real', 'reciprocal', 'both'):
-        raise ValueError("domain must be one of 'real', 'reciprocal', or 'both'.")
-
-    valid_methods = set(_TRAVERSAL_INDEX_GENERATORS) | {'coordinate_aligned'}
-    if method not in valid_methods:
-        valid = ', '.join(sorted(valid_methods | set(_TRAVERSAL_METHOD_ALIASES)))
-        raise ValueError(f"method must be one of: {valid}.")
-    if method == 'coordinate_aligned' and domain == 'both':
-        raise ValueError("method='coordinate_aligned' supports domain='real' or 'reciprocal', not 'both'.")
-    if domain == 'both' and method not in {'row_major', 'morton'}:
-        raise NotImplementedError(
-            "domain='both' currently supports method='row_major' and "
-            "method='morton'. Other traversal pairings need an explicit design."
-        )
-
-    return domain, method
-
-
-def _validate_resize_side(method, resize_side):
-    """Validate a user-provided side length for a curve method."""
-    resize_side = int(resize_side)
-    base = _curve_base_for_method(method)
-    if resize_side <= 0 or not _is_power_of(resize_side, base):
-        raise ValueError(
-            f"resize_side must be a positive power of {base} for method='{method}'."
-        )
-    return resize_side
-
-
-def _select_resize_side(shape, method, resize_side=None, resize_side_mode='nearest'):
-    """Select a compatible square side for curve resize mode."""
-    if resize_side is not None:
-        return _validate_resize_side(method, resize_side)
-
-    resize_side_mode = resize_side_mode.lower()
-    if resize_side_mode not in ('nearest', 'downsample', 'upsample'):
-        raise ValueError("resize_side_mode must be 'nearest', 'downsample', or 'upsample'.")
-
-    target = min(shape)
-    base = _curve_base_for_method(method)
-    if resize_side_mode == 'nearest':
-        return _nearest_power(target, base)
-    if resize_side_mode == 'downsample':
-        return _largest_power_leq(target, base)
-    return _smallest_power_geq(target, base)
-
-
-def _center_crop_metadata(shape, method):
-    """Return centered compatible crop metadata for special traversals."""
-    height, width = tuple(int(v) for v in shape)
-    if method in _BLOCK_TRAVERSAL_METHODS:
-        block_size = _block_size_for_method(method)
-        grid_y = _largest_multiple_leq(height, block_size)
-        grid_x = _largest_multiple_leq(width, block_size)
-    else:
-        side = _largest_power_leq(min(height, width), _curve_base_for_method(method))
-        grid_y = side
-        grid_x = side
-
-    y0 = (height - grid_y) // 2
-    x0 = (width - grid_x) // 2
-    y1 = y0 + grid_y
-    x1 = x0 + grid_x
-    return (grid_y, grid_x), y0, y1, x0, x1
-
-
-def _excess_indices_for_crop(shape, y0, y1, x0, x1):
-    """Return coordinates outside a centered compatible square crop."""
-    height, width = shape
-    excess = [
-        (y_idx, x_idx)
-        for y_idx in range(height)
-        for x_idx in range(width)
-        if not (y0 <= y_idx < y1 and x0 <= x_idx < x1)
-    ]
-    return np.array(excess, dtype=int).reshape((-1, 2))
-
-
-def _validate_traversal_indices(indices, shape, method):
-    """Ensure traversal coordinates are unique and within ``shape``."""
-    indices = np.asarray(indices, dtype=int)
-    if indices.ndim != 2 or indices.shape[1] != 2:
-        raise ValueError(f"Traversal method '{method}' must return an (N, 2) array.")
-    if indices.size == 0:
-        raise ValueError(f"Traversal method '{method}' returned no coordinates.")
-
-    height, width = shape
-    if np.any(indices[:, 0] < 0) or np.any(indices[:, 0] >= height):
-        raise ValueError(f"Traversal method '{method}' returned out-of-bounds y coordinates.")
-    if np.any(indices[:, 1] < 0) or np.any(indices[:, 1] >= width):
-        raise ValueError(f"Traversal method '{method}' returned out-of-bounds x coordinates.")
-
-    if len(set(map(tuple, indices))) != len(indices):
-        raise ValueError(f"Traversal method '{method}' returned duplicate coordinates.")
-    return indices
-
-
-def _get_traversal_indices(shape, method, curve_shape_strategy='center_crop',
-                           resize_side=None, resize_side_mode='nearest'):
-    """
-    Return traversal indices and metadata for a 2D coordinate grid.
-
-    Full-shape methods visit every coordinate in ``shape``. Curve methods use
-    either a centered compatible square crop or a resized compatible square.
-    Block methods such as ``meander-4`` and ``meander-5`` use a centered
-    compatible rectangular crop whose dimensions are multiples of the required
-    block size.
-    """
-    method = _normalize_traversal_method(method)
-    shape = tuple(int(v) for v in shape)
-    if len(shape) != 2 or any(v <= 0 for v in shape):
-        raise ValueError("Traversal shape must be a pair of positive integers.")
-    if method not in _TRAVERSAL_INDEX_GENERATORS:
-        valid = ', '.join(sorted(set(_TRAVERSAL_INDEX_GENERATORS) | set(_TRAVERSAL_METHOD_ALIASES)))
-        raise ValueError(f"method='{method}' is not a traversal method. Valid methods are: {valid}.")
-
-    if method in _FULL_SHAPE_TRAVERSAL_METHODS:
-        indices = np.asarray(_TRAVERSAL_INDEX_GENERATORS[method](shape), dtype=int)
-        expected_size = shape[0] * shape[1]
-        if indices.shape != (expected_size, 2):
-            raise ValueError(
-                f"Traversal method '{method}' returned shape {indices.shape}; "
-                f"expected {(expected_size, 2)}."
-            )
-        indices = _validate_traversal_indices(indices, shape, method)
-        return indices, {
-            'curve_shape_strategy': 'full_shape',
-            'traversal_shape': shape,
-        }
-
-    if method == 'moore':
-        _moore_indices(shape)
-
-    special_methods = _CURVE_TRAVERSAL_METHODS | _BLOCK_TRAVERSAL_METHODS
-    if method not in special_methods:
-        raise ValueError(f"Unknown traversal method '{method}'.")
-
-    if curve_shape_strategy is None:
-        curve_shape_strategy = 'center_crop'
-    if not isinstance(curve_shape_strategy, str):
-        raise ValueError("curve_shape_strategy must be a string.")
-    curve_shape_strategy = curve_shape_strategy.lower()
-
-    if curve_shape_strategy == 'center_crop':
-        grid_shape, y0, y1, x0, x1 = _center_crop_metadata(shape, method)
-        local_indices = np.asarray(
-            _TRAVERSAL_INDEX_GENERATORS[method](grid_shape),
-            dtype=int,
-        )
-        if local_indices.shape != (grid_shape[0] * grid_shape[1], 2):
-            raise ValueError(
-                f"Traversal method '{method}' did not cover its selected "
-                f"{grid_shape} grid exactly once."
-            )
-        indices = local_indices + np.array([y0, x0])
-        indices = _validate_traversal_indices(indices, shape, method)
-        traversal_metadata = {
-            'curve_shape_strategy': 'center_crop',
-            'curve_grid_shape': grid_shape,
-            'crop_slices': {'y': (y0, y1), 'x': (x0, x1)},
-            'kept_indices': indices,
-            'excess_indices': _excess_indices_for_crop(shape, y0, y1, x0, x1),
-            'traversal_shape': shape,
-        }
-        if method in _BLOCK_TRAVERSAL_METHODS:
-            block_size = _block_size_for_method(method)
-            traversal_metadata.update({
-                'block_size': block_size,
-                'block_grid_shape': (
-                    grid_shape[0] // block_size,
-                    grid_shape[1] // block_size,
-                ),
-            })
-        return indices, traversal_metadata
-
-    if curve_shape_strategy == 'resize':
-        if method in _BLOCK_TRAVERSAL_METHODS:
-            block_size = _block_size_for_method(method)
-            raise NotImplementedError(
-                f"method='{method}' currently supports "
-                "curve_shape_strategy='center_crop' only. Its compatible "
-                "domain is a centered rectangle with dimensions divisible by "
-                f"{block_size}."
-            )
-        side = _select_resize_side(
-            shape,
-            method,
-            resize_side=resize_side,
-            resize_side_mode=resize_side_mode,
-        )
-        indices = np.asarray(
-            _TRAVERSAL_INDEX_GENERATORS[method]((side, side)),
-            dtype=int,
-        )
-        if indices.shape != (side * side, 2):
-            raise ValueError(
-                f"Traversal method '{method}' did not cover its resized "
-                f"{side}x{side} grid exactly once."
-            )
-        indices = _validate_traversal_indices(indices, (side, side), method)
-        return indices, {
-            'curve_shape_strategy': 'resize',
-            'curve_grid_shape': (side, side),
-            'resize_side': side,
-            'resize_side_mode': resize_side_mode,
-            'resized_traversal_shape': (side, side),
-            'traversal_shape': (side, side),
-        }
-
-    raise ValueError("curve_shape_strategy must be 'center_crop' or 'resize'.")
-
-
-def plot_traversals(method='all', grid_shape=(64, 64), *, ncols=3,
-                    cmap='turbo', linewidth=1.5, show_grid=True,
-                    mark_endpoints=True, show=True):
-    """Plot one or all implemented 2D unfolding traversal paths.
-
-    ``grid_shape`` is the maximum requested grid, not a promise that every
-    method uses every cell. Full-shape methods traverse it entirely. Curve and
-    block methods traverse their largest compatible centered crop within it;
-    shaded cells are excluded. Each title shows both the used and maximum grid
-    shapes. This visualizer does not resize data or require a ``HyperData``.
-
-    Parameters
-    ----------
-    method : str, optional
-        An implemented traversal name or ``'all'``. The latter plots the ten
-        implemented canonical methods in registry order. ``'z_order'`` and
-        ``'meander_4'``/``'meander_5'`` are accepted aliases for single plots.
-        ``'moore'`` is not yet implemented; ``'coordinate_aligned'`` is an axis
-        rearrangement rather than a 2D traversal.
-    grid_shape : int or tuple[int, int], optional
-        Maximum grid height and width, in ``(y, x)`` order. An integer requests
-        a square. Compatible curves may use only a centered part of this grid.
-    ncols : int, optional
-        Maximum number of subplot columns. A single method uses one column.
-    cmap : str or Colormap, optional
-        Matplotlib colormap for the path's normalized start-to-end progress.
-    linewidth : float, optional
-        Width of the colored traversal line in points.
-    show_grid, mark_endpoints : bool, optional
-        Draw cell boundaries and colored start/end markers, respectively.
-    show : bool, optional
-        Display the figure with ``matplotlib.pyplot.show`` when True.
-
-    Returns
-    -------
-    tuple[Figure, ndarray]
-        Matplotlib figure and a 2D array of axes. Unused axes in ``'all'``
-        mode are hidden. A block method that cannot fit inside ``grid_shape``
-        gets an explanatory panel in ``'all'`` mode; a single-method request
-        raises the underlying size error.
-
-    Examples
-    --------
-    >>> fig, axes = plot_traversals('all', (64, 64), ncols=3)
-    >>> fig, axes = plot_traversals('peano', 81, linewidth=2, show=False)
-    """
-    if isinstance(grid_shape, Integral) and not isinstance(grid_shape, (bool, np.bool_)):
-        grid_shape = (grid_shape, grid_shape)
-    else:
-        grid_shape = np.asarray(grid_shape, dtype=object)
-        if grid_shape.shape != (2,):
-            raise ValueError("grid_shape must be a positive integer or (height, width).")
-    if any(
-        isinstance(size, (bool, np.bool_))
-        or not isinstance(size, (Integral, np.integer)) or size < 1
-        for size in grid_shape
-    ):
-        raise ValueError("grid_shape must contain positive integers.")
-    height, width = map(int, grid_shape)
-
-    if isinstance(ncols, (bool, np.bool_)) or not isinstance(ncols, Integral) or ncols < 1:
-        raise ValueError("ncols must be a positive integer.")
-    if isinstance(linewidth, (bool, np.bool_)) or not isinstance(
-        linewidth, (Integral, float, np.floating)
-    ) or not np.isfinite(linewidth) or linewidth <= 0:
-        raise ValueError("linewidth must be a positive finite number.")
-
-    requested_method = _normalize_traversal_method(method)
-    implemented = tuple(
-        name for name in _TRAVERSAL_INDEX_GENERATORS if name != 'moore'
-    )
-    if requested_method == 'all':
-        methods = implemented
-    elif requested_method == 'moore':
-        _moore_indices((height, width))
-    elif requested_method in implemented:
-        if (
-            requested_method in _BLOCK_TRAVERSAL_METHODS
-            and min(height, width) < _block_size_for_method(requested_method)
-        ):
-            _get_traversal_indices((height, width), requested_method)
-        methods = (requested_method,)
-    else:
-        valid = ', '.join(implemented)
-        raise ValueError(
-            f"method must be 'all' or one of: {valid}. "
-            "coordinate_aligned is not a 2D traversal."
-        )
-
-    plot_cols = min(int(ncols), len(methods))
-    plot_rows = int(np.ceil(len(methods) / plot_cols))
-    fig, axes = plt.subplots(
-        plot_rows, plot_cols, squeeze=False,
-        figsize=(4.8 * plot_cols, 4.8 * plot_rows), layout='constrained',
-    )
-    progress_norm = Normalize(vmin=0, vmax=1)
-
-    for ax, name in zip(axes.flat, methods):
-        ax.set_xlim(-0.5, width - 0.5)
-        ax.set_ylim(height - 0.5, -0.5)
-        ax.set_aspect('equal')
-        ax.set_facecolor('white')
-        if show_grid:
-            grid_lines = [
-                ((x - 0.5, -0.5), (x - 0.5, height - 0.5))
-                for x in range(width + 1)
-            ] + [
-                ((-0.5, y - 0.5), (width - 0.5, y - 0.5))
-                for y in range(height + 1)
-            ]
-            ax.add_collection(LineCollection(
-                grid_lines, colors='0.75', linewidths=0.3, alpha=0.45, zorder=0.5,
-            ))
-        ax.add_patch(Rectangle(
-            (-0.5, -0.5), width, height, fill=False,
-            edgecolor='0.45', linewidth=0.8, zorder=1,
-        ))
-
-        if name in _BLOCK_TRAVERSAL_METHODS and min(height, width) < _block_size_for_method(name):
-            block_size = _block_size_for_method(name)
-            ax.set_title(f'{name}\nunavailable / max {height}x{width}')
-            ax.text(
-                (width - 1) / 2, (height - 1) / 2,
-                f'Requires at least {block_size}x{block_size}',
-                ha='center', va='center', fontsize=9,
-            )
-            ax.set_axis_off()
-            continue
-
-        indices, details = _get_traversal_indices(
-            (height, width), name, curve_shape_strategy='center_crop',
-        )
-        used_height, used_width = details.get('curve_grid_shape', (height, width))
-        crop_slices = details.get('crop_slices')
-        if crop_slices is not None:
-            y0, y1 = crop_slices['y']
-            x0, x1 = crop_slices['x']
-            excluded_regions = (
-                (-0.5, -0.5, width, y0),
-                (-0.5, y1 - 0.5, width, height - y1),
-                (-0.5, y0 - 0.5, x0, y1 - y0),
-                (x1 - 0.5, y0 - 0.5, width - x1, y1 - y0),
-            )
-            for x, y, region_width, region_height in excluded_regions:
-                if region_width > 0 and region_height > 0:
-                    ax.add_patch(Rectangle(
-                        (x, y), region_width, region_height,
-                        facecolor='0.88', edgecolor='none', alpha=0.7, zorder=0.2,
-                    ))
-            ax.add_patch(Rectangle(
-                (x0 - 0.5, y0 - 0.5), used_width, used_height,
-                fill=False, edgecolor='0.35', linestyle='--',
-                linewidth=0.9, zorder=3,
-            ))
-
-        xy = indices[:, [1, 0]].astype(np.float32)
-        if len(xy) > 1:
-            segments = np.stack((xy[:-1], xy[1:]), axis=1)
-            path = LineCollection(
-                segments, cmap=cmap, norm=progress_norm,
-                linewidths=linewidth, zorder=2,
-            )
-            path.set_array(np.linspace(0, 1, len(segments), dtype=np.float32))
-            ax.add_collection(path)
-        if mark_endpoints:
-            ax.scatter(
-                xy[0, 0], xy[0, 1], s=28, marker='o', c='limegreen',
-                edgecolors='black', linewidths=0.5, zorder=4,
-            )
-            ax.scatter(
-                xy[-1, 0], xy[-1, 1], s=34, marker='X', c='crimson',
-                edgecolors='black', linewidths=0.5, zorder=4,
-            )
-        ax.set_title(f'{name}\nused {used_height}x{used_width} / max {height}x{width}')
-        ax.set_axis_off()
-
-    for ax in list(axes.flat)[len(methods):]:
-        ax.set_visible(False)
-    colorbar = fig.colorbar(
-        ScalarMappable(norm=progress_norm, cmap=cmap),
-        ax=list(axes.flat)[:len(methods)], shrink=0.7, pad=0.02,
-    )
-    colorbar.set_label('Traversal progress (start to end)')
-    if show:
-        plt.show()
-    return fig, axes
-
-
-def _inverse_transpose_order(order):
-    """Return the inverse permutation for a transpose order."""
-    inverse = [0] * len(order)
-    for idx, axis in enumerate(order):
-        inverse[axis] = idx
-    return tuple(inverse)
-
-
-def _copy_traversal_metadata(prefix, metadata):
-    """Copy traversal metadata, optionally namespaced for domain='both'."""
-    if prefix is None:
-        return dict(metadata)
-    return {f"{prefix}_{key}": value for key, value in metadata.items()}
-
-
-def _build_unfold_metadata(original_shape, domain='real', method='row_major',
-                           curve_shape_strategy='center_crop',
-                           preserve_excess=True, resize_side=None,
-                           resize_side_mode='nearest', resize_method='linear',
-                           preserve_original=False, working_shape=None):
-    """Build metadata needed to undo an unfolding exactly when possible."""
-    original_shape = _validate_unfold_shape(original_shape)
-    working_shape = _validate_unfold_shape(working_shape or original_shape)
-    domain, method = _normalize_unfold_request(domain=domain, method=method)
-    ry, rx, ky, kx = working_shape
-
-    metadata = {
-        'version': 2,
-        'original_shape': original_shape,
-        'working_shape': working_shape,
-        'domain': domain,
-        'method': method,
-        'preserve_excess': bool(preserve_excess),
-        'preserve_original': bool(preserve_original),
-    }
-
-    if method == 'coordinate_aligned':
-        if domain == 'real':
-            transpose_order = (0, 2, 1, 3)
-            intermediate_shape = (ry, ky, rx, kx)
-            output_shape = (ry * ky, rx * kx)
-            interpretation = (
-                "Rows combine real-space y with reciprocal-space y; columns "
-                "combine real-space x with reciprocal-space x."
-            )
-        else:
-            transpose_order = (2, 0, 3, 1)
-            intermediate_shape = (ky, ry, kx, rx)
-            output_shape = (ky * ry, kx * rx)
-            interpretation = (
-                "Rows combine reciprocal-space y with real-space y; columns "
-                "combine reciprocal-space x with real-space x."
-            )
-
-        metadata.update({
-            'representation': 'coordinate_aligned_matrix',
-            'curve_shape_strategy': 'not_applicable',
-            'transpose_order': transpose_order,
-            'inverse_transpose_order': _inverse_transpose_order(transpose_order),
-            'intermediate_shape': intermediate_shape,
-            'output_shape': output_shape,
-            'interpretation': interpretation,
-        })
-        return metadata
-
-    if domain == 'real':
-        indices, traversal_meta = _get_traversal_indices(
-            (ry, rx),
-            method,
-            curve_shape_strategy=curve_shape_strategy,
-            resize_side=resize_side,
-            resize_side_mode=resize_side_mode,
-        )
-        metadata.update(_copy_traversal_metadata(None, traversal_meta))
-        metadata.update({
-            'representation': 'real_stack',
-            'traversal_indices': indices,
-            'output_shape': (len(indices), ky, kx),
-            'resize_method': resize_method,
-            'resized_shape': working_shape if traversal_meta['curve_shape_strategy'] == 'resize' else None,
-            'interpretation': (
-                "The real-space scan grid is traversed into a stack of "
-                "diffraction patterns."
-            ),
-        })
-    elif domain == 'reciprocal':
-        indices, traversal_meta = _get_traversal_indices(
-            (ky, kx),
-            method,
-            curve_shape_strategy=curve_shape_strategy,
-            resize_side=resize_side,
-            resize_side_mode=resize_side_mode,
-        )
-        metadata.update(_copy_traversal_metadata(None, traversal_meta))
-        metadata.update({
-            'representation': 'reciprocal_stack',
-            'traversal_indices': indices,
-            'output_shape': (len(indices), ry, rx),
-            'resize_method': resize_method,
-            'resized_shape': working_shape if traversal_meta['curve_shape_strategy'] == 'resize' else None,
-            'interpretation': (
-                "The reciprocal-space diffraction grid is traversed into a "
-                "stack of real-space images."
-            ),
-        })
-    else:
-        real_indices, real_meta = _get_traversal_indices(
-            (ry, rx),
-            method,
-            curve_shape_strategy=curve_shape_strategy,
-            resize_side=resize_side,
-            resize_side_mode=resize_side_mode,
-        )
-        reciprocal_indices, reciprocal_meta = _get_traversal_indices(
-            (ky, kx),
-            method,
-            curve_shape_strategy=curve_shape_strategy,
-            resize_side=resize_side,
-            resize_side_mode=resize_side_mode,
-        )
-        metadata.update({
-            'representation': 'both_matrix',
-            'real_traversal_indices': real_indices,
-            'reciprocal_traversal_indices': reciprocal_indices,
-            'output_shape': (len(real_indices), len(reciprocal_indices)),
-            'resize_method': resize_method,
-            'resized_shape': working_shape if real_meta['curve_shape_strategy'] == 'resize' else None,
-            'interpretation': (
-                "Rows traverse real-space positions and columns traverse "
-                "reciprocal-space pixels."
-            ),
-        })
-        metadata.update(_copy_traversal_metadata('real', real_meta))
-        metadata.update(_copy_traversal_metadata('reciprocal', reciprocal_meta))
-        metadata['curve_shape_strategy'] = real_meta['curve_shape_strategy']
-
-    return metadata
-
-
-def _require_metadata(metadata):
-    """Validate unfolding metadata and return a shallow copy."""
-    if metadata is None:
-        raise ValueError(
-            "metadata is required for undo=True. Use return_metadata=True when "
-            "unfolding, or call HyperData.unfold(undo=True) on an unfolded "
-            "HyperData object that still has attached metadata."
-        )
-    if not isinstance(metadata, dict):
-        raise ValueError("metadata must be a dictionary returned by unfold(...).")
-
-    required = {'original_shape', 'domain', 'method', 'representation', 'output_shape'}
-    missing = sorted(required - set(metadata))
-    if missing:
-        raise ValueError(f"metadata is missing required field(s): {', '.join(missing)}.")
-
-    clean = dict(metadata)
-    clean['original_shape'] = _validate_unfold_shape(clean['original_shape'])
-    clean['working_shape'] = _validate_unfold_shape(
-        clean.get('working_shape', clean['original_shape'])
-    )
-    clean['output_shape'] = tuple(int(v) for v in clean['output_shape'])
-    return clean
-
-
-def _validate_unfolded_shape(array, metadata):
-    """Raise a helpful error if an unfolded array does not match metadata."""
-    expected_shape = tuple(metadata['output_shape'])
-    if array.shape != expected_shape:
-        raise ValueError(
-            "Unfolded array shape does not match metadata: "
-            f"got {array.shape}, expected {expected_shape}."
-        )
-
-
-def _extract_excess_values(array, metadata):
-    """Store excluded data required for exact center-crop undo."""
-    representation = metadata['representation']
-    if metadata.get('curve_shape_strategy') != 'center_crop':
-        return
-    if not metadata.get('preserve_excess', False):
-        return
-
-    if representation == 'real_stack':
-        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
-        metadata['excess_values'] = array[
-            excess_indices[:, 0],
-            excess_indices[:, 1],
-            :,
-            :,
-        ].copy()
-    elif representation == 'reciprocal_stack':
-        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
-        values = np.empty(
-            (len(excess_indices), array.shape[0], array.shape[1]),
-            dtype=array.dtype,
-        )
-        for idx, (ky_idx, kx_idx) in enumerate(excess_indices):
-            values[idx] = array[:, :, ky_idx, kx_idx]
-        metadata['excess_values'] = values
-    elif representation == 'both_matrix':
-        real_excess = np.asarray(metadata['real_excess_indices'], dtype=int)
-        reciprocal_excess = np.asarray(
-            metadata['reciprocal_excess_indices'], dtype=int,
-        )
-        real_kept = np.asarray(metadata['real_traversal_indices'], dtype=int)
-        metadata['excess_values'] = {
-            'real': array[
-                real_excess[:, 0], real_excess[:, 1], :, :
-            ].copy(),
-            'reciprocal': array[
-                real_kept[:, 0, None],
-                real_kept[:, 1, None],
-                reciprocal_excess[None, :, 0],
-                reciprocal_excess[None, :, 1],
-            ].copy(),
-        }
-        metadata['excess_values_encoding'] = 'separated_domains'
-
-
-def _unfold_payload_arrays(metadata):
-    """Yield large saved values; traversal coordinates remain independent."""
-    for key in ('original_values', 'excess_values'):
-        value = metadata.get(key)
-        if isinstance(value, np.ndarray):
-            yield value
-        elif isinstance(value, dict):
-            yield from (
-                item for item in value.values()
-                if isinstance(item, np.ndarray)
-            )
-
-
-def _clone_unfold_metadata(metadata, *, share_payload=False):
-    """Copy metadata without recopying immutable undo payloads by default."""
-    if metadata is None:
-        return None
-    if not share_payload:
-        return deepcopy(metadata)
-    memo = {}
-    for values in _unfold_payload_arrays(metadata):
-        values.setflags(write=False)
-        memo[id(values)] = values
-    return deepcopy(metadata, memo)
-
-
-def _crop_restore_shape(metadata):
-    """Return the shape restored when center-crop excess was not preserved."""
-    representation = metadata['representation']
-    working_shape = metadata['working_shape']
-    ry, rx, ky, kx = working_shape
-
-    if representation == 'real_stack':
-        side_y, side_x = metadata['curve_grid_shape']
-        return (side_y, side_x, ky, kx)
-    if representation == 'reciprocal_stack':
-        side_y, side_x = metadata['curve_grid_shape']
-        return (ry, rx, side_y, side_x)
-    if representation == 'both_matrix':
-        real_side_y, real_side_x = metadata['real_curve_grid_shape']
-        reciprocal_side_y, reciprocal_side_x = metadata['reciprocal_curve_grid_shape']
-        return (real_side_y, real_side_x, reciprocal_side_y, reciprocal_side_x)
-    raise ValueError(f"Unsupported crop restore representation '{representation}'.")
-
-
-def _local_crop_indices(indices, crop_slices):
-    """Convert original-array crop coordinates to local cropped coordinates."""
-    indices = np.asarray(indices, dtype=int)
-    y0 = crop_slices['y'][0]
-    x0 = crop_slices['x'][0]
-    return indices - np.array([y0, x0])
-
-
-def _restore_real_stack(array, metadata):
-    """Undo a real-domain stack unfolding."""
-    indices = np.asarray(metadata['traversal_indices'], dtype=int)
-    strategy = metadata.get('curve_shape_strategy', 'full_shape')
-
-    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
-        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
-        local_indices = _local_crop_indices(indices, metadata['crop_slices'])
-        restored[local_indices[:, 0], local_indices[:, 1], :, :] = array
-        return restored
-
-    if strategy == 'resize' and metadata.get('preserve_original', False):
-        return np.array(metadata['original_values'], copy=True)
-
-    restored_shape = metadata['working_shape']
-    restored = np.empty(restored_shape, dtype=array.dtype)
-
-    if strategy == 'center_crop' and metadata.get('preserve_excess', False):
-        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
-        restored[excess_indices[:, 0], excess_indices[:, 1], :, :] = metadata['excess_values']
-
-    restored[indices[:, 0], indices[:, 1], :, :] = array
-    return restored
-
-
-def _restore_reciprocal_stack(array, metadata):
-    """Undo a reciprocal-domain stack unfolding."""
-    indices = np.asarray(metadata['traversal_indices'], dtype=int)
-    strategy = metadata.get('curve_shape_strategy', 'full_shape')
-
-    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
-        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
-        local_indices = _local_crop_indices(indices, metadata['crop_slices'])
-        for flat_idx, (ky_idx, kx_idx) in enumerate(local_indices):
-            restored[:, :, ky_idx, kx_idx] = array[flat_idx]
-        return restored
-
-    if strategy == 'resize' and metadata.get('preserve_original', False):
-        return np.array(metadata['original_values'], copy=True)
-
-    restored_shape = metadata['working_shape']
-    restored = np.empty(restored_shape, dtype=array.dtype)
-
-    if strategy == 'center_crop' and metadata.get('preserve_excess', False):
-        excess_indices = np.asarray(metadata['excess_indices'], dtype=int)
-        for flat_idx, (ky_idx, kx_idx) in enumerate(excess_indices):
-            restored[:, :, ky_idx, kx_idx] = metadata['excess_values'][flat_idx]
-
-    for flat_idx, (ky_idx, kx_idx) in enumerate(indices):
-        restored[:, :, ky_idx, kx_idx] = array[flat_idx]
-    return restored
-
-
-def _restore_both_matrix(array, metadata):
-    """Undo a 2D mixed real/reciprocal unfolding."""
-    real_indices = np.asarray(metadata['real_traversal_indices'], dtype=int)
-    reciprocal_indices = np.asarray(metadata['reciprocal_traversal_indices'], dtype=int)
-    strategy = metadata.get('curve_shape_strategy', 'full_shape')
-
-    if strategy == 'center_crop' and not metadata.get('preserve_excess', False):
-        restored = np.empty(_crop_restore_shape(metadata), dtype=array.dtype)
-        real_local = _local_crop_indices(real_indices, metadata['real_crop_slices'])
-        reciprocal_local = _local_crop_indices(
-            reciprocal_indices,
-            metadata['reciprocal_crop_slices'],
-        )
-    else:
-        if strategy == 'resize' and metadata.get('preserve_original', False):
-            return np.array(metadata['original_values'], copy=True)
-        if strategy == 'center_crop' and metadata.get('preserve_excess', False):
-            encoding = metadata.get('excess_values_encoding', 'full_tensor')
-            if encoding == 'full_tensor':
-                # Saved files from the original implementation use this form.
-                restored = np.array(metadata['excess_values'], copy=True)
-            elif encoding == 'separated_domains':
-                restored = np.empty(metadata['working_shape'], dtype=array.dtype)
-                real_excess = np.asarray(metadata['real_excess_indices'], dtype=int)
-                reciprocal_excess = np.asarray(
-                    metadata['reciprocal_excess_indices'], dtype=int,
-                )
-                values = metadata['excess_values']
-                restored[real_excess[:, 0], real_excess[:, 1], :, :] = values['real']
-                for flat_idx, (ry_idx, rx_idx) in enumerate(real_indices):
-                    restored[
-                        ry_idx, rx_idx,
-                        reciprocal_excess[:, 0], reciprocal_excess[:, 1],
-                    ] = values['reciprocal'][flat_idx]
-            else:
-                raise ValueError(
-                    f"Unsupported excess-values encoding '{encoding}'."
-                )
-        else:
-            restored = np.empty(metadata['working_shape'], dtype=array.dtype)
-        real_local = real_indices
-        reciprocal_local = reciprocal_indices
-
-    for real_flat_idx, (ry_idx, rx_idx) in enumerate(real_local):
-        restored[
-            ry_idx,
-            rx_idx,
-            reciprocal_local[:, 0],
-            reciprocal_local[:, 1],
-        ] = array[real_flat_idx]
-    return restored
-
-
-def _infer_square_side(value, label):
-    """Infer a square side length from a flattened grid size."""
-    value = int(value)
-    side = int(np.sqrt(value))
-    if side * side != value:
-        raise ValueError(
-            f"Cannot infer a square {label} grid from {value} elements. "
-            "Pass original_shape explicitly."
-        )
-    return side
-
-
-def _infer_row_major_original_shape(array, domain, original_shape=None):
-    """Infer or validate the original 4D shape for row-major undo without metadata."""
-    domain, _ = _normalize_unfold_request(domain=domain, method='row_major')
-
-    if original_shape is not None:
-        original_shape = tuple(int(v) for v in original_shape)
-        if len(original_shape) == 4:
-            return _validate_unfold_shape(original_shape)
-        if len(original_shape) == 2 and domain == 'real' and array.ndim == 3:
-            ry, rx = original_shape
-            return _validate_unfold_shape((ry, rx, array.shape[1], array.shape[2]))
-        if len(original_shape) == 2 and domain == 'reciprocal' and array.ndim == 3:
-            ky, kx = original_shape
-            return _validate_unfold_shape((array.shape[1], array.shape[2], ky, kx))
-        raise ValueError(
-            "original_shape must be (Ry, Rx, Ky, Kx). For 3D row-major "
-            "domain='real' undo, (Ry, Rx) is also accepted; for "
-            "domain='reciprocal' undo, (Ky, Kx) is also accepted."
-        )
-
-    if domain == 'real' and array.ndim == 3:
-        ry = rx = _infer_square_side(array.shape[0], 'real-space')
-        return (ry, rx, array.shape[1], array.shape[2])
-
-    if domain == 'reciprocal' and array.ndim == 3:
-        ky = kx = _infer_square_side(array.shape[0], 'reciprocal-space')
-        return (array.shape[1], array.shape[2], ky, kx)
-
-    if domain == 'both' and array.ndim == 2:
-        ry = rx = _infer_square_side(array.shape[0], 'real-space')
-        ky = kx = _infer_square_side(array.shape[1], 'reciprocal-space')
-        return (ry, rx, ky, kx)
-
-    raise ValueError(
-        "metadata-less undo requires original_shape unless a square row-major "
-        "shape can be inferred from the unfolded array."
-    )
-
-
-def _build_row_major_undo_metadata(array, domain='real', method='row_major',
-                                   original_shape=None):
-    """Build minimal row-major metadata for undo when no unfold metadata exists."""
-    domain, method = _normalize_unfold_request(domain=domain, method=method)
-    if method != 'row_major':
-        raise ValueError(
-            "metadata-less undo only supports method='row_major'. Pass metadata "
-            "for non-row-major traversal methods."
-        )
-
-    original_shape = _infer_row_major_original_shape(
-        array,
-        domain=domain,
-        original_shape=original_shape,
-    )
-    return _build_unfold_metadata(
-        original_shape=original_shape,
-        working_shape=original_shape,
-        domain=domain,
-        method='row_major',
-        preserve_excess=False,
-    )
-
-
-def _unfold_array(array, domain='real', method='row_major',
-                  curve_shape_strategy='center_crop', preserve_excess=True,
-                  resize_side=None, resize_side_mode='nearest',
-                  resize_method='linear', preserve_original=False,
-                  original_shape=None, original_values=None, undo=False,
-                  metadata=None, return_metadata=False):
-    """
-    Unfold or restore a 4D-STEM tensor using explicit domain/method metadata.
-
-    Examples
-    --------
-    >>> original = np.arange(5*7*4*6).reshape(5, 7, 4, 6)
-    >>> unfolded, meta = _unfold_array(original, domain='real',
-    ...                                method='hilbert',
-    ...                                preserve_excess=True,
-    ...                                return_metadata=True)
-    >>> restored = _unfold_array(unfolded, undo=True, metadata=meta)
-    >>> np.array_equal(restored, original)
-    True
-    """
-    array = np.asarray(array)
-
-    if undo:
-        if metadata is None:
-            metadata = _build_row_major_undo_metadata(
-                array,
-                domain=domain,
-                method=method,
-                original_shape=original_shape,
-            )
-        metadata = _require_metadata(metadata)
-        _validate_unfolded_shape(array, metadata)
-        representation = metadata['representation']
-
-        if representation == 'coordinate_aligned_matrix':
-            restored = array.reshape(metadata['intermediate_shape'])
-            restored = np.transpose(restored, metadata['inverse_transpose_order'])
-
-        elif representation == 'real_stack':
-            restored = _restore_real_stack(array, metadata)
-
-        elif representation == 'reciprocal_stack':
-            restored = _restore_reciprocal_stack(array, metadata)
-
-        elif representation == 'both_matrix':
-            restored = _restore_both_matrix(array, metadata)
-
-        else:
-            raise ValueError(f"Unsupported metadata representation '{representation}'.")
-
-        if return_metadata:
-            return restored, metadata
-        return restored
-
-    if array.ndim != 4:
-        raise ValueError(
-            "Forward unfolding expects a 4D-STEM tensor with shape "
-            "(Ry, Rx, Ky, Kx)."
-        )
-
-    metadata = _build_unfold_metadata(
-        original_shape=original_shape or array.shape,
-        working_shape=array.shape,
-        domain=domain,
-        method=method,
-        curve_shape_strategy=curve_shape_strategy,
-        preserve_excess=preserve_excess,
-        resize_side=resize_side,
-        resize_side_mode=resize_side_mode,
-        resize_method=resize_method,
-        preserve_original=preserve_original,
-    )
-
-    if preserve_original and original_values is not None:
-        metadata['original_values'] = np.array(original_values, copy=True)
-
-    _extract_excess_values(array, metadata)
-    payloads = tuple(_unfold_payload_arrays(metadata))
-    metadata['preserved_values_nbytes'] = sum(values.nbytes for values in payloads)
-    for values in payloads:
-        values.setflags(write=False)
-    representation = metadata['representation']
-
-    if representation == 'coordinate_aligned_matrix':
-        unfolded = np.transpose(array, metadata['transpose_order'])
-        unfolded = unfolded.reshape(metadata['output_shape'])
-
-    elif representation == 'real_stack':
-        indices = metadata['traversal_indices']
-        unfolded = array[indices[:, 0], indices[:, 1], :, :]
-
-    elif representation == 'reciprocal_stack':
-        indices = metadata['traversal_indices']
-        unfolded = np.empty(metadata['output_shape'], dtype=array.dtype)
-        for flat_idx, (ky_idx, kx_idx) in enumerate(indices):
-            unfolded[flat_idx] = array[:, :, ky_idx, kx_idx]
-
-    elif representation == 'both_matrix':
-        real_indices = metadata['real_traversal_indices']
-        reciprocal_indices = metadata['reciprocal_traversal_indices']
-        unfolded = np.empty(metadata['output_shape'], dtype=array.dtype)
-        for flat_idx, (ry_idx, rx_idx) in enumerate(real_indices):
-            unfolded[flat_idx] = array[
-                ry_idx,
-                rx_idx,
-                reciprocal_indices[:, 0],
-                reciprocal_indices[:, 1],
-            ]
-
-    else:
-        raise ValueError(f"Unsupported unfolding representation '{representation}'.")
-
-    metadata['output_shape'] = unfolded.shape
-
-    if return_metadata:
-        return unfolded, metadata
-    return unfolded
 
 
 def clip_values(array, a_min=1, a_max=None):
@@ -5378,9 +2980,13 @@ def _peak_intensities_from_array(array, r, centers, return_pixel_counts=False):
     for int_idx, radius in enumerate(radii):
         cy, cx = centers[int_idx]
         y0 = max(0, min(array.shape[0], round(cy - (radius + 0.5))))
-        y1 = max(0, min(array.shape[0], round(cy + (radius + 0.5))))
+        y1 = max(0, min(array.shape[0], max(
+            round(cy + (radius + 0.5)), int(np.floor(cy + radius + 1e-10)) + 1,
+        )))
         x0 = max(0, min(array.shape[1], round(cx - (radius + 0.5))))
-        x1 = max(0, min(array.shape[1], round(cx + (radius + 0.5))))
+        x1 = max(0, min(array.shape[1], max(
+            round(cx + (radius + 0.5)), int(np.floor(cx + radius + 1e-10)) + 1,
+        )))
         if y0 >= y1 or x0 >= x1:
             continue
 
@@ -5408,6 +3014,19 @@ class StrainResult:
     source 4D scan. ``as_real_space`` is available for 2D maps. The result can
     also be indexed or unpacked like the historical four-array return; when
     ``return_transform=True``, the diagnostics dictionary is item five.
+
+    ``output_frame='reciprocal'`` reports detector directions. Its default
+    ``basis_angle_deg=0`` assigns ``exx`` to kx and ``eyy`` to ky, preserving
+    the input peak-coordinate shear/rotation conventions. The manual angle
+    changes this reporting basis without moving scan pixels.
+
+    ``output_frame='real'`` uses the stored R/Q orientation to report a
+    Cartesian real-space tensor (x right, y up). The strain tensor is
+    ``I - U``, with ``U`` the polar stretch in that frame; ``erot`` is positive
+    counterclockwise. ``rq_calibration`` records the immutable calibration
+    used, and ``output_basis_matrix`` maps centered input ``(ky, kx)`` vectors
+    to reporting coordinates. ``basis_angle_deg`` is the manual angle only
+    and is zero for real-frame output. Scan layout and fit errors are retained.
     """
 
     exx: np.ndarray
@@ -5428,6 +3047,11 @@ class StrainResult:
     real_conv_factor: float | tuple[float, float] | None = None
     real_origin: tuple[float, float] = (0.0, 0.0)
     diagnostics: dict | None = None
+    output_frame: str = 'reciprocal'
+    rq_calibration: RQCalibration | None = None
+    output_basis_matrix: np.ndarray | None = None
+    fit_status: np.ndarray | None = None
+    condition_numbers: np.ndarray | None = None
 
     @property
     def valid_mask(self):
@@ -5445,6 +3069,7 @@ class StrainResult:
 
         ``component`` may be a strain component, ``fit_rmse``,
         ``relative_fit_rmse``, a peak-count map, or ``valid_mask``.
+        This changes neither the scan layout nor the strain tensor basis.
         """
         quantities = {
             'exx': ('Strain exx', None),
@@ -5494,9 +3119,82 @@ class StrainResult:
     def __repr__(self):
         return (
             f'StrainResult(shape={self.exx.shape}, '
+            f'output_frame={self.output_frame!r}, '
             f'real_units={self.real_units!r}, '
             f'diagnostics={self.diagnostics is not None})'
         )
+
+
+def _braggness_pattern(pattern, annulus_mask, sigma, top_pixels,
+                       denominator_floor):
+    """Evaluate one finite Cartesian pattern without modifying its values.
+
+    The caller validates the common detector mask and calculation settings.
+    Floating inputs up to 32 bits use float32; other real numeric inputs use
+    float64. Filtering precedes annulus selection, including at image edges.
+    """
+    dtype = np.float32 if pattern.dtype.kind == 'f' and pattern.dtype.itemsize <= 4 else np.float64
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        work = np.asarray(pattern, dtype=dtype)
+        smooth = gaussian_filter(work, sigma=sigma, mode='reflect', truncate=4.0)
+        residual = np.maximum(work - smooth, 0)
+        if not np.isfinite(residual).all():
+            raise FloatingPointError('Gaussian residual is not finite.')
+        top = np.partition(residual[annulus_mask], -top_pixels)[-top_pixels:]
+        total = float(np.sum(work[annulus_mask], dtype=np.float64))
+        numerator = float(np.sum(top, dtype=np.float64))
+        score = np.float32(numerator / max(total, denominator_floor))
+    if not np.isfinite(total) or not np.isfinite(numerator) or not np.isfinite(score):
+        raise FloatingPointError('Braggness is not representable as a finite float32 score.')
+    return score
+
+
+@dataclass(slots=True, repr=False, eq=False)
+class BraggnessResult:
+    """Concentrated sharp diffraction contrast from :meth:`HyperData.get_braggness`.
+
+    Attributes
+    ----------
+    score : numpy.ndarray
+        Dimensionless float32 scores with the source ``scan_shape``: scalar
+        shape ``()`` for one pattern, ``(N,)`` for a stack, or ``(Ry, Rx)``
+        for a 4D scan. Skipped or invalid patterns contain NaN.
+    valid_mask : numpy.ndarray
+        Boolean array of the same shape; True means successfully evaluated.
+        Geometric segmentation/refinement must retain this exclusion, e.g.
+        ``refined_mask &= result.valid_mask``.
+    metadata : dict
+        Small JSON-serializable calculation settings and evaluation counts.
+        Contains no diffraction arrays or per-pattern intermediates.
+    real_units, real_conv_factor, real_origin
+        Source scan calibration used by :meth:`as_real_space`.
+
+    The score is not a phase label, crystalline volume fraction, or orientation
+    confidence. Noise, intensity, detector geometry, and parameters affect it.
+    """
+
+    score: np.ndarray
+    valid_mask: np.ndarray
+    metadata: dict
+    real_units: str | None = None
+    real_conv_factor: float | tuple[float, float] | None = None
+    real_origin: tuple[float, float] = (0.0, 0.0)
+
+    def as_real_space(self):
+        """Return a 2D score map retaining source scan units, spacing, and origin.
+
+        Raises ValueError for a single pattern or 1D stack, whose 2D scan
+        layout cannot be inferred. No scan or detector axes are transposed.
+        """
+        if self.score.ndim != 2:
+            raise ValueError('as_real_space requires a 2D scan map from 4D data.')
+        return RealSpace(
+            self.score, units=self.real_units, conv_factor=self.real_conv_factor,
+            origin=self.real_origin, quantity='Braggness', value_units=None,
+        )
+
+    def __repr__(self):
+        return f'BraggnessResult(shape={self.score.shape}, real_units={self.real_units!r})'
 
 
 #%% The main 4D-STEM object
@@ -5532,7 +3230,10 @@ class HyperData:
                  raw_trim_meta=None,
                  raw_trim_dims=(128, 128),
                  mat_variable=None,
-                 rq_calibration=None):
+                 rq_calibration=None,
+                 metadata_path='auto',
+                 acquisition_metadata=None,
+                 cepstral_metadata=None):
         """Wrap an array or load a dataset with optional axis reversal.
 
         ``flip_axis`` accepts one axis or a sequence of axes to reverse. For
@@ -5561,8 +3262,39 @@ class HyperData:
         ``rq_calibration`` is an optional :class:`RQCalibration` or saved
         calibration dictionary describing real-to-detector orientation.
         Saved files restore it automatically; axis flips update its frame.
+
+        ``metadata_path='auto'`` discovers recognized EMPAD XML sidecars in
+        the same directory as a raw file. The XML must name that raw file;
+        multiple matches raise an error rather than choosing silently. Pass
+        an explicit XML path to select a sidecar, or None to disable external
+        discovery. Explicit paths are relative to the working directory.
+        Imported scan dimensions must match the loaded array (or the pattern
+        count for a 3D stack); sidecars do not change raw layout or trimming.
+        Malformed sidecars warn and are skipped in auto mode; explicit ones
+        raise errors. Auto discovery does not search for XML beside NumPy or
+        generic HDF5 files. Saved HyperData files restore embedded metadata
+        even with ``metadata_path=None`` and do not rediscover sidecars.
+
+        ``acquisition_metadata`` optionally supplies a descriptive dictionary
+        for an array or overrides saved/imported acquisition information.
+        It cannot be combined with an explicit ``metadata_path``. The record
+        is deep-copied and describes the original acquisition, not the current
+        cropped/resized geometry. It never sets pixel calibration or
+        ``rq_calibration``; explicit user calibrations remain authoritative.
+        ``cepstral_metadata`` identifies EWPC/Fourier-conjugate pattern axes
+        and their zero pixel. Saved files restore it; it is not diffraction
+        calibration and is mutually exclusive with ``polar_metadata``.
         """
         loaded_metadata = {}
+        imported_acquisition = {}
+        data_path = None
+        if metadata_path is not None and not isinstance(metadata_path, (str, Path)):
+            raise TypeError("metadata_path must be 'auto', a file path, or None.")
+        if acquisition_metadata is not None:
+            if not isinstance(acquisition_metadata, dict):
+                raise TypeError('acquisition_metadata must be a dictionary or None.')
+            if metadata_path not in ('auto', None):
+                raise ValueError('Use acquisition_metadata or an explicit metadata_path, not both.')
 
         # Read dataset from file path if input object is string/path-like.
         if isinstance(data, (str, Path)):
@@ -5581,6 +3313,8 @@ class HyperData:
                     "valid 4Denoise HyperData save file."
                 )
             else:
+                if acquisition_metadata is None:
+                    imported_acquisition = _load_acquisition_metadata(data_path, metadata_path)
                 data = read_4D(
                     str(data_path),
                     hdf5_dataset=hdf5_dataset,
@@ -5595,6 +3329,15 @@ class HyperData:
                 )
         elif mat_variable is not None:
             raise ValueError("mat_variable applies only to .mat files.")
+
+        if not imported_acquisition and metadata_path not in ('auto', None):
+            imported_acquisition = _load_acquisition_metadata(data_path, metadata_path)
+        if imported_acquisition:
+            _validate_acquisition_shape(imported_acquisition, data.shape)
+        if acquisition_metadata is None:
+            acquisition_metadata = (
+                imported_acquisition or loaded_metadata.get('acquisition_metadata')
+            )
 
         if (
             real_units is None
@@ -5612,6 +3355,10 @@ class HyperData:
             reciprocal_conv_factor = loaded_metadata.get('reciprocal_conv_factor')
         if polar_metadata is None and loaded_metadata:
             polar_metadata = loaded_metadata.get('polar_metadata')
+        if cepstral_metadata is None and loaded_metadata:
+            cepstral_metadata = loaded_metadata.get('cepstral_metadata')
+        if cepstral_metadata is not None and polar_metadata is not None:
+            raise ValueError('Cepstral and polar coordinate metadata cannot be combined.')
         if center_beam_metadata is None and loaded_metadata:
             center_beam_metadata = loaded_metadata.get('center_beam_metadata')
         if real_origin is None:
@@ -5626,49 +3373,29 @@ class HyperData:
             )
 
         flip_axes = self._normalize_flip_axes(flip_axis, data.ndim)
-        if polar_metadata is not None and any(
-            axis in (data.ndim - 2, data.ndim - 1) for axis in flip_axes
-        ):
-            raise ValueError(
-                "Flipping polar radius or angle axes would invalidate polar "
-                "metadata. Convert to Cartesian coordinates before flipping "
-                "reciprocal-space axes."
-            )
         if flip_axes:
+            geometry = _transform_geometry(
+                {'real_units': real_units, 'real_conv_factor': real_conv_factor,
+                 'real_origin': real_origin, 'reciprocal_units': reciprocal_units,
+                 'reciprocal_conv_factor': reciprocal_conv_factor,
+                 'polar_metadata': polar_metadata, 'cepstral_metadata': cepstral_metadata,
+                 'center_beam_metadata': center_beam_metadata, 'rq_calibration': rq_calibration},
+                data.shape, data.shape, 'flip', flip_axes=flip_axes,
+            )
+            real_origin = geometry['real_origin']
+            real_conv_factor = geometry['real_conv_factor']
+            cepstral_metadata = geometry['cepstral_metadata']
+            center_beam_metadata = geometry['center_beam_metadata']
+            rq_calibration = geometry['rq_calibration']
             data = np.flip(data, axis=flip_axes)
-            if data.ndim == 4 and real_conv_factor is not None:
-                steps = list(_real_spacing_pair(
-                    _normalize_real_spacing(real_conv_factor)
-                ))
-                origin = list(_normalize_real_origin(real_origin))
-                for axis in (0, 1):
-                    if axis in flip_axes:
-                        origin[axis] += (data.shape[axis] - 1) * steps[axis]
-                        steps[axis] *= -1
-                real_origin = tuple(origin)
-                real_conv_factor = (
-                    steps[0] if np.isclose(steps[0], steps[1])
-                    else tuple(steps)
-                )
 
         self.array = data
+        self.acquisition_metadata = acquisition_metadata
         self.real_units = None
         self.real_conv_factor = None
         self.real_origin = _normalize_real_origin(real_origin)
         self.rq_calibration = rq_calibration
-        if flip_axes and self.rq_calibration is not None:
-            real_flip = np.eye(2)
-            q_flip = np.eye(2)
-            for axis in flip_axes:
-                if axis == self.ndim - 1:
-                    q_flip[0, 0] = -1
-                elif axis == self.ndim - 2:
-                    q_flip[1, 1] = -1
-                elif self.ndim == 4:
-                    real_flip[1 - axis, 1 - axis] = -1
-            self.rq_calibration = _reframe_rq_calibration(
-                self.rq_calibration, real=real_flip, reciprocal=q_flip,
-            )
+
         self.reciprocal_units = None
         self.reciprocal_conv_factor = None
         self.unfold_metadata = _clone_unfold_metadata(
@@ -5678,20 +3405,47 @@ class HyperData:
             share_payload=True,
         )
         self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+        self.cepstral_metadata = deepcopy(cepstral_metadata) if cepstral_metadata is not None else None
         self.center_beam_metadata = (
             deepcopy(center_beam_metadata)
             if center_beam_metadata is not None
             else None
         )
-        if self.center_beam_metadata is not None and any(
-            axis in (self.ndim - 2, self.ndim - 1) for axis in flip_axes
-        ):
-            self._flip_center_beam_metadata(flip_axes)
 
         if real_units is not None or real_conv_factor is not None:
             self.set_real_scale(real_units, real_conv_factor)
         if reciprocal_units is not None or reciprocal_conv_factor is not None:
             self.set_reciprocal_scale(reciprocal_units, reciprocal_conv_factor)
+
+    @property
+    def acquisition_metadata(self):
+        """Descriptive original-acquisition record; never an inferred calibration."""
+        return self._acquisition_metadata
+
+    @acquisition_metadata.setter
+    def acquisition_metadata(self, value):
+        self._acquisition_metadata = _copy_acquisition_metadata(value)
+
+    def metadata_summary(self):
+        """Return a readable acquisition and current-calibration summary.
+
+        Use ``print(data.metadata_summary())`` in a notebook. Missing fields
+        remain unknown. The original acquisition scan shape and instrument
+        settings are reported separately from the current data shape and
+        user/verified calibration; no rotation or scale is inferred here.
+        Original XML values and conversion provenance are available through
+        ``acquisition_metadata['raw_metadata']`` and ``['field_sources']``.
+        """
+        lines = [f'Current data shape: {self.shape}']
+        lines.extend(_acquisition_summary(self.acquisition_metadata))
+        for label, factor, units in (
+            ('real-space', self.real_conv_factor, self.real_units),
+            ('reciprocal-space', self.reciprocal_conv_factor, self.reciprocal_units),
+        ):
+            calibration = 'not set' if factor is None else f'{factor!r} {units!r} per pixel'
+            lines.append(f'Current {label} calibration: {calibration}')
+        lines.append(f'Current R/Q calibration: {self.rq_calibration!r}')
+        return '\n'.join(lines)
 
     @property
     def array(self):
@@ -5724,6 +3478,7 @@ class HyperData:
             self.unfold_metadata = None
             if old_shape[-2:] != new_array.shape[-2:]:
                 self.polar_metadata = None
+                self.cepstral_metadata = None
                 self.center_beam_metadata = None
                 self.rq_calibration = None
 
@@ -5764,42 +3519,16 @@ class HyperData:
             normalized.append(axis)
         return tuple(normalized)
 
-    def _flip_center_beam_metadata(self, flip_axes):
-        """Keep current center coordinates aligned after reciprocal flips."""
-        metadata = self.center_beam_metadata
-        if not isinstance(metadata, dict):
-            return
-        flip_y = self.ndim - 2 in flip_axes
-        flip_x = self.ndim - 1 in flip_axes
-        for key in (
-            'center_px', 'mean_fit_center_px', 'std_fit_center_px',
-            'target_center_px',
-        ):
-            if key not in metadata:
-                continue
-            center = np.asarray(metadata[key], dtype=float)
-            if center.shape != (2,):
-                continue
-            center = center.copy()
-            if flip_y:
-                center[0] = self.k_shape[0] - 1 - center[0]
-            if flip_x:
-                center[1] = self.k_shape[1] - 1 - center[1]
-            metadata[key] = tuple(center)
-        if 'center_calibrated' in metadata:
-            center = np.asarray(metadata['center_calibrated'], dtype=float)
-            if center.shape == (2,):
-                center = center.copy()
-                if flip_y:
-                    center[0] *= -1
-                if flip_x:
-                    center[1] *= -1
-                metadata['center_calibrated'] = tuple(center)
 
     @property
     def is_polar(self):
         """Return True when the last two axes represent polar ``(r, theta)``."""
         return self.polar_metadata is not None
+
+    @property
+    def is_cepstral(self):
+        """Whether the pattern axes are cepstral rather than diffraction axes."""
+        return self.cepstral_metadata is not None
 
     @staticmethod
     def _validate_scale(units, conv_factor, label):
@@ -6004,66 +3733,112 @@ class HyperData:
 
     @classmethod
     @contextmanager
-    def open_hdf5(cls, filename, hdf5_dataset=None):
-        """Open a 3D/4D HDF5 dataset for bounded-memory reading.
+    def open(cls, filename, hdf5_dataset=None, *, real_units=None,
+             real_conv_factor=None, reciprocal_units=None,
+             reciprocal_conv_factor=None, real_origin=None,
+             backend='auto', reader=None, dataset=None,
+             axis_order=None, reader_kwargs=None):
+        """Open disk-backed data without loading the complete array into RAM.
 
-        This reader is intentionally separate from ``HyperData(path)``: it
-        never pretends that every HyperData analysis method is lazy. Use
-        ``get_dp`` for one pattern or ``iter_chunks`` for scan blocks. Each
-        returned chunk is an independent in-memory HyperData object; unfolding
-        metadata is not attached to partial chunks.
+        Returns a context manager yielding a read-only :class:`DiffractionSource`.
+        Supports nonempty 3D stacks and 4D scans in ``.npy``, ``.h5``,
+        ``.hdf5``, ``.hdf`` and saved ``.4denoise`` files. NumPy arrays are
+        memory-mapped read-only; HDF5 arrays remain on disk. Other formats
+        use the optional RosettaSciIO backend when a curated lazy reader is
+        available. Object arrays and NumPy archives are not supported.
+
+        ``backend='auto'`` prefers native NumPy/HDF5 readers for their formats.
+        Set ``backend='rosetta'`` or specify ``reader`` to use RosettaSciIO
+        explicitly, including vendor-specific HDF5 formats. ``reader`` accepts
+        a registered plugin name, alias or module suffix, e.g. ``'emd'``.
+        Unsupported lazy readers never fall back to loading the full array.
+        Install the optional backend with ``pip install -e ".[rosetta]"``.
+
+        ``dataset`` selects a Rosetta result by zero-based index or unique
+        title when several numeric 3D/4D arrays are returned. Other dimensions,
+        including thumbnail images, are not selected automatically.
+        ``axis_order`` is a permutation of original array indices, ordered
+        as ``(Ry, Rx, Ky, Kx)`` or ``(N, Ky, Kx)``. Default None infers that
+        order only from unambiguous labels/navigation metadata; ambiguous
+        axes raise an error rather than guessing. ``reader_kwargs`` forwards
+        plugin-specific options, excluding managed ``filename`` and ``lazy``.
+        Writable ``mode``/``mmap_mode`` values are rejected before opening.
+
+        Uniform compatible real-space calibration and isotropic detector
+        pixel-size magnitudes are imported. Unsupported/nonuniform calibration
+        warns and retains pixel units; all original axes and metadata are
+        archived in acquisition metadata. Detector offsets/signs do not define
+        a beam center or R/Q calibration. ``source.reader_metadata`` decodes
+        the archive; :func:`unpack_reader_metadata` works after a full load or
+        saved-file reload, even without RosettaSciIO installed.
+
+        Lazy Rosetta slices are computed synchronously, reserving the largest
+        declared reader chunk before budgeting managed buffers. Inspect
+        ``source.reader_chunk_nbytes``. A small returned selection may still
+        read a whole upstream chunk; task graphs, codecs/caches and library
+        overhead are not a process-RAM guarantee. Smaller plugin ``chunks``
+        can be supplied in ``reader_kwargs`` when supported.
+
+        ``hdf5_dataset`` selects one array when generic HDF5 has several.
+        Saved HyperData files restore calibration and acquisition/geometry
+        metadata automatically. Generic HDF5 and NumPy files have no assumed
+        calibration. Supply both units and conversion factor for each domain
+        to set or override its calibration, and optionally ``real_origin``.
+        These overrides affect returned objects, never the source file.
+        Reciprocal overrides update Cartesian beam calibration but are rejected
+        for saved polar/cepstral data, whose transformed axes have separate
+        coordinate metadata; omit overrides to preserve that metadata.
+
+        Inspect ``source.shape``, ``dtype``, ``nbytes`` and ``metadata`` without
+        reading pixels. Use ``get_dp`` for patterns or bounded mean/std/min/max
+        reductions, ``iter_chunks`` for independent HyperData blocks, or
+        ``load`` to explicitly create a complete in-memory HyperData object.
+        Large unfolding undo payloads are deferred until a full ``load``.
+        Every returned pattern/block/full object remains usable after closing
+        the source. Reads after closure fail rather than accessing dead handles.
+
+        This API does not promise lazy execution of arbitrary HyperData methods.
+        In particular, global tensor denoising still needs an explicit full
+        load. ``HyperData(filename)`` retains its existing eager behavior.
 
         Examples
         --------
-        >>> with HyperData.open_hdf5('experiment.h5') as source:
-        ...     for scan_slices, block in source.iter_chunks((16, 16)):
+        >>> with HyperData.open('experiment.npy') as source:
+        ...     mean_dp = source.get_dp(operation='mean', working_memory_mb=64)
+        ...     for scan_slices, block in source.iter_chunks((8, 8)):
         ...         process(block)
+        >>> with HyperData.open('saved.4denoise') as source:
+        ...     data = source.load(max_memory_mb=4096)
         """
-        path = Path(filename).expanduser()
-        if path.suffix.lower() not in {'.h5', '.hdf5', '.hdf', '.4denoise'}:
-            raise ValueError("open_hdf5 requires an HDF5 file path.")
-        if not path.is_file():
-            raise FileNotFoundError(f"'{path}' does not exist or is not a file.")
+        with _open_diffraction_source(
+            filename, cls, ReciprocalSpace, real_type=RealSpace,
+            hdf5_dataset=hdf5_dataset,
+            real_units=real_units, real_conv_factor=real_conv_factor,
+            reciprocal_units=reciprocal_units,
+            reciprocal_conv_factor=reciprocal_conv_factor, real_origin=real_origin,
+            backend=backend, reader=reader, dataset=dataset,
+            axis_order=axis_order, reader_kwargs=reader_kwargs,
+        ) as source:
+            yield source
 
-        with h5py.File(path, 'r') as file:
-            file_format = _decode_hdf5_value(
-                file.attrs.get('fourdenoise_format', None)
-            )
-            if file_format == _HYPERDATA_HDF5_FORMAT:
-                version = _checked_hyperdata_format_version(file, path)
-                if hdf5_dataset is not None and str(hdf5_dataset).strip('/\\') != 'array':
-                    raise ValueError(
-                        "Saved HyperData files contain their data at '/array'; "
-                        "omit hdf5_dataset or use '/array'."
-                    )
-                if 'array' not in file:
-                    raise ValueError(f"'{path}' does not contain a saved data array.")
-                dataset = file['array']
-                metadata = {}
-                if 'metadata' in file:
-                    group = file['metadata']
-                    for key in (
-                        'real_units', 'real_conv_factor', 'real_origin',
-                        'reciprocal_units', 'reciprocal_conv_factor',
-                        'polar_metadata', 'center_beam_metadata',
-                        'rq_calibration',
-                    ):
-                        if key in group:
-                            metadata[key] = _read_hdf5_value(group, key)
-                metadata = _migrate_hyperdata_metadata(metadata, version)
-            else:
-                dataset = _select_hdf5_dataset(file, hdf5_dataset)
-                metadata = {}
+    @classmethod
+    @contextmanager
+    def open_hdf5(cls, filename, hdf5_dataset=None):
+        """Open an HDF5 diffraction source using the shared disk-backed reader.
 
-            reader = _HDF5ChunkReader(dataset, cls, metadata)
-            try:
-                yield reader
-            finally:
-                reader._closed = True
+        Accepts ``.h5``, ``.hdf5``, ``.hdf`` and ``.4denoise`` paths. This
+        format-specific entry point uses the same :class:`DiffractionSource`
+        as :meth:`open`; use that method for NumPy files or explicit calibration
+        overrides. Existing HDF5 streaming workflows continue to use this API.
+        """
+        if Path(filename).suffix.lower() not in {'.h5', '.hdf5', '.hdf', '.4denoise'}:
+            raise ValueError('open_hdf5 requires an HDF5 file path.')
+        with cls.open(filename, hdf5_dataset=hdf5_dataset) as source:
+            yield source
 
     @classmethod
     def to_polar_hdf5(cls, source, destination, *, hdf5_dataset=None,
-                      chunk_shape=8, center=None, r_max=None,
+                      chunk_shape=8, working_memory_mb=None, center=None, r_max=None,
                       output_shape=None, order=1, fill_value=0.0,
                       clip=False, compression='gzip', compression_opts=4,
                       overwrite=False, atomic=True, progress=True):
@@ -6073,6 +3848,10 @@ class HyperData:
         transform as :meth:`to_polar`, and write each result directly into a
         chunked HyperData HDF5 file. ``chunk_shape`` bounds the number of scan
         positions held in memory; it is a scalar or one value per scan axis.
+        ``working_memory_mb`` further bounds numerical interpolation workspace
+        (default 256 MiB). For NumPy/Rosetta sources and explicit calibration,
+        open a source with ``HyperData.open(...)`` and call
+        ``source.to_polar(destination=...)`` inside the with block.
         The saved result can be opened with ``HyperData.open_hdf5`` for later
         bounded-memory access or loaded fully with ``HyperData(destination)``.
         The destination must differ from the source. Atomic output is the
@@ -6082,111 +3861,123 @@ class HyperData:
         and interpolation meanings. ``hdf5_dataset`` selects an array from a
         generic HDF5 file; saved HyperData files use ``/array`` automatically.
         """
-        source_path = Path(source).expanduser()
-        destination_path = Path(destination).expanduser()
-        if not destination_path.suffix:
-            destination_path = destination_path.with_suffix('.4denoise')
-        if destination_path.suffix.lower() not in {
-            '.4denoise', '.h5', '.hdf5', '.hdf',
-        }:
-            raise ValueError(
-                "destination must end in .4denoise, .h5, .hdf5, or .hdf."
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.to_polar(
+                center=center, r_max=r_max, output_shape=output_shape, order=order,
+                fill_value=fill_value, clip=clip, destination=destination,
+                working_memory_mb=working_memory_mb, chunk_shape=chunk_shape,
+                compression=compression, compression_opts=compression_opts,
+                overwrite=overwrite, atomic=atomic, progress=progress,
             )
-        if source_path.resolve() == destination_path.resolve():
-            raise ValueError("source and destination must be different files.")
-        if destination_path.exists() and not overwrite:
-            raise FileExistsError(
-                f"'{destination_path}' exists; use overwrite=True to replace it."
-            )
-        if not destination_path.parent.is_dir():
-            raise FileNotFoundError(
-                f"Output directory '{destination_path.parent}' does not exist."
-            )
-        for name, value in (('overwrite', overwrite), ('atomic', atomic), ('progress', progress)):
-            if not isinstance(value, (bool, np.bool_)):
-                raise ValueError(f"{name} must be a boolean.")
-        if compression is not None and not isinstance(compression, str):
-            raise ValueError("compression must be a string or None.")
 
-        temporary_path = None
-        if atomic:
-            descriptor, temp_name = tempfile.mkstemp(
-                prefix=f'.{destination_path.name}.', suffix='.tmp',
-                dir=destination_path.parent,
+    @classmethod
+    def resize_hdf5(cls, source, destination, shape, domain, method='area', *,
+                    hdf5_dataset=None, working_memory_mb=None,
+                    compression='gzip', compression_opts=4,
+                    overwrite=False, atomic=True, progress=True):
+        """Resize HDF5 data directly to a metadata-preserving disk destination.
+
+        Parameters
+        ----------
+        source, destination : str or pathlib.Path
+            Input HDF5 file and distinct output file (.4denoise/.h5/.hdf5/.hdf).
+            A destination without a suffix receives .4denoise. Generic HDF5
+            inputs have no assumed calibration; saved HyperData inputs retain
+            their metadata with the same geometry updates as resize.
+        shape, domain, method
+            Same selected-axis output sizes and numerical meanings as resize.
+            Real-space fractional bins span global scan coordinates even when
+            their source regions cross processing-block boundaries.
+        hdf5_dataset : str or None, optional
+            Dataset path for generic multi-dataset inputs.
+        working_memory_mb : float or None, optional
+            Temporary-buffer budget in MiB (default 256). Source and output
+            remain on disk. Allocator overhead and HDF5 caches are excluded.
+        compression : str or None, optional
+            HDF5 compression filter, default gzip.
+        compression_opts : int or None, optional
+            Compression options, default gzip level 4.
+        overwrite : bool, optional
+            Permit replacement of an existing destination, default False.
+        atomic : bool, optional
+            Default True writes a temporary sibling file and publishes only
+            after completion. Failed atomic writes leave an existing output
+            untouched. False explicitly permits a partial output on failure.
+        progress : bool, optional
+            Display one output-pixel progress bar, default True.
+
+        Returns
+        -------
+        str
+            Saved path. Use open_hdf5 for bounded access; HyperData(path)
+            explicitly loads the entire output into RAM.
+        """
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.resize(
+                shape, domain, method, destination=destination,
+                working_memory_mb=working_memory_mb, compression=compression,
+                compression_opts=compression_opts, overwrite=overwrite,
+                atomic=atomic, progress=progress,
             )
-            os.close(descriptor)
-            temporary_path = Path(temp_name)
-        write_path = temporary_path or destination_path
 
-        try:
-            with cls.open_hdf5(source_path, hdf5_dataset=hdf5_dataset) as reader:
-                scan_shape = reader.shape[:-2]
-                with h5py.File(write_path, 'w' if atomic or overwrite else 'x') as file:
-                    file.attrs['fourdenoise_format'] = _HYPERDATA_HDF5_FORMAT
-                    file.attrs['format_version'] = _HYPERDATA_HDF5_VERSION
-                    file.attrs['saved_class'] = 'HyperData'
-                    dataset = None
-                    with tqdm(
-                        total=int(np.prod(scan_shape)),
-                        desc='Diffraction patterns', disable=not progress,
-                    ) as bar:
-                        for scan_slices, block in reader.iter_chunks(chunk_shape):
-                            polar_block = block.to_polar(
-                                center=center, r_max=r_max,
-                                output_shape=output_shape, order=order,
-                                fill_value=fill_value, clip=clip,
-                                progress=False,
-                            )
-                            if dataset is None:
-                                output_pattern_shape = polar_block.shape[-2:]
-                                output_shape_full = scan_shape + output_pattern_shape
-                                dataset = file.create_dataset(
-                                    'array', shape=output_shape_full,
-                                    dtype=polar_block.dtype,
-                                    chunks=(1,) * len(scan_shape) + output_pattern_shape,
-                                    **_hdf5_dataset_kwargs(
-                                        polar_block.array, compression,
-                                        compression_opts,
-                                    ),
-                                )
-                                file.attrs['array_ndim'] = polar_block.ndim
-                                file.attrs['array_dtype'] = str(polar_block.dtype)
-                                metadata = {
-                                    'real_units': polar_block.real_units,
-                                    'real_conv_factor': polar_block.real_conv_factor,
-                                    'real_origin': polar_block.real_origin,
-                                    'reciprocal_units': polar_block.reciprocal_units,
-                                    'reciprocal_conv_factor': polar_block.reciprocal_conv_factor,
-                                    'polar_metadata': polar_block.polar_metadata,
-                                    'unfold_metadata': None,
-                                    'center_beam_metadata': None,
-                                    'rq_calibration': (
-                                        polar_block.rq_calibration.to_dict()
-                                        if polar_block.rq_calibration is not None else None
-                                    ),
-                                }
-                                metadata_group = file.create_group('metadata')
-                                metadata_group.attrs['kind'] = 'dict'
-                                for key, value in metadata.items():
-                                    _write_hdf5_value(
-                                        metadata_group, key, value,
-                                        compression=compression,
-                                        compression_opts=compression_opts,
-                                    )
-                            dataset[scan_slices + (slice(None), slice(None))] = polar_block.array
-                            bar.update(int(np.prod(polar_block.scan_shape)))
-                    if dataset is None:
-                        raise ValueError("source has no diffraction patterns to transform.")
+    @classmethod
+    def to_cartesian_hdf5(cls, source, destination, *, hdf5_dataset=None,
+                          output_shape=None, center=None, order=1, fill_value=0.0,
+                          clip=False, working_memory_mb=None, compression='gzip',
+                          compression_opts=4, overwrite=False, atomic=True, progress=True):
+        """Convert saved polar data to Cartesian patterns without a full RAM output.
 
-            if atomic:
-                if overwrite:
-                    os.replace(temporary_path, destination_path)
-                else:
-                    os.link(temporary_path, destination_path)
-            return str(destination_path)
-        finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        Shape, center, interpolation and fill meanings match to_cartesian.
+        None uses (2*n_r, 2*n_r); 'original' uses the stored Cartesian canvas.
+        Only current scan blocks and per-pattern coordinate workspaces are
+        allocated. working_memory_mb budgets explicit temporary arrays in MiB
+        (default 256); allocator overhead, metadata, HDF5 caches and the
+        caller's data are excluded. An insufficient one-pattern budget fails
+        before transforming a probe. Saved calibration, scan origin and R/Q
+        metadata are preserved; polar identity is removed from the result.
+
+        Returns the output path, not an eager HyperData object. The source
+        must have saved polar metadata. Writes are atomic by default; replacing
+        an existing destination requires overwrite=True. Source and destination
+        must differ. Set progress=False to suppress the single outer bar.
+        """
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.to_cartesian(
+                output_shape=output_shape, center=center, order=order,
+                fill_value=fill_value, clip=clip, destination=destination,
+                working_memory_mb=working_memory_mb, compression=compression,
+                compression_opts=compression_opts, overwrite=overwrite,
+                atomic=atomic, progress=progress,
+            )
+
+    @classmethod
+    def remove_bg_hdf5(cls, source, destination, background, *, hdf5_dataset=None,
+                       bg_frac=1, a_min=1, a_max=None, working_memory_mb=None,
+                       compression='gzip', compression_opts=4,
+                       overwrite=False, atomic=True, progress=True):
+        """Subtract a fixed 2D diffraction background into a bounded HDF5 output.
+
+        bg_frac and clipping limits match remove_bg. Background must be one
+        ndarray or ReciprocalSpace with the source diffraction shape; it is
+        not a scan-shaped stack. Global background estimation and residual
+        peak inference are intentionally not chunked here: estimate the
+        background explicitly first. This path acts independently per pattern
+        and does not approximate global denoising or change fitting semantics.
+
+        working_memory_mb is a temporary-array MiB budget (default 256), not a
+        process-RAM limit; caller-owned background, metadata and HDF5 caches
+        are excluded. Current scan blocks are read, transformed, and discarded.
+        All coordinate metadata is retained. Returns a saved path. Atomic
+        publication is the default; overwrite=True permits replacement, and
+        source/destination must differ. One optional outer progress bar is used.
+        """
+        with cls.open_hdf5(source, hdf5_dataset=hdf5_dataset) as reader:
+            return reader.remove_bg(
+                background, bg_frac=bg_frac, a_min=a_min, a_max=a_max,
+                destination=destination, working_memory_mb=working_memory_mb,
+                compression=compression, compression_opts=compression_opts,
+                overwrite=overwrite, atomic=atomic, progress=progress,
+            )
 
     def save(self, filename, overwrite=False, compression='gzip',
              compression_opts=4, atomic=True):
@@ -6252,12 +4043,14 @@ class HyperData:
             raise ValueError("compression must be a string or None.")
 
         metadata = {
+            'acquisition_metadata': self.acquisition_metadata,
             'real_units': self.real_units,
             'real_conv_factor': self.real_conv_factor,
             'real_origin': self.real_origin,
             'reciprocal_units': self.reciprocal_units,
             'reciprocal_conv_factor': self.reciprocal_conv_factor,
             'polar_metadata': self.polar_metadata,
+            'cepstral_metadata': self.cepstral_metadata,
             'unfold_metadata': self.unfold_metadata,
             'center_beam_metadata': self.center_beam_metadata,
             'rq_calibration': (
@@ -6324,6 +4117,7 @@ class HyperData:
                center_beam_metadata=_SCALE_UNSET,
                real_origin=_SCALE_UNSET,
                rq_calibration=_SCALE_UNSET,
+               cepstral_metadata=_SCALE_UNSET,
                preserve_unfold=False):
         """Create an object; retain unfolding only for shape-preserving values."""
         if real_units is _SCALE_UNSET:
@@ -6336,6 +4130,10 @@ class HyperData:
             reciprocal_conv_factor = self.reciprocal_conv_factor
         if polar_metadata is _SCALE_UNSET:
             polar_metadata = self.polar_metadata
+        if cepstral_metadata is _SCALE_UNSET:
+            cepstral_metadata = (
+                self.cepstral_metadata if tuple(data.shape[-2:]) == self.pattern_shape else None
+            )
         if center_beam_metadata is _SCALE_UNSET:
             center_beam_metadata = (
                 self.center_beam_metadata
@@ -6353,6 +4151,7 @@ class HyperData:
             reciprocal_units=reciprocal_units,
             reciprocal_conv_factor=reciprocal_conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            cepstral_metadata=cepstral_metadata,
             center_beam_metadata=(
                 deepcopy(center_beam_metadata)
                 if center_beam_metadata is not None
@@ -6360,6 +4159,7 @@ class HyperData:
             ),
             real_origin=real_origin,
             rq_calibration=rq_calibration,
+            acquisition_metadata=self.acquisition_metadata,
         )
         if preserve_unfold and result.shape == self.shape:
             result.unfold_metadata = _clone_unfold_metadata(
@@ -6385,6 +4185,7 @@ class HyperData:
             units=units,
             conv_factor=conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            cepstral_metadata=self.cepstral_metadata,
             center_beam_metadata=(
                 deepcopy(center_beam_metadata)
                 if center_beam_metadata is not None
@@ -8365,6 +6166,8 @@ class HyperData:
                 "'rotate_dps' only supports 3D stacks of diffraction patterns "
                 "or 4D-STEM datasets."
             )
+        if self.is_cepstral:
+            raise ValueError('rotate_dps is a diffraction rotation; rotate the diffraction data before EWPC.')
         if (
             not np.isscalar(angle)
             or not np.isreal(angle)
@@ -8458,12 +6261,11 @@ class HyperData:
                     prefilter=order > 1,
                 )
 
-            return self._spawn(
-                new_data, center_beam_metadata=None,
-                rq_calibration=_reframe_rq_calibration(
-                    self.rq_calibration, reciprocal=_rq_rotation_matrix(angle_degrees),
-                ),
+            geometry = _transform_geometry(
+                dict(self._coordinate_metadata(), rq_calibration=self.rq_calibration),
+                self.shape, new_data.shape, 'rotation', angle_degrees=angle_degrees,
             )
+            return self._spawn(new_data, **geometry)
 
         output_dtype = (
             self.dtype if order == 0
@@ -8515,13 +6317,28 @@ class HyperData:
                     order=int(order),
                 )
 
-        return self._spawn(
-            new_data, center_beam_metadata=None,
-            rq_calibration=_reframe_rq_calibration(
-                self.rq_calibration, reciprocal=_rq_rotation_matrix(angle_degrees),
-            ),
+        geometry = _transform_geometry(
+            dict(self._coordinate_metadata(), rq_calibration=self.rq_calibration),
+            self.shape, new_data.shape, 'rotation', angle_degrees=angle_degrees,
         )
+        return self._spawn(new_data, **geometry)
     
+    def _normalization_input(self, method, operation):
+        """Validate intensity data and promote it before normalization math."""
+        if method not in ('global', 'local'):
+            raise ValueError("method must be 'global' or 'local'.")
+        arr = np.asarray(self.array)
+        if arr.size == 0 or arr.dtype.kind not in 'biuf':
+            raise ValueError(
+                f"{operation} requires a nonempty, real-valued numeric array."
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{operation} requires finite input values.")
+        if method == 'local' and arr.ndim < 2:
+            raise ValueError("Local normalization requires at least 2 dimensions.")
+        axes = None if method == 'global' else (-2, -1)
+        return arr.astype(np.result_type(arr.dtype, np.float32), copy=False), axes
+
     def standardize(self, method='local'):
         """
         Standardize the dataset using NumPy.
@@ -8541,45 +6358,33 @@ class HyperData:
               (entire dataset has zero mean and unit variance).
             - 'local': Standardize each individual image in the dataset
               (each pattern on the last two axes has zero mean and unit variance).
-            Default is 'global'.
+            Default is 'local'.
     
         Returns
         -------
         HyperData
-            The standardized dataset with zero mean and unit variance, either
-            globally or locally.
+            New dataset with zero mean and unit variance, either globally or
+            locally. Constant arrays/patterns become zeros. Integer input is
+            promoted to floating point; output has at least float32 precision.
+            Calibration and unfolding metadata are preserved. The input is
+            not modified.
     
         Raises
         ------
         ValueError
-            If an invalid method is specified, or if local standardization is
-            applied to data with fewer than 2 dimensions.
+            If an invalid method is specified, the data is empty, non-real,
+            or contains NaN/infinity, or local standardization is applied to
+            data with fewer than 2 dimensions.
         """
-        methods = ['global', 'local']
-        if method not in methods:
-            raise ValueError(f"Valid methods are: {methods}")
-    
-        arr = self.array
-    
-        if method == 'global':
-            # Global standardization: calculate mean and std over the entire dataset
-            mean = np.mean(arr)
-            std = np.std(arr)
-            standardized_tensor = (arr - mean) / (std + 1)
-    
-        elif method == 'local':
-            # Local standardization: standardize each pattern defined by the last two axes
-            if arr.ndim < 2:
-                raise ValueError("Local standardization requires at least 2 dimensions")
-    
-            # Compute mean and std for each image on the last two dimensions
-            axes = tuple(range(arr.ndim - 2, arr.ndim))  # last two axes
-            mean = np.mean(arr, axis=axes, keepdims=True)
-            std = np.std(arr, axis=axes, keepdims=True)
-    
-            # Standardize each image independently
-            standardized_tensor = (arr - mean) / (std + 1)
-    
+        arr, axes = self._normalization_input(method, 'standardize')
+        stats_dtype = np.result_type(arr.dtype, np.float64)
+        mean = np.mean(arr, axis=axes, dtype=stats_dtype, keepdims=True)
+        std = np.std(arr, axis=axes, dtype=stats_dtype, keepdims=True)
+        standardized_tensor = np.zeros_like(arr)
+        # Only zero-variance patterns are special; do not bias every divisor.
+        np.divide(
+            arr - mean, std, out=standardized_tensor, where=std != 0,
+        )
         return self._spawn(standardized_tensor, preserve_unfold=True)
 
     def normalize(self, method='global'):
@@ -8606,49 +6411,28 @@ class HyperData:
         Returns
         -------
         HyperData
-            New HyperData instance containing the normalized dataset with
-            values in the range [0, 1] (up to numerical precision).
+            New HyperData instance containing values in [0, 1], up to
+            numerical precision. Constant arrays/patterns become zeros.
+            Integer input is promoted before subtraction to avoid overflow;
+            output has at least float32 precision. Calibration and unfolding
+            metadata are preserved. The input is not modified.
     
         Raises
         ------
         ValueError
-            If an invalid method is specified, or if local normalization is
-            applied to data with fewer than 2 dimensions.
+            If an invalid method is specified, the data is empty, non-real,
+            or contains NaN/infinity, or local normalization is applied to
+            data with fewer than 2 dimensions.
         """
-        methods = ['global', 'local']
-        if method not in methods:
-            raise ValueError(f"Valid methods are: {methods}")
-    
-        arr = self.array
-    
-        if method == 'global':
-            # Global normalization: single min/max over entire dataset
-            min_val = np.min(arr)
-            max_val = np.max(arr)
-            denom = max_val - min_val
-    
-            if denom == 0:
-                # Constant array: return zeros
-                normalized_tensor = np.zeros_like(arr, dtype=np.float32)
-            else:
-                normalized_tensor = (arr - min_val) / denom
-    
-        elif method == 'local':
-            # Local normalization: per-pattern min/max on the last two axes
-            if arr.ndim < 2:
-                raise ValueError("Local normalization requires at least 2 dimensions")
-    
-            axes = tuple(range(arr.ndim - 2, arr.ndim))  # last two axes
-    
-            min_val = np.min(arr, axis=axes, keepdims=True)
-            max_val = np.max(arr, axis=axes, keepdims=True)
-            denom = max_val - min_val
-    
-            # Avoid division by zero: where denom == 0, set denom to 1 (pattern is constant)
-            denom_safe = np.where(denom == 0, 1, denom)
-    
-            normalized_tensor = (arr - min_val) / denom_safe
-    
+        arr, axes = self._normalization_input(method, 'normalize')
+        stats_dtype = np.result_type(arr.dtype, np.float64)
+        min_val = np.min(arr, axis=axes, keepdims=True).astype(stats_dtype)
+        max_val = np.max(arr, axis=axes, keepdims=True).astype(stats_dtype)
+        denom = max_val - min_val
+        normalized_tensor = np.zeros_like(arr)
+        np.divide(
+            arr - min_val, denom, out=normalized_tensor, where=denom != 0,
+        )
         return self._spawn(normalized_tensor, preserve_unfold=True)
 
     
@@ -8903,8 +6687,13 @@ class HyperData:
             relative to the diffraction origin, with positive kx to the right.
         kshape : tuple of (int, int), optional
             Shape (A, B) to resize cropped diffraction patterns to.
-            If not provided, it is inferred from the cropped reciprocal region
-            when subpixel cropping or explicit k-limits are used.
+            If not provided, each requested window extent is rounded to the
+            nearest integer, with a minimum of one pixel, rather than using
+            the enclosing integer slice. Limits are half-open pixel-index
+            bounds: output pixel j samples
+            ``start + (j + 0.5) * (stop - start) / output_size - 0.5``.
+            For example, a four-pixel window (1.2, 5.2) samples
+            1.2, 2.2, 3.2, 4.2 along that axis. Downsampling is anti-aliased.
             Interpolating integer data returns floating-point output so detector
             counts retain their original range and subpixel values.
         rshape : tuple of (int, int), optional
@@ -8921,6 +6710,9 @@ class HyperData:
             Unit system used for ``kylim`` and ``kxlim``. ``'auto'`` uses
             stored reciprocal-space calibration when available and otherwise
             falls back to pixels.
+            For polar data, limits are radial/angular array indices; use
+            ``'pixels'`` or ``'auto'``. Crops update polar sample ranges and
+            support; an angular sector is no longer a full periodic circle.
 
         Examples
         --------
@@ -8949,6 +6741,11 @@ class HyperData:
 
         if self.ndim != 4:
             raise ValueError("crop currently requires a 4D HyperData object.")
+        if self.is_polar and _normalize_unit_mode(reciprocal_limit_units) == 'calibrated':
+            raise ValueError(
+                "Polar cropping uses radial/angular pixel-index limits; use "
+                "reciprocal_limit_units='pixels' or 'auto'."
+            )
 
         _, real_factor, real_mode = _resolve_unit_mode(
             real_limit_units,
@@ -8962,83 +6759,6 @@ class HyperData:
             self.reciprocal_conv_factor,
             label='reciprocal_limit_units',
         )
-    
-        def parse_limits(limits, max_length, allow_float=False, name="limits",
-                         unit_mode='pixels', conv_factor=None, axis='real',
-                         origin=0.0):
-            """Return (start, end) within [0, max_length]."""
-            if limits is None:
-                return (0, max_length)
-
-            def calibrated_to_pixel(value):
-                if unit_mode != 'calibrated':
-                    return float(value)
-                if axis == 'real':
-                    return (float(value) - origin) / conv_factor
-                axis_center = (max_length - 1) / 2.0
-                if axis == 'reciprocal_y':
-                    return axis_center - float(value) / conv_factor
-                if axis == 'reciprocal_x':
-                    return axis_center + float(value) / conv_factor
-                raise ValueError(f"Unknown crop axis {axis!r}.")
-    
-            # Single index
-            if np.isscalar(limits):
-                value = float(limits)
-                if not np.isfinite(value):
-                    raise ValueError(f"{name}: index must be finite.")
-                if unit_mode == 'calibrated':
-                    idx = int(np.rint(calibrated_to_pixel(value)))
-                else:
-                    if not value.is_integer():
-                        raise ValueError(
-                            f"{name}: single-index limits must be integer "
-                            "when using pixel units."
-                        )
-                    idx = int(value)
-                if idx < 0 or idx >= max_length:
-                    raise ValueError(f"{name}: index {idx} out of bounds for axis length {max_length}")
-                return (idx, idx + 1)
-    
-            # Two-element sequence
-            is_pair = (
-                isinstance(limits, (tuple, list, np.ndarray))
-                and np.asarray(limits).shape == (2,)
-            )
-            if is_pair:
-                start, end = np.asarray(limits, dtype=float)
-                if not np.all(np.isfinite((start, end))):
-                    raise ValueError(f"{name}: range limits must be finite.")
-    
-                if unit_mode == 'calibrated':
-                    start_px = calibrated_to_pixel(start)
-                    end_px = calibrated_to_pixel(end)
-                    if axis.startswith('reciprocal_'):
-                        start, end = sorted((start_px, end_px))
-                    else:
-                        start, end = start_px, end_px
-                    if not allow_float:
-                        start = int(np.floor(start))
-                        end = int(np.ceil(end))
-                elif not allow_float:
-                    # Real-space indices must be integers
-                    if not float(start).is_integer() or not float(end).is_integer():
-                        raise ValueError(f"{name}: real-space limits must be integers")
-                    start = int(start)
-                    end = int(end)
-    
-                if start < 0 or end > max_length:
-                    raise ValueError(
-                        f"{name}: range ({start}, {end}) out of bounds for axis length {max_length}"
-                    )
-                if end <= start:
-                    raise ValueError(f"{name}: end ({end}) must be greater than start ({start})")
-                if allow_float and np.isclose(start, np.rint(start)) and np.isclose(end, np.rint(end)):
-                    start = int(np.rint(start))
-                    end = int(np.rint(end))
-                return (start, end)
-    
-            raise ValueError(f"{name}: limits must be int, tuple, list, or None")
     
         Ny, Nx, Ky, Kx = self.shape
     
@@ -9074,23 +6794,21 @@ class HyperData:
             )
     
         # --- Reciprocal-space limits (allow floats for subpixel cropping) ---
-        kylim_range = parse_limits(
+        kylim_range = _parse_reciprocal_crop_limits(
             kylim,
             Ky,
-            allow_float=True,
             name="kylim",
-            unit_mode=reciprocal_mode,
+            mode=reciprocal_mode,
             conv_factor=reciprocal_factor,
-            axis='reciprocal_y',
+            axis=0,
         )
-        kxlim_range = parse_limits(
+        kxlim_range = _parse_reciprocal_crop_limits(
             kxlim,
             Kx,
-            allow_float=True,
             name="kxlim",
-            unit_mode=reciprocal_mode,
+            mode=reciprocal_mode,
             conv_factor=reciprocal_factor,
-            axis='reciprocal_x',
+            axis=1,
         )
     
         # Integer boundaries for actual array slicing (pad around subpixel ROI)
@@ -9105,32 +6823,14 @@ class HyperData:
                 f"y in [{y0}, {y1}), x in [{x0}, {x1}), shape ({Ky}, {Kx})"
             )
     
-        # Determine whether subpixel cropping is needed (any float in k-limits)
-        def is_int_like(v):
-            return isinstance(v, (Integral, np.integer))
-    
-        subpixel = not (
-            is_int_like(kylim_range[0])
-            and is_int_like(kylim_range[1])
-            and is_int_like(kxlim_range[0])
-            and is_int_like(kxlim_range[1])
+        subpixel = not all(
+            float(value).is_integer() for value in kylim_range + kxlim_range
         )
     
         # Natural reciprocal-space shape from the slice
         natural_kshape = (y1 - y0, x1 - x0)
     
-        # Normalize kshape (if provided)
-        if kshape is not None:
-            if len(kshape) != 2:
-                raise ValueError("kshape must be a tuple (A, B)")
-            kshape = (int(kshape[0]), int(kshape[1]))
-            if kshape[0] <= 0 or kshape[1] <= 0:
-                raise ValueError("kshape must contain positive integers")
-        else:
-            # If user provided k-limits or we are doing subpixel cropping,
-            # default kshape to the natural cropped size
-            if kylim is not None or kxlim is not None or subpixel:
-                kshape = natural_kshape
+        kshape = _reciprocal_crop_shape(kylim_range, kxlim_range, kshape)
     
         if kshape is not None and kshape[0] != kshape[1]:
             print(f"Warning: Non-square diffraction pattern shape {kshape}. Proceeding anyway.")
@@ -9140,36 +6840,11 @@ class HyperData:
         x0r, x1r = xlim_range
         subarray = self.array[y0r:y1r, x0r:x1r]
     
-        # --- Crop reciprocal region ---
-        cropped = subarray[:, :, y0:y1, x0:x1]
-    
-        # --- k-space resize (subpixel or enforced kshape) ---
-        needs_k_resize = subpixel or (kshape is not None and kshape != natural_kshape)
-    
-        if needs_k_resize:
-            # If kshape is None here, fall back to natural_kshape
-            if kshape is None:
-                kshape = natural_kshape
-
-            resize_dtype = np.result_type(subarray.dtype, np.float32)
-            new_data = np.empty(
-                (subarray.shape[0], subarray.shape[1], kshape[0], kshape[1]),
-                dtype=resize_dtype,
-            )
-    
-            for i in range(subarray.shape[0]):
-                for j in range(subarray.shape[1]):
-                    dp = cropped[i, j]
-                    new_data[i, j] = transform.resize(
-                        dp.astype(resize_dtype, copy=False),
-                        kshape,
-                        order=1,          # bilinear
-                        mode="reflect",
-                        anti_aliasing=True,
-                        preserve_range=True,
-                    )
-    
-            cropped = new_data
+        # The shared sampler uses actual fractional bounds, never a resized slice.
+        needs_k_resize = subpixel or kshape != natural_kshape
+        cropped = _resample_reciprocal_crop(
+            subarray, kylim_range, kxlim_range, kshape,
+        )
     
         # --- Real-space resize (rshape) ---
         if rshape is not None:
@@ -9215,62 +6890,12 @@ class HyperData:
                     )
                     cropped = resized.reshape(Ny_out, Nx_out, Ky_c, Kx_c)
 
-        new_real_conv = self.real_conv_factor
-        new_reciprocal_conv = self.reciprocal_conv_factor
-        real_step = _real_spacing_pair(self.real_conv_factor)
-        new_real_origin = (
-            self.real_origin[0] + y0r * real_step[0],
-            self.real_origin[1] + x0r * real_step[1],
+        geometry = _transform_geometry(
+            self._coordinate_metadata(), self.shape, cropped.shape, 'crop',
+            real_bounds=(ylim_range, xlim_range),
+            reciprocal_bounds=(kylim_range, kxlim_range),
         )
-
-        if kshape is not None and self.reciprocal_conv_factor is not None:
-            y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
-            x_scale = (kxlim_range[1] - kxlim_range[0]) / kshape[1]
-            if np.isclose(y_scale, x_scale):
-                new_reciprocal_conv = self.reciprocal_conv_factor * x_scale
-            else:
-                print("Warning: anisotropic reciprocal-space resizing cleared the stored reciprocal-space calibration.")
-                new_reciprocal_conv = None
-
-        if rshape is not None and self.real_conv_factor is not None:
-            y_scale = (ylim_range[1] - ylim_range[0]) / rshape[0]
-            x_scale = (xlim_range[1] - xlim_range[0]) / rshape[1]
-            new_real_conv = _scaled_real_spacing(
-                self.real_conv_factor, (y_scale, x_scale),
-            )
-            new_real_origin = (
-                new_real_origin[0] + 0.5 * (y_scale - 1) * real_step[0],
-                new_real_origin[1] + 0.5 * (x_scale - 1) * real_step[1],
-            )
-
-        new_real_units = self.real_units if new_real_conv is not None else None
-        new_reciprocal_units = (
-            self.reciprocal_units if new_reciprocal_conv is not None else None
-        )
-
-        k_geometry_changed = (
-            (y0, y1, x0, x1) != (0, Ky, 0, Kx) or needs_k_resize
-        )
-        beam_metadata = self.center_beam_metadata
-        if k_geometry_changed:
-            beam_metadata = None if subpixel or self.polar_metadata is not None else (
-                _resampled_center_beam_metadata(
-                    self.center_beam_metadata, (Ky, Kx), cropped.shape[-2:],
-                    crop_origin=(y0, x0), crop_shape=natural_kshape,
-                    units=new_reciprocal_units,
-                    conv_factor=new_reciprocal_conv,
-                )
-            )
-
-        return self._spawn(
-            cropped,
-            real_units=new_real_units,
-            real_conv_factor=new_real_conv,
-            real_origin=new_real_origin,
-            reciprocal_units=new_reciprocal_units,
-            reciprocal_conv_factor=new_reciprocal_conv,
-            center_beam_metadata=beam_metadata,
-        )
+        return self._spawn(cropped, **geometry)
 
     # Private method: helper function for the 'alignment' method
     def _quickCOM(self, r_mask=5, center=None):
@@ -9329,14 +6954,19 @@ class HyperData:
         Parameters
         ----------
         r : int, optional
-            Inner radius of the annular mask. Defaults to one fifth of the diffraction pattern's horizontal dimension if not specified.
+            Inner radius of the annular mask in pixels. Defaults to one fifth
+            of the smaller diffraction dimension.
         R : int, optional
-            Outer radius of the annular mask. Defaults to two fifths of the diffraction pattern's horizontal dimension if not specified.
+            Outer radius in pixels. Defaults to two fifths of the smaller
+            diffraction dimension. Limits must satisfy ``0 <= r < R``.
         interp_method : str, optional
             Interpolation method to use during affine transformations. Can be 'linear' or 'cubic'.
         show_ellipse : bool, optional
             Plots the mean diffraction pattern in the dataset with an overlaid ring of inner radius r and outer radius R. If return_fix 
             is False, it plots the ring in the non-corrected pattern. Otherwise, it plots it in the corrected pattern.
+        return_fix : bool, optional
+            If False, fit/optionally display the original annulus and return
+            an independent unchanged copy without applying the warp.
         
         Returns
         -------
@@ -9346,42 +6976,66 @@ class HyperData:
         Notes
         -----
         This method must be applied after applying the 'alignment' method for better accuracy.
+        The stored direct-beam center is used when available; otherwise the
+        subpixel detector midpoint is used. Interpolation uses floating point
+        to retain fractional counts. Real-space calibration, origin and
+        acquisition records are preserved. An anisotropic correction clears
+        scalar reciprocal calibration, circular-beam metadata and R/Q
+        calibration, which no longer describe the warped detector. Identity
+        corrections retain them. Both 3D stacks and 4D scans are supported.
         """
         
-        A, B, C, D = self.shape
-        
-        if not r:
-            r = C//5 
-        if not R:
-            R = 2*C//5
-        
-        mean_pattern = self.get_dp('mean').array
-        params = self._extract_ellipse(mean_pattern, C//2, D//2, r, R)
-        corrected_data = np.empty_like(self.array)
+        if self.ndim not in (3, 4) or self.is_polar or self.is_cepstral:
+            raise ValueError('Elliptical correction requires Cartesian 3D/4D diffraction data.')
+        if interp_method not in ('linear', 'cubic'):
+            raise ValueError("interp_method must be 'linear' or 'cubic'.")
+        C, D = self.pattern_shape
+        r = min(C, D) / 5 if r is None else float(r)
+        R = 2 * min(C, D) / 5 if R is None else float(R)
+        if not np.all(np.isfinite((r, R))) or not 0 <= r < R:
+            raise ValueError('Annular limits must satisfy finite 0 <= r < R.')
+        mean_dp = self.get_dp('mean')
+        mean_pattern = mean_dp.array
+        center, _ = _rq_center(mean_dp.shape, mean_dp.center_beam_metadata, mean_dp.conv_factor)
+        params = self._extract_ellipse(mean_pattern, *center, r, R)
+        output_dtype = np.result_type(self.dtype, np.float32)
         
         Ang, a, b = params 
-        print("Ellptical statistics before correction:")
+        print("Elliptical statistics before correction:")
         print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px \n")
         
         if show_ellipse:
-            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
+            self._plot_with_ring(np.log(np.maximum(mean_pattern, 1)), r, R, center=center, **kwargs)
+
+        if not return_fix:
+            return self.copy()
+
+        corrected_data = np.empty(self.shape, dtype=output_dtype)
         
         # Perform Correction
-        for i in tqdm(range(A), desc="Fixing elliptical distortions"):
-            for j in range(B):
-                corrected_data[i, j] = self._apply_affine_transformation(self.array[i, j], *params, interp_method)
-        
-        corrected_data = HyperData(corrected_data)
+        for index in tqdm(np.ndindex(self.scan_shape), total=prod(self.scan_shape), desc="Fixing elliptical distortions"):
+            corrected_data[index] = self._apply_affine_transformation(
+                self.array[index], *params, interp_method, center=center,
+            )
+
+        identity = np.isclose(a, b, rtol=0, atol=1e-12)
+        corrected_data = self._spawn(
+            corrected_data,
+            reciprocal_units=self.reciprocal_units if identity else None,
+            reciprocal_conv_factor=self.reciprocal_conv_factor if identity else None,
+            center_beam_metadata=self.center_beam_metadata if identity else None,
+            rq_calibration=self.rq_calibration if identity else None,
+        )
         
         mean_pattern = corrected_data.get_dp('mean').array
-        params = corrected_data._extract_ellipse(mean_pattern, C//2, D//2, r, R)
+        params = corrected_data._extract_ellipse(mean_pattern, *center, r, R)
         
         Ang, a, b = params 
-        print("Ellptical statistics after correction:")
+        print("Elliptical statistics after correction:")
         print(f"Ellipse rotation = {np.degrees(Ang)} degrees \nMajor axis 'a' = {a} px \nMinor axis 'b' = {b} px \n")
         
         if show_ellipse:
-            self._plot_with_ring(np.log(mean_pattern), r, R, **kwargs)
+            self._plot_with_ring(np.log(np.maximum(mean_pattern, 1)), r, R, center=center, **kwargs)
         
         return corrected_data
 
@@ -9411,24 +7065,46 @@ class HyperData:
         tuple
             A tuple of fitted ellipse parameters (A, a, b), where A is the rotation angle,
             a is the length of the major axis, and b is the length of the minor axis.
+
+        Raises
+        ------
+        ValueError
+            If the annulus contains no finite positive intensity.
+        RuntimeError
+            If the bounded ellipse optimization does not converge.
         """
         y, x = np.indices(image.shape)  # Get array indices for the entire image
         mask = ((x - cx)**2 + (y - cy)**2 >= r**2) & ((x - cx)**2 + (y - cy)**2 <= R**2)
         x_vals, y_vals = x[mask], y[mask]  # Get the coordinates within the mask
-        intensities = image[mask]  # Get the intensities at these coordinates
+        intensities = np.maximum(np.asarray(image, dtype=np.float64)[mask], 0)
+        if intensities.size == 0 or not np.all(np.isfinite(intensities)) or intensities.max() <= 0:
+            raise ValueError('Ellipse fitting requires finite positive intensity in the annulus.')
+        weights = (intensities / intensities.max()) ** 4
 
         def ellipse_cost(params):
             A, a, b = params
-            cost = intensities**4 * (((x_vals - cx) * np.cos(A) + (y_vals - cy) * np.sin(A))**2 / a**2 +
+            cost = weights * (((x_vals - cx) * np.cos(A) + (y_vals - cy) * np.sin(A))**2 / a**2 +
                                   ((y_vals - cy) * np.cos(A) - (x_vals - cx) * np.sin(A))**2 / b**2 - 1)**2
             return np.sum(cost)
 
-        initial_guess = [0, (R-r)/2 + 1, (R-r)/2 - 1]  # Initial guess for A, a, b
-        result = minimize(ellipse_cost, initial_guess, method='L-BFGS-B')
+        # A circular initial guess has zero angular gradient, even for an
+        # ellipse at 45 degrees. Weighted moments give a nondegenerate seed.
+        offsets = np.column_stack((x_vals - cx, y_vals - cy))
+        moment = (offsets.T * weights) @ offsets / weights.sum()
+        eigenvalues, eigenvectors = np.linalg.eigh(moment)
+        major_direction = eigenvectors[:, -1]
+        axes = np.clip(np.sqrt(np.maximum(2 * eigenvalues[::-1], 0)), (R + r) / 20, 2 * R)
+        initial_guess = [np.arctan2(major_direction[1], major_direction[0]), *axes]
+        result = minimize(
+            ellipse_cost, initial_guess, method='L-BFGS-B',
+            bounds=((None, None), (1e-6, 2 * R), (1e-6, 2 * R)),
+        )
+        if not result.success or not np.all(np.isfinite(result.x)):
+            raise RuntimeError(f'Ellipse fitting failed: {result.message}')
         return result.x
 
 
-    def _apply_affine_transformation(self, image, A, a, b, interp_method):
+    def _apply_affine_transformation(self, image, A, a, b, interp_method, center=None):
         """
         Apply an affine transformation to make the fitted ellipse a circle.
 
@@ -9450,12 +7126,16 @@ class HyperData:
         """
         # NumPy shape is (rows, cols); OpenCV points/sizes use (x, y)/(width, height).
         rows, cols = image.shape
+        if interp_method not in ('linear', 'cubic') or not np.all(np.isfinite((A, a, b))) or min(a, b) <= 0:
+            raise ValueError('Affine correction requires positive finite axes and linear/cubic interpolation.')
+        cy, cx = ((rows - 1) / 2, (cols - 1) / 2) if center is None else center
+        image = image.astype(np.result_type(image.dtype, np.float32), copy=False)
         
         # Points in the original image
         p1 = np.float32([
-            [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
-            [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
-            [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
+            [a * np.cos(A) + cx, a * np.sin(A) + cy],
+            [-a * np.cos(A) + cx, -a * np.sin(A) + cy],
+            [b * np.sin(A) + cx, -b * np.cos(A) + cy]
         ])
         
         # Depending on whether a or b is larger, set the corresponding points in the corrected image
@@ -9463,15 +7143,15 @@ class HyperData:
         # transformed diffraction pattern.
         if a < b:
             p2 = np.float32([
-                [b * np.cos(A) + cols//2, b * np.sin(A) + rows//2],
-                [-b * np.cos(A) + cols//2, -b * np.sin(A) + rows//2],
-                [b * np.sin(A) + cols//2, -b * np.cos(A) + rows//2]
+                [b * np.cos(A) + cx, b * np.sin(A) + cy],
+                [-b * np.cos(A) + cx, -b * np.sin(A) + cy],
+                [b * np.sin(A) + cx, -b * np.cos(A) + cy]
             ])
         else:
             p2 = np.float32([
-                [a * np.cos(A) + cols//2, a * np.sin(A) + rows//2],
-                [-a * np.cos(A) + cols//2, -a * np.sin(A) + rows//2],
-                [a * np.sin(A) + cols//2, -a * np.cos(A) + rows//2]
+                [a * np.cos(A) + cx, a * np.sin(A) + cy],
+                [-a * np.cos(A) + cx, -a * np.sin(A) + cy],
+                [a * np.sin(A) + cx, -a * np.cos(A) + cy]
             ])
             
         M = cv2.getAffineTransform(p1, p2)
@@ -9485,7 +7165,7 @@ class HyperData:
         return transformed_image
     
     
-    def _plot_with_ring(self, data, inner_radius, outer_radius, **kwargs):
+    def _plot_with_ring(self, data, inner_radius, outer_radius, center=None, **kwargs):
         """
         Plots a 2D array with an overlaid red ring directly on the same figure.
         
@@ -9503,7 +7183,7 @@ class HyperData:
         
         # Generate a grid of points
         y, x = np.indices(data.shape)
-        center_x, center_y = np.array(data.shape) // 2
+        center_y, center_x = tuple((size - 1) / 2 for size in data.shape) if center is None else center
         
         # Calculate the radius for each point in the grid
         radius = np.sqrt((x - center_x)**2 + (y - center_y)**2)
@@ -9566,19 +7246,57 @@ class HyperData:
     
         return mean_com, std_dev_com
     
-    #TODO: Is there a faster way to get this?
-    def get_ewpc(self):
+    def get_ewpc(self, a_min=1):
+        """Return the magnitude of the FFT of log-intensity (EWPC).
+
+        Parameters
+        ----------
+        a_min : positive float, optional
+            Floor applied before taking the logarithm; defaults to 1 as in
+            the original method. The source array is not modified.
+
+        Returns
+        -------
+        HyperData
+            Same scan geometry, with ``is_cepstral=True`` and pattern axes
+            ``(cy, cx)`` in Fourier-conjugate pixel indices. The FFT zero is
+            recorded in ``cepstral_metadata`` and used by ``get_dp().show()``.
+            Detector units, direct-beam metadata and R/Q calibration are
+            cleared: they do not describe cepstral coordinates. No physical
+            length calibration is inferred, especially for rectangular grids
+            or angle-calibrated detectors. Identity survives copy/save/load.
+
+        Raises
+        ------
+        ValueError
+            For polar/already-cepstral input, invalid flooring, or nonfinite,
+            empty or non-real intensity data. Convert polar data to Cartesian
+            first; an FFT over radius and angle is not Cartesian EWPC.
         """
-        Transform dataset to Exit Wave Power Cepstrum (EWPC)
-        """
-    
-        return self._spawn(np.abs(fftshift(
-                                       fft2(
-                                            np.log(self.clip().array),
-                                            axes=(-2, -1)
-                                            ),
-                                       axes=(-2, -1)
-                                      )), center_beam_metadata=None)
+        if self.is_polar or self.is_cepstral:
+            raise ValueError('EWPC requires Cartesian diffraction data, not polar or cepstral data.')
+        if (
+            isinstance(a_min, (bool, np.bool_)) or not np.isscalar(a_min)
+            or not isinstance(a_min, (int, float, np.integer, np.floating))
+            or not np.isfinite(a_min) or a_min <= 0
+        ):
+            raise ValueError('a_min must be positive and finite for the EWPC logarithm.')
+        array, _ = self._normalization_input('global', 'get_ewpc')
+        cepstrum = np.abs(fftshift(fft2(np.log(np.maximum(array, a_min)), axes=(-2, -1)), axes=(-2, -1)))
+        return self._spawn(
+            cepstrum, reciprocal_units=None, reciprocal_conv_factor=None,
+            polar_metadata=None, center_beam_metadata=None, rq_calibration=None,
+            cepstral_metadata={
+                'transform': 'ewpc',
+                'axis_order': ('cy', 'cx'),
+                'shape': self.pattern_shape,
+                'center_px': tuple(size // 2 for size in self.pattern_shape),
+                'axis_units': 'pixels',
+                'source_reciprocal_units': self.reciprocal_units,
+                'source_reciprocal_conv_factor': self.reciprocal_conv_factor,
+                'log_floor': float(a_min),
+            },
+        )
     
     
     def get_stdDev(self, domain='reciprocal'):
@@ -9683,7 +7401,7 @@ class HyperData:
         elif isinstance(grid_shape, np.ndarray):
             grid_shape = grid_shape.tolist()
 
-        grid_shape = self._normalize_resize_shape(
+        grid_shape = _normalize_resize_shape(
             grid_shape, 2, 'grid_shape'
         )
         ny, nx = grid_shape
@@ -9881,438 +7599,132 @@ class HyperData:
         return fig, ax
 
     def get_dp(self, y=None, x=None, mask=None, operation=None,
-               selection_units='pixels', **flat_kwargs):
-        """
-        Obtain a diffraction pattern from a 3D/4D dataset, either at a
-        specific point, averaged over a specified region, or via a special operation.
-    
+               selection_units='pixels', *, working_memory_mb=None):
+        """Select a diffraction pattern or reduce a 3D stack/4D scan.
+
         Parameters
         ----------
-        y : int, float, tuple, list, ndarray, or None
-            If tuple (ymin, ymax), averages over rows [ymin:ymax];
-            if scalar, selects a single row; if None, ignored.
-        x : int, float, tuple, list, ndarray, or None
-            If tuple (xmin, xmax), averages over cols [xmin:xmax];
-            if scalar, selects a single column; if None, ignored.
-        mask : ndarray[bool] | None
-            Shape (A, B). If provided and operation in
-            {'mean','median','max','min','std'}, returns aggregation over all
-            True pixels. If operation == 'random', picks a random True pixel
-            and returns its DP.
-        operation : {'mean','median','max','min','std','random','flat_mean'} | None
-            Operation to apply. Defaults to 'mean' if None. The reduction
-            operations aggregate over the selected real-space region (or the
-            full scan when no region is given). ``random`` selects one pattern;
-            ``flat_mean`` uses radial masking and a flat-field threshold.
+        y, x : number, length-2 range, or None, optional
+            Scan selections for 4D data. Ranges are half-open; omitted axes
+            select the complete axis. Two scalar indices return one pattern
+            directly. For a 3D stack, pass its integer index as y or x.
+            ``get_dp('mean')`` is shorthand for ``operation='mean'``.
+        mask : array-like of bool, optional
+            Boolean scan mask of shape ``(Ry, Rx)`` for 4D data. Selects the
+            patterns included in the reduction; takes precedence over y/x.
+            Empty selections and non-Boolean masks are rejected.
+        operation : {'mean', 'std', 'min', 'max', 'median', 'random'}, optional
+            Defaults to mean. Mean/std/min/max process bounded scan blocks.
+            Std is the population standard deviation (ddof=0). Median remains
+            exact but may copy the full selected stack; it is not memory-bounded.
+            Random selects one pattern within the selection.
         selection_units : {'pixels', 'calibrated', 'auto'}, optional
-            Unit system used to interpret ``y`` and ``x`` for 4D data.
-            Defaults to ``'pixels'`` so scalar calls such as ``get_dp(i, j)``
-            always select scan indices, even when real-space calibration is
-            stored. Use ``'calibrated'`` to select using real-space units.
-    
+            Units for y/x on a 4D scan. Defaults to pixels even when calibration
+            exists, so ``get_dp(i, j)`` continues to select scan indices.
+        working_memory_mb : positive float or None, keyword-only, optional
+            Temporary-array budget in MiB (1024**2 bytes) for mean/std/min/max;
+            None uses 256 MiB automatically. Accounts conservatively for block
+            reads, masked copies, dtype conversion and reduction buffers. The
+            resident source, input mask, Python/NumPy overhead and file caches
+            are not included: this is not a total-process RAM limit. A budget
+            too small for one pattern and its buffers raises a clear error.
+            Explicit budgets are unsupported for median/random. Single-pattern
+            index selections avoid aggregation and do not allocate these buffers.
+
         Returns
         -------
-        ReciprocalSpace or ndarray
+        ReciprocalSpace
+            Pattern with preserved detector units, direct-beam information and
+            polar/cepstral geometry. No source values or metadata are modified.
+
+        Notes
+        -----
+        Mean and variance accumulate using at least float64 precision, while
+        floating input retains its output dtype. Integer means/stds return
+        float64 and min/max retain the input dtype. NaN/Inf propagation follows
+        NumPy, not nan-aware filtering. Block summation can differ in the final
+        floating-point digits from one whole-array reduction.
+
+        Raises
+        ------
+        TypeError
+            For unexpected keywords or a non-Boolean mask. The scan-mask
+            argument is ``mask``, not ``real_mask``.
+        ValueError
+            For invalid operations, selections or working-memory budgets.
+
+        Examples
+        --------
+        >>> mean_dp = data.get_dp(mask=cluster_mask, working_memory_mb=64)
+        >>> std_dp = data.get_dp(operation='std', working_memory_mb=64)
         """
-    
-        operations = {
-            'mean':   np.mean,
-            'median': np.median,
-            'max':    np.max,
-            'min':    np.min,
-            'std':    np.std,
-            'random': 'random',
-            'flat_mean': None,
-        }
-
-        if (
-            isinstance(y, str)
-            and x is None
-            and operation is None
-            and y in operations
-        ):
-            operation = y
-            y = None
-    
-        # Default operation is mean
-        if operation is None:
-            operation = 'mean'
-    
-        if operation not in operations:
-            valid_ops = ', '.join(f"'{op}'" for op in operations.keys())
-            raise ValueError(f"'operation' must be one of: {valid_ops}.")
-
-        selection_mode = _normalize_unit_mode(
-            selection_units,
-            label='selection_units',
+        result = _get_dp_array(
+            self.array, y, x, mask, operation, selection_units=selection_units,
+            real_units=self.real_units, real_conv_factor=self.real_conv_factor,
+            real_origin=self.real_origin, working_memory_mb=working_memory_mb,
         )
-        selection_factor = None
-        if self.ndim == 4:
-            _, selection_factor, selection_mode = self._resolve_real_selection_units(
-                selection_units
-            )
-        elif selection_mode == 'calibrated':
-            raise ValueError(
-                "selection_units='calibrated' is only supported for 4D data, "
-                "where y and x are real-space scan coordinates."
-            )
-    
-        # Selecting a random diffraction pattern
-        if operation == 'random':
-            rng = np.random
-            if self.ndim not in (3, 4):
-                raise ValueError("Random selection supported only for 3D or 4D arrays.")
-    
-            # (2) mask constraint
-            if mask is not None:
-                if self.ndim != 4:
-                    raise ValueError("mask requires a 4D dataset (A,B,C,D).")
-                if mask.shape != (self.shape[0], self.shape[1]):
-                    raise ValueError(f"'mask' must be shape {(self.shape[0], self.shape[1])}.")
-                ys, xs = np.where(mask)
-                if ys.size == 0:
-                    raise ValueError("mask has no True pixels.")
-                idx = rng.randint(0, ys.size)
-                y_pos, x_pos = int(ys[idx]), int(xs[idx])
-                print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) using mask...\n")
-                return self._spawn_reciprocal(self.array[y_pos, x_pos])
-    
-            # Region via y/x. Units are resolved before random sampling.
-            if self.ndim == 4 and (y is not None or x is not None):
-                A, B = self.shape[0], self.shape[1]
-                y0, y1, _ = _parse_real_selection(
-                    y,
-                    A,
-                    'y',
-                    selection_mode,
-                    _real_spacing_pair(selection_factor)[0],
-                    self.real_origin[0],
-                )
-                x0, x1, _ = _parse_real_selection(
-                    x,
-                    B,
-                    'x',
-                    selection_mode,
-                    _real_spacing_pair(selection_factor)[1],
-                    self.real_origin[1],
-                )
-                y_pos = rng.randint(y0, y1)
-                x_pos = rng.randint(x0, x1)
-                print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos}) within specified region...\n")
-                return self._spawn_reciprocal(self.array[y_pos, x_pos])
-    
-            # Global random selection
-            if self.ndim == 4:
-                y_pos = int(self.shape[0] * rng.random())
-                x_pos = int(self.shape[1] * rng.random())
-                print(f"Acquired diffraction pattern at position ({y_pos}, {x_pos})...\n")
-                return self._spawn_reciprocal(self.array[y_pos, x_pos])
-            else:  # self.ndim == 3
-                idx = int(self.shape[0] * rng.random())
-                print(f"Acquired diffraction pattern of index {idx}...\n")
-                return self._spawn_reciprocal(self.array[idx])
-    
-        # Automatically finding the mean of non-tilt regions
-        #TODO: verify generalizability
-        if operation == 'flat_mean':
-            r = (self.shape[-2] + self.shape[-1]) / 4
-            r_min = 0.6 * r
-            r_max = 0.8 * r
-            reduced_data = self.apply_mask(r_min, r_max,)
-            mean, flat_mask = mask_and_average(
-                reduced_data.array,
-                return_mask=True,
-                function='sum_2d',
-                threshold='upper',
-                **flat_kwargs
-            )
-            result = np.mean(self.apply_mask(mask=flat_mask, domain='real',).array, axis=0)
-            return self._spawn_reciprocal(result)
-    
-        # From here on: mean/median/max/min
-        agg_func = operations[operation]
-    
-        # Operating on a provided real-space mask
-        if mask is not None:
-            if self.ndim != 4:
-                raise ValueError("mask requires a 4D dataset (A,B,C,D).")
-            if mask.shape != (self.shape[0], self.shape[1]):
-                raise ValueError(f"'mask' must be shape {(self.shape[0], self.shape[1])}.")
-            sub = self.array[mask]   # shape (N, C, D)
-            result = agg_func(sub, axis=0)
-            return self._spawn_reciprocal(result)
-    
-        # Operating based on the (y, x) inputs
-        if y is not None or x is not None:
-            if self.ndim == 4:
-                A, B = self.shape[0], self.shape[1]
-                y0, y1, y_kind = _parse_real_selection(
-                    y,
-                    A,
-                    'y',
-                    selection_mode,
-                    _real_spacing_pair(selection_factor)[0],
-                    self.real_origin[0],
-                )
-                x0, x1, x_kind = _parse_real_selection(
-                    x,
-                    B,
-                    'x',
-                    selection_mode,
-                    _real_spacing_pair(selection_factor)[1],
-                    self.real_origin[1],
-                )
-
-                if y_kind == 'index' and x_kind == 'index':
-                    return self._spawn_reciprocal(self.array[y0, x0])
-
-                sub = self.array[y0:y1, x0:x1, :, :]
-                result = agg_func(sub, axis=(0, 1))
-                return self._spawn_reciprocal(result)
-    
-            elif self.ndim == 3:
-                # For 3D: only support picking by index, as before
-                if isinstance(y, (Integral, np.integer)) and x is None:
-                    return self._spawn_reciprocal(self.array[int(y), :, :])
-                if y is None and isinstance(x, (Integral, np.integer)):
-                    return self._spawn_reciprocal(self.array[int(x), :, :])
-                raise ValueError("Region-based (tuple) selection currently only supported for 4D arrays.")
-    
-        # Global Operation
-        # If no y/x or masks are given, apply global aggregation over (A,B)
-        if self.ndim == 4:
-            result = agg_func(self.array, axis=(0, 1))
-            return self._spawn_reciprocal(result)
-        elif self.ndim == 3:
-            result = agg_func(self.array, axis=0)
-            return self._spawn_reciprocal(result)
-    
-        raise ValueError("No parameters specified.")
+        return self._spawn_reciprocal(result)
 
 
-    @staticmethod
-    def _normalize_resize_shape(shape, expected_ndim, label):
-        """Normalize a requested resize shape to a tuple of positive integers."""
-        if expected_ndim == 1 and isinstance(shape, (Integral, np.integer)):
-            shape = (int(shape),)
-        elif isinstance(shape, (tuple, list)):
-            if not all(isinstance(v, (Integral, np.integer)) for v in shape):
-                raise ValueError(f"{label} must contain integers.")
-            shape = tuple(int(v) for v in shape)
-        else:
-            raise ValueError(f"{label} must be an integer or tuple of integers.")
-
-        if len(shape) != expected_ndim:
-            raise ValueError(f"{label} must have {expected_ndim} dimension(s).")
-        if any(v <= 0 for v in shape):
-            raise ValueError(f"{label} must contain positive integers.")
-        return shape
-
-    @staticmethod
-    def _resize_axis_area(array, new_size, axis):
-        """
-        Resize one axis by area-weighted averaging.
-
-        Exact integer factors reduce to standard block averaging. Non-integer
-        factors use fractional overlap weights so each output bin integrates the
-        corresponding input interval.
-        """
-        old_size = array.shape[axis]
-        if new_size > old_size:
-            raise ValueError("resize currently supports downsampling only.")
-
-        out_dtype = np.result_type(array.dtype, np.float64)
-        if new_size == old_size:
-            return array.astype(out_dtype, copy=True)
-
-        moved = np.moveaxis(array, axis, 0).astype(out_dtype, copy=False)
-        resized = np.zeros((new_size,) + moved.shape[1:], dtype=out_dtype)
-        scale = old_size / new_size
-
-        for out_idx in range(new_size):
-            start = out_idx * scale
-            stop = (out_idx + 1) * scale
-            first = max(0, int(np.floor(start)))
-            last = min(old_size, int(np.ceil(stop)))
-
-            for in_idx in range(first, last):
-                overlap = min(stop, in_idx + 1) - max(start, in_idx)
-                if overlap > 0:
-                    resized[out_idx] += moved[in_idx] * overlap
-
-            resized[out_idx] /= scale
-
-        return np.moveaxis(resized, 0, axis)
-
-    @classmethod
-    def _resize_area(cls, array, output_shape, axes):
-        """Apply area-weighted resizing over one or more axes."""
-        resized = array
-        for axis, new_size in zip(axes, output_shape):
-            resized = cls._resize_axis_area(resized, new_size, axis)
-        return resized
-
-    @staticmethod
-    def _resize_interpolation(array, output_shape, axes, method='linear'):
-        """Resize selected axes with interpolation, supporting up/downsampling."""
-        target_shape = list(array.shape)
-        for axis, new_size in zip(axes, output_shape):
-            target_shape[axis] = int(new_size)
-
-        order = 0 if method == 'nearest' else 1
-        downsampling = any(new < old for new, old in zip(output_shape, [array.shape[a] for a in axes]))
-        resized = transform.resize(
-            array,
-            tuple(target_shape),
-            order=order,
-            mode='reflect',
-            anti_aliasing=(order > 0 and downsampling),
-            preserve_range=True,
-        )
-        if order == 0:
-            return resized.astype(array.dtype, copy=False)
-        return resized
-
-    @staticmethod
-    def _resized_calibration(units, conv_factor, scale_factors, label):
-        """
-        Update units-per-pixel calibration after resizing.
-
-        Real-space spacing may be anisotropic. Reciprocal-space calibration is
-        still scalar and is cleared if the resize makes its pixels anisotropic.
-        """
-        if conv_factor is None:
-            return units, conv_factor
-
-        scale_factors = tuple(float(v) for v in scale_factors)
-        if label == 'real' and len(scale_factors) == 2:
-            return units, _scaled_real_spacing(conv_factor, scale_factors)
-        if label == 'real' and len(scale_factors) == 1:
-            return units, _scaled_real_spacing(
-                conv_factor, (scale_factors[0], scale_factors[0]),
-            )
-        if len(scale_factors) == 1 or np.allclose(scale_factors, scale_factors[0]):
-            return units, conv_factor * scale_factors[0]
-
-        print(
-            f"Warning: anisotropic {label}-space resizing cleared the stored "
-            f"{label}-space calibration."
-        )
-        return None, None
-
-    def resize(self, shape, domain, method='area'):
-        """
-        Resize real- or reciprocal-space dimensions.
+    def resize(self, shape, domain, method='area', *, working_memory_mb=None):
+        """Resize selected axes using memory-budgeted output tiles.
 
         Parameters
         ----------
-        shape : int or tuple
-            Requested output shape for the selected domain. For 4D data,
-            ``domain='real'`` expects ``(Ny, Nx)`` and ``domain='reciprocal'``
-            expects ``(Ky, Kx)``. For 3D stacks, ``domain='real'`` expects the
-            number of diffraction patterns and ``domain='reciprocal'`` expects
-            ``(Ky, Kx)``.
+        shape : int or sequence of int
+            Desired domain shape. A 4D scan uses a (y, x) pair in either
+            domain; a 3D stack uses an integer for real-space stack length.
         domain : {'real', 'reciprocal'}
-            Which axes to resize.
+            Axes to resize, without mixing the other domain.
         method : {'area', 'linear', 'nearest'}, optional
-            ``'area'`` performs weighted area averaging and supports
-            downsampling only. ``'linear'`` and ``'nearest'`` use interpolation
-            and support both downsampling and upsampling.
+            Area-weighted averaging supports downsampling. Linear and nearest
+            also support upsampling. Fractional bins and interpolation halos
+            are defined globally, not separately inside each tile.
+        working_memory_mb : float or None, optional
+            Temporary-buffer budget in MiB; None selects 256 MiB. Includes
+            source reads, conversion, interpolation/filtering and tile buffers.
+            Resident input and the complete returned output, allocator overhead
+            and file caches are excluded. Too-small budgets raise ValueError.
+            Use resize_hdf5 for outputs too large to keep in RAM.
 
-        Real-space resizing updates each pixel spacing independently and
-        shifts ``real_origin`` to the center of the first output pixel.
+        Returns
+        -------
+        HyperData
+            Independently stored data with updated coordinate metadata.
+
+        Notes
+        -----
+        Floating/complex output retains the source dtype, with at least
+        float64 accumulator precision. Integer/Boolean averaging or linear
+        interpolation produces float64; nearest retains the original dtype.
+        A completely unchanged resize makes one same-dtype independent output,
+        without interpolating or promoting its values.
+
+        Real-space pixel spacing and pixel-center origin are updated. Polar
+        interpolation preserves radial endpoints and full-circle periodicity;
+        area averaging records shifted sample centers. Beam/cepstral geometry
+        is updated, or invalidated when its shape no longer represents it.
+        Resizing changes geometry and does not retain unfolding undo metadata.
         """
-        if domain is None:
-            raise ValueError("domain must be 'real' or 'reciprocal'.")
-        if not isinstance(domain, str):
-            raise ValueError("domain must be 'real' or 'reciprocal'.")
-        if not isinstance(method, str):
-            raise ValueError("method must be a string.")
-
-        domain = domain.lower()
-        method = method.lower()
-        if domain not in ('real', 'reciprocal'):
-            raise ValueError("domain must be 'real' or 'reciprocal'.")
-        if method not in ('area', 'linear', 'nearest'):
-            raise ValueError("method must be 'area', 'linear', or 'nearest'.")
-        if self.ndim not in (3, 4):
-            raise ValueError("resize currently supports 3D or 4D datasets.")
-
-        if self.ndim == 4 and domain == 'real':
-            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
-            current_shape = self.shape[:2]
-            axes = (0, 1)
-        elif self.ndim == 4 and domain == 'reciprocal':
-            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
-            current_shape = self.shape[2:4]
-            axes = (2, 3)
-        elif self.ndim == 3 and domain == 'real':
-            output_shape = self._normalize_resize_shape(shape, 1, 'shape')
-            current_shape = (self.shape[0],)
-            axes = (0,)
-        else:
-            output_shape = self._normalize_resize_shape(shape, 2, 'shape')
-            current_shape = self.shape[1:3]
-            axes = (1, 2)
-
-        if method == 'area' and any(new > old for new, old in zip(output_shape, current_shape)):
-            raise ValueError(
-                "resize with method='area' supports downsampling only: requested "
-                f"{output_shape} from {current_shape}."
-            )
-
-        if method == 'area':
-            resized = self._resize_area(self.array, output_shape, axes)
-        else:
-            resized = self._resize_interpolation(
-                self.array,
-                output_shape,
-                axes,
-                method=method,
-            )
-
-        real_units = self.real_units
-        real_conv = self.real_conv_factor
-        real_origin = self.real_origin
-        reciprocal_units = self.reciprocal_units
-        reciprocal_conv = self.reciprocal_conv_factor
-        scale_factors = tuple(
-            old / new for old, new in zip(current_shape, output_shape)
+        axes, output_shape = _resize_spec(self.shape, shape, domain)
+        method = method.lower() if isinstance(method, str) else method
+        resized = _resize_array(
+            self.array, output_shape, axes, method,
+            working_memory_mb=working_memory_mb,
+            polar_metadata=self.polar_metadata if domain.lower() == 'reciprocal' else None,
         )
-
-        if domain == 'real':
-            real_units, real_conv = self._resized_calibration(
-                real_units, real_conv, scale_factors, 'real'
-            )
-            if self.ndim == 4:
-                old_step = _real_spacing_pair(self.real_conv_factor)
-                real_origin = tuple(
-                    old_origin + 0.5 * (factor - 1) * step
-                    for old_origin, factor, step in zip(
-                        self.real_origin, scale_factors, old_step,
-                    )
-                )
-        else:
-            reciprocal_units, reciprocal_conv = self._resized_calibration(
-                reciprocal_units, reciprocal_conv, scale_factors, 'reciprocal'
-            )
-
-        beam_metadata = self.center_beam_metadata
-        if domain == 'reciprocal' and output_shape != current_shape:
-            beam_metadata = _resampled_center_beam_metadata(
-                self.center_beam_metadata, current_shape, output_shape,
-                units=reciprocal_units, conv_factor=reciprocal_conv,
-            ) if self.polar_metadata is None else None
-
-        return self._spawn(
-            resized,
-            real_units=real_units,
-            real_conv_factor=real_conv,
-            real_origin=real_origin,
-            reciprocal_units=reciprocal_units,
-            reciprocal_conv_factor=reciprocal_conv,
-            center_beam_metadata=beam_metadata,
+        metadata = _transform_geometry(
+            self._coordinate_metadata(), self.shape, output_shape, 'resize', domain=domain.lower(), method=method,
         )
+        return self._spawn(resized, **metadata)
+
+    def _coordinate_metadata(self):
+        """Collect current geometry without copying or describing array values."""
+        return {key: getattr(self, key) for key in (
+            'real_units', 'real_conv_factor', 'real_origin',
+            'reciprocal_units', 'reciprocal_conv_factor',
+            'polar_metadata', 'cepstral_metadata', 'center_beam_metadata',
+        )}
 
     def bin_data(self, domain=None, iterations=1, *, bin_domain=None):
         """
@@ -10377,9 +7789,17 @@ class HyperData:
                       units='auto', mask_cmap='turbo', mask_vmin=None,
                       mask_vmax=None, mask_power=1, mask_log_scale=True,
                       mask_show_kwargs=None, ring_color='green',
-                      ring_alpha=0.3, show=True):
+                      ring_alpha=0.3, show=True, working_memory_mb=None):
         """
         Form a real-space virtual image using a reciprocal-space detector.
+
+        Products and sums are evaluated blockwise in at least float64 precision
+        without allocating a complete weighted tensor. ``working_memory_mb``
+        bounds the numerical workspace (default 256 MiB); it excludes the
+        returned scan image, detector construction, metadata, caches and plots.
+        The source is never mutated, and NaN/Inf propagate as in NumPy sums.
+        A mean detector is computed only for plot_mask or return_detector.
+        Complex amplitudes are rejected; supply real-valued intensities.
 
         The detector type is inferred from exactly one of these specifications:
 
@@ -10477,287 +7897,209 @@ class HyperData:
         ... )
         >>> image = data.virtual_image(mask=detector_weights)
         """
-        if self.ndim != 4:
-            raise ValueError("virtual_image requires a 4D HyperData object.")
-        if mask_show_kwargs is not None and not isinstance(mask_show_kwargs, dict):
-            raise TypeError("mask_show_kwargs must be a dictionary or None.")
-        _normalize_unit_mode(units, label='units')
-        if not np.isfinite(ring_alpha) or not 0 <= ring_alpha <= 1:
-            raise ValueError("ring_alpha must be between 0 and 1.")
-        to_rgba(ring_color)
-
-        has_annulus = annulus is not None
-        has_mask = mask is not None
-        has_disk_input = radius is not None or centers is not None
-
-        if (radius is None) != (centers is None):
-            raise ValueError(
-                "radius and centers must be provided together for circular "
-                "detectors."
-            )
-
-        detector_count = sum((has_annulus, has_mask, has_disk_input))
-        if detector_count != 1:
-            raise ValueError(
-                "Specify exactly one detector: annulus, radius with centers, "
-                "or mask."
-            )
-        if has_disk_input and self.is_polar:
-            raise ValueError(
-                "radius and centers define Cartesian (ky, kx) circles and "
-                "cannot be applied after to_polar(). Use annulus or mask."
-            )
-
-        ky, kx = self.shape[-2:]
-        if has_annulus or has_disk_input:
-            if self.is_polar:
-                _, detector_factor, detector_mode = self._resolve_polar_radius_units(
-                    detector_units
-                )
-            else:
-                _, detector_factor, detector_mode = self._resolve_reciprocal_detector_units(
-                    detector_units
-                )
-        else:
-            _normalize_unit_mode(detector_units, label='detector_units')
-            detector_factor = None
-            detector_mode = 'pixels'
-
-        if has_mask:
-            if theta_range is not None:
-                raise ValueError(
-                    "theta_range is only valid with annulus on polar data."
-                )
-            detector_weights = np.asarray(mask)
-            if detector_weights.shape != (ky, kx):
-                raise ValueError(
-                    "mask must match the reciprocal-space shape "
-                    f"{(ky, kx)}; got {detector_weights.shape}."
-                )
-            if not (
-                np.issubdtype(detector_weights.dtype, np.bool_)
-                or np.issubdtype(detector_weights.dtype, np.number)
-            ):
-                raise TypeError("mask must contain Boolean or numeric values.")
-            if np.issubdtype(detector_weights.dtype, np.complexfloating):
-                raise TypeError("mask weights must be real-valued.")
-            if (
-                np.issubdtype(detector_weights.dtype, np.number)
-                and not np.all(np.isfinite(detector_weights))
-            ):
-                raise ValueError("mask must contain only finite values.")
-            detector_weights = detector_weights.astype(
-                np.result_type(detector_weights.dtype, np.float32),
-                copy=False,
-            )
-
-        elif has_annulus:
-            annulus_values = np.asarray(annulus, dtype=float)
-            if annulus_values.shape != (2,):
-                raise ValueError(
-                    "annulus must contain exactly (inner_radius, outer_radius)."
-                )
-            if not np.all(np.isfinite(annulus_values)):
-                raise ValueError("annulus radii must be finite.")
-            if detector_mode == 'calibrated':
-                annulus_values = self._scale_values_to_pixels(
-                    annulus_values,
-                    detector_factor,
-                )
-            inner_radius, outer_radius = annulus_values
-            if inner_radius < 0 or outer_radius <= inner_radius:
-                raise ValueError(
-                    "annulus must satisfy 0 <= inner_radius < outer_radius."
-                )
-
-            if self.is_polar:
-                metadata = self.polar_metadata or {}
-                radius_min, radius_max = metadata.get(
-                    'radius_range_pixels',
-                    (0.0, float(ky - 1)),
-                )
-                radius_values = np.linspace(radius_min, radius_max, ky)
-                radial_mask = (
-                    (radius_values >= inner_radius)
-                    & (radius_values <= outer_radius)
-                )
-
-                angular_mask = np.ones(kx, dtype=bool)
-                if theta_range is not None:
-                    angle_values = np.asarray(theta_range, dtype=float)
-                    if angle_values.shape != (2,):
-                        raise ValueError(
-                            "theta_range must contain exactly two angles."
-                        )
-                    if not np.all(np.isfinite(angle_values)):
-                        raise ValueError("theta_range angles must be finite.")
-                    theta_min, theta_max = angle_values
-                    theta_start, theta_stop = metadata.get(
-                        'theta_range',
-                        (0.0, 360.0),
-                    )
-                    theta_values = np.linspace(
-                        theta_start,
-                        theta_stop,
-                        kx,
-                        endpoint=False,
-                    )
-                    if theta_min <= theta_max:
-                        angular_mask = (
-                            (theta_values >= theta_min)
-                            & (theta_values <= theta_max)
-                        )
-                    else:
-                        angular_mask = (
-                            (theta_values >= theta_min)
-                            | (theta_values <= theta_max)
-                        )
-
-                detector_weights = (
-                    radial_mask[:, None] & angular_mask[None, :]
-                ).astype(np.float32)
-            else:
-                if theta_range is not None:
-                    raise ValueError(
-                        "theta_range is only valid for polar data."
-                    )
-                detector_weights = make_mask(
-                    ((ky - 1) / 2, (kx - 1) / 2),
-                    (float(inner_radius), float(outer_radius)),
-                    mask_dim=(ky, kx),
-                ).astype(np.float32)
-
-        else:
-            if theta_range is not None:
-                raise ValueError(
-                    "theta_range is only valid with annulus on polar data."
-                )
-
-            center_values = np.asarray(centers, dtype=float)
-            if center_values.shape == (2,):
-                center_values = center_values.reshape(1, 2)
-            elif center_values.ndim != 2 or center_values.shape[1] != 2:
-                raise ValueError(
-                    "centers must be one (ky, kx) pair or an (N, 2) array."
-                )
-            if center_values.shape[0] == 0:
-                raise ValueError("centers must contain at least one center.")
-            if not np.all(np.isfinite(center_values)):
-                raise ValueError("centers must contain only finite values.")
-            if detector_mode == 'calibrated':
-                center_values = self._calibrated_centers_to_pixels(
-                    center_values,
-                    detector_factor,
-                    (ky, kx),
-                )
-
-            radius_values = np.asarray(radius, dtype=float)
-            if radius_values.ndim == 0:
-                radius_values = np.full(
-                    center_values.shape[0],
-                    float(radius_values),
-                )
-            elif (
-                radius_values.ndim == 1
-                and radius_values.size == center_values.shape[0]
-            ):
-                pass
-            else:
-                raise ValueError(
-                    "radius must be a scalar or contain one value per center."
-                )
-            if (
-                not np.all(np.isfinite(radius_values))
-                or np.any(radius_values <= 0)
-            ):
-                raise ValueError("All detector radii must be positive and finite.")
-            if detector_mode == 'calibrated':
-                radius_values = self._scale_values_to_pixels(
-                    radius_values,
-                    detector_factor,
-                )
-
-            detector_weights = np.zeros((ky, kx), dtype=np.float32)
-            for center, disk_radius in zip(center_values, radius_values):
-                detector_weights[
-                    make_mask(
-                        center,
-                        float(disk_radius),
-                        mask_dim=(ky, kx),
-                    )
-                ] = 1.0
-
-        if not np.any(detector_weights != 0):
-            raise ValueError("The detector selects no reciprocal-space pixels.")
-
-        mean_detector = np.mean(self.array, axis=(0, 1))
-        masked_image = np.sum(
-            self.array * detector_weights[None, None, :, :],
-            axis=(2, 3),
-        )
-        virtual_image = self._spawn_real(
-            masked_image, quantity='Virtual detector signal',
+        return _virtual_image(
+            self.array, annulus, radius=radius, centers=centers, mask=mask,
+            theta_range=theta_range, detector_units=detector_units,
+            axis_units=axis_units, vmin=vmin, vmax=vmax, grid=grid,
+            num_div=num_div, plot_mask=plot_mask, grid_color=grid_color,
+            axes=axes, return_detector=return_detector, title=title, units=units,
+            mask_cmap=mask_cmap, mask_vmin=mask_vmin, mask_vmax=mask_vmax,
+            mask_power=mask_power, mask_log_scale=mask_log_scale,
+            mask_show_kwargs=mask_show_kwargs, ring_color=ring_color,
+            ring_alpha=ring_alpha, show=show, working_memory_mb=working_memory_mb,
+            geometry={
+                'reciprocal_units': self.reciprocal_units,
+                'reciprocal_conv_factor': self.reciprocal_conv_factor,
+                'polar_metadata': self.polar_metadata,
+            },
+            real_factory=lambda array: self._spawn_real(
+                array, quantity='Virtual detector signal',
+            ),
+            reciprocal_factory=self._spawn_reciprocal,
+            polar_factory=lambda array: HyperData(
+                array, polar_metadata=deepcopy(self.polar_metadata),
+            ),
         )
 
-        detector_array = mean_detector * detector_weights
+
+    def get_braggness(self, annulus=(18.0, 50.0), *, center=None, sigma=2.0,
+                      top_pixels=50, denominator_floor=1.0, scan_mask=None,
+                      nonfinite='raise', progress=False):
+        """Measure concentrated sharp diffraction contrast, one pattern at a time.
+
+        Gaussian-filter each *complete* diffraction pattern D, then form
+        ``R = maximum(D - Gaussian(D), 0)``. Sum the largest ``top_pixels``
+        values of R inside the annulus and divide by
+        ``max(sum(D inside the annulus), denominator_floor)``. The Gaussian
+        uses SciPy ``mode='reflect'`` and ``truncate=4.0`` and never mixes scan
+        positions. This is not an FFT or a count of detected Bragg peaks.
+
+        Parameters
+        ----------
+        annulus : pair of float, default (18, 50)
+            Inner and outer radii in Cartesian detector **pixels**, selecting
+            ``inner <= radius < outer``. Inner must be nonnegative and outer
+            strictly greater. These bounds differ from ``virtual_image``.
+        center : pair of float or None
+            Explicit array pixel coordinates ``(ky, kx)`` override metadata.
+            None uses ``center_beam_metadata['center_px']`` from alignment,
+            then ``mean_fit_center_px``, then ``center_calibrated`` converted
+            to pixels using its stored or current reciprocal calibration.
+            Without a stored center, use the subpixel image center
+            ``((Ky-1)/2, (Kx-1)/2)``. Stale/malformed metadata raises an error.
+            Set ``center=(64, 64)`` explicitly to reproduce the 128x128 raw
+            4D-TOMO notebook calculation (not the image center 63.5).
+        sigma : float, default 2
+            Positive finite Gaussian width in detector pixels.
+        top_pixels : int, default 50
+            Positive count, no greater than the selected annulus pixel count.
+        denominator_floor : float, default 1
+            Positive finite lower bound on integrated annulus intensity.
+        scan_mask : boolean array or None
+            Shape must equal ``scan_shape``. True means evaluate; False yields
+            NaN and invalid status without reading/checking that pattern.
+            For one 2D pattern, a scalar boolean has the required shape ``()``.
+        nonfinite : {'raise', 'omit'}, default 'raise'
+            Raise with the scan index if any pixel in an evaluated pattern is
+            nonfinite; omit invalidates the entire pattern. Numerical overflow
+            during calculation follows the same policy. No values are repaired.
+        progress : bool, default False
+            Display one progress bar over scan positions.
+
+        Returns
+        -------
+        BraggnessResult
+            Float32 score and boolean validity arrays of shape ``scan_shape``;
+            small metadata records settings, center source, dtype policy, and
+            diagnostic counts.
+            For 4D data, ``result.as_real_space()`` retains scan calibration.
+
+        Notes
+        -----
+        Supports real numeric 2D, 3D, and 4D Cartesian arrays. Complex, boolean,
+        object, and polar data are rejected. Float16 is promoted to float32;
+        float32 filtering/subtraction remains float32. Integer and other float
+        inputs use float64; extended precision is reduced to float64. Both sums
+        accumulate in float64, and output scores are float32. Integer values
+        above float64's exact-integer range may lose precision on conversion.
+
+        The current supplied array is used without flipping, aligning, clipping,
+        repairing, or mutating it or its metadata/backing file. Only per-pattern
+        temporaries and a detector-sized mask are allocated, even for trimmed or
+        flipped noncontiguous memmaps. The reference 4D-TOMO calculation uses
+        stored, unflipped, unaligned intensities; aligned/flipped input is a
+        different measurement, particularly for an off-subpixel center.
+
+        Noise can increase sharp contrast. Counts, denominator flooring, annulus
+        geometry, Gaussian width, and selected-pixel count affect comparability.
+        This dimensionless index is not necessarily restricted to [0, 1] and
+        does not establish phase, crystalline volume fraction, or orientation
+        confidence. Use additional evidence for those interpretations.
+        """
+        if self.ndim not in (2, 3, 4):
+            raise ValueError('get_braggness requires 2D, 3D, or 4D diffraction data.')
         if self.is_polar:
-            detector_image = HyperData(
-                detector_array,
-                polar_metadata=deepcopy(self.polar_metadata),
+            raise ValueError('get_braggness requires Cartesian detector pixels, not polar data.')
+        if self.dtype.kind not in 'iuf':
+            raise TypeError('get_braggness requires real numeric data; complex, boolean, and object inputs are unsupported.')
+        if not isinstance(nonfinite, str) or nonfinite not in ('raise', 'omit'):
+            raise ValueError("nonfinite must be 'raise' or 'omit'.")
+        if not isinstance(progress, (bool, np.bool_)):
+            raise TypeError('progress must be boolean.')
+        parameters = {}
+        for name, value in (('sigma', sigma), ('denominator_floor', denominator_floor)):
+            scalar = np.asarray(value)
+            if scalar.ndim != 0 or scalar.dtype.kind not in 'iuf':
+                raise ValueError(f'{name} must be a positive finite scalar.')
+            scalar = float(scalar)
+            if not np.isfinite(scalar) or scalar <= 0:
+                raise ValueError(f'{name} must be a positive finite scalar.')
+            parameters[name] = scalar
+        sigma, denominator_floor = parameters['sigma'], parameters['denominator_floor']
+        center_source = 'explicit'
+        if center is None:
+            center, stored_center_source = _rq_center(
+                self.pattern_shape, self.center_beam_metadata,
+                self.reciprocal_conv_factor,
             )
-        else:
-            detector_image = self._spawn_reciprocal(detector_array)
-
-        has_negative_weights = np.any(detector_weights < 0)
-        if vmin is None:
-            if has_negative_weights:
-                vmin = np.min(masked_image)
-            else:
-                positive_values = masked_image[masked_image > 0]
-                vmin = (
-                    np.min(positive_values)
-                    if positive_values.size
-                    else np.min(masked_image)
-                )
-        if vmax is None:
-            vmax = np.max(masked_image)
-
-        if show:
-            virtual_image.show(
-                title=title,
-                cmap='gray',
-                vmin=vmin,
-                vmax=vmax,
-                axes=axes,
-                grid=grid,
-                num_div=num_div,
-                grid_color=grid_color,
-                axis_units=axis_units,
+            center_source = (
+                'image_center' if stored_center_source == 'image midpoint'
+                else f'center_beam_metadata.{stored_center_source}'
             )
+        pairs = {}
+        for name, value in (('annulus', annulus), ('center', center)):
+            pair = np.asarray(value)
+            if pair.shape != (2,) or pair.dtype.kind not in 'iuf':
+                raise ValueError(f'{name} must contain two finite real numbers.')
+            pair = pair.astype(np.float64)
+            if not np.isfinite(pair).all():
+                raise ValueError(f'{name} must contain two finite real numbers.')
+            pairs[name] = pair
+        inner, outer = pairs['annulus']
+        if not 0 <= inner < outer:
+            raise ValueError('annulus requires 0 <= inner < outer.')
+        if isinstance(top_pixels, (bool, np.bool_)) or not isinstance(top_pixels, Integral) or top_pixels <= 0:
+            raise ValueError('top_pixels must be a positive integer.')
+        top_pixels = int(top_pixels)
+        ky, kx = np.ogrid[:self.pattern_shape[0], :self.pattern_shape[1]]
+        radius = np.hypot(ky - pairs['center'][0], kx - pairs['center'][1])
+        annulus_mask = (radius >= inner) & (radius < outer)
+        pixel_count = int(np.count_nonzero(annulus_mask))
+        if top_pixels > pixel_count:
+            raise ValueError(f'top_pixels={top_pixels} exceeds the annulus pixel count ({pixel_count}).')
+        if scan_mask is not None:
+            scan_mask = np.asarray(scan_mask)
+            if scan_mask.dtype.kind != 'b' or scan_mask.shape != self.scan_shape:
+                raise ValueError(f'scan_mask must be boolean with shape {self.scan_shape}.')
 
-        if plot_mask:
-            mask_options = {
-                'title': 'Mean Diffraction Pattern and Virtual Detector',
-                'cmap': mask_cmap,
-                'vmin': mask_vmin,
-                'vmax': mask_vmax,
-                'power': mask_power,
-                'logScale': mask_log_scale,
-                'axis_units': units,
-                'overlay_mask': detector_weights != 0,
-                'overlay_color': ring_color,
-                'overlay_alpha': ring_alpha,
-            }
-            if self.is_polar:
-                mask_options['aspect'] = 'auto'
-            if mask_show_kwargs:
-                mask_options.update(mask_show_kwargs)
-            self._spawn_reciprocal(mean_detector).show(**mask_options)
+        score = np.full(self.scan_shape, np.nan, dtype=np.float32)
+        valid_mask = np.zeros(self.scan_shape, dtype=bool)
+        skipped = nonfinite_count = numerical_failures = 0
+        indices = np.ndindex(self.scan_shape)
+        if progress:
+            indices = tqdm(indices, total=prod(self.scan_shape), desc='Braggness')
+        for index in indices:
+            if scan_mask is not None and not scan_mask[index]:
+                skipped += 1
+                continue
+            pattern = self.array[index]
+            if not np.isfinite(pattern).all():
+                nonfinite_count += 1
+                if nonfinite == 'raise':
+                    raise ValueError(f'Nonfinite diffraction values at scan index {index}.')
+                continue
+            try:
+                value = _braggness_pattern(pattern, annulus_mask, sigma, top_pixels, denominator_floor)
+            except FloatingPointError as exc:
+                numerical_failures += 1
+                if nonfinite == 'raise':
+                    raise ValueError(f'Braggness calculation failed at scan index {index}: {exc}') from exc
+                continue
+            score[index] = value
+            valid_mask[index] = True
 
-        if return_detector:
-            return virtual_image, detector_image
-        return virtual_image
-
+        calculation_dtype = 'float32' if self.dtype.kind == 'f' and self.dtype.itemsize <= 4 else 'float64'
+        metadata = {
+            'definition': 'positive_gaussian_residual_top_pixels_over_annulus_intensity',
+            'input_shape': list(self.shape), 'scan_shape': list(self.scan_shape),
+            'pattern_shape': list(self.pattern_shape), 'coordinate_order': 'ky,kx',
+            'units': 'pixels', 'center': pairs['center'].tolist(),
+            'center_source': center_source,
+            'annulus': pairs['annulus'].tolist(), 'annulus_bounds': 'inner <= r < outer',
+            'sigma': sigma, 'gaussian_mode': 'reflect', 'gaussian_truncate': 4.0,
+            'top_pixels': top_pixels, 'annulus_pixel_count': pixel_count,
+            'denominator_floor': denominator_floor, 'nonfinite': nonfinite,
+            'input_dtype': str(self.dtype), 'calculation_dtype': calculation_dtype,
+            'accumulation_dtype': 'float64', 'output_dtype': 'float32',
+            'scan_mask_applied': scan_mask is not None,
+            'total_patterns': int(score.size), 'evaluated_patterns': int(np.count_nonzero(valid_mask)),
+            'skipped_patterns': skipped, 'nonfinite_patterns': nonfinite_count,
+            'numerical_failures': numerical_failures,
+        }
+        return BraggnessResult(
+            score, valid_mask, metadata, real_units=self.real_units,
+            real_conv_factor=self.real_conv_factor, real_origin=self.real_origin,
+        )
 
     def get_peaks(self,
                   radius: float,
@@ -11297,7 +8639,9 @@ class HyperData:
                     outlier_max_iterations=2,
                     outlier_space='radial_angular',
                     outlier_method='auto_mixture',
-                    outlier_bic_delta=0.0):
+                    outlier_bic_delta=0.0, *, output_frame='reciprocal',
+                    match_radius=None, initial_rotation=None, initial_transform=None,
+                    initial_translation=None, ambiguity_ratio=None):
         """
         Calculate strain and rotation maps from Bragg peak centers.
 
@@ -11305,21 +8649,71 @@ class HyperData:
         coordinates to measured peak coordinates at each diffraction pattern,
         then extracts strain from the polar stretch matrix. Peak sets are not
         required to have the same size or order. By default, reference and
-        measured peaks are paired by a one-to-one, centroid-aligned spatial
-        assignment before fitting.
+        measured peaks are paired by a one-to-one, neighborhood-gated spatial
+        assignment before fitting. Unrelated peaks may remain unmatched;
+        centroids of unequal peak sets are not assumed to be comparable.
+
+        Peak coordinates and diagnostic fitted matrices use ``(ky, kx)``
+        order. For default reciprocal output at ``ang=0``, the stretch matrix
+        ``U`` gives ``eyy = 1 - U[0, 0]`` and ``exx = 1 - U[1, 1]``.
+        Map indices retain the input scan order ``(Ry, Rx)``. The named
+        result components (and tuple unpacking order) remain ``exx, eyy,
+        exy, erot``. Real-frame output converts the fitted transform using
+        stored R/Q calibration before extracting the Cartesian tensor.
+
+        Matching options
+        ----------------
+        ``match_radius`` bounds pair distances in the supplied peak units;
+        None uses 45% of the median nearest-reference-peak separation.
+        ``initial_rotation`` is a Cartesian counterclockwise angle in degrees,
+        scalar or scan-shaped. ``initial_transform`` instead accepts a global
+        or scan-shaped (2, 2) reference-to-measured matrix in (ky, kx) order.
+        These mutually exclusive guesses select candidates only; fitting
+        estimates the full transform and retains its rotation. Optional
+        ``initial_translation`` uses (ky, kx) units and requires
+        ``fit_translation=True``. Without it, translation consensus is sought
+        without relying on peak-set centroids. ``ambiguity_ratio`` between
+        zero and one optionally rejects pairs whose distance is too close to
+        that of a competing candidate (smaller is stricter). The default
+        retains pairs while reporting their geometric confidence margins.
+        Explicit ``match_peaks='hungarian'`` allows unrestricted assignment
+        if no match_radius is supplied; ``'ordered'`` trusts supplied pairing.
+        ``'auto'`` and ``'nearest'`` use the neighborhood gate.
 
         Parameters
         ----------
         centers : ndarray or nested list, optional
             Measured peak centers. Common fixed-size shape is
-            ``(Ry, Rx, n_peaks, 2)``. Nested lists may be used when each
+            ``(Ry, Rx, n_peaks, 2)``, with each coordinate in ``(ky, kx)``
+            order. Nested lists may be used when each
             diffraction pattern has a different number of peaks.
         ref_centers : ndarray or nested list, optional
             Reference peak centers. Supported forms are a global
             ``(n_ref_peaks, 2)`` array or a local reference with the same scan
             layout as ``centers``.
         ang : float, optional
-            In-plane angle in degrees used to rotate the strain basis.
+            In-plane angle in degrees used to rotate the reporting basis of
+            the fitted strain tensor, not the scan image. At the default 0,
+            ``exx`` follows kx and ``eyy`` follows ky; these directions need
+            not coincide with the real-space scan axes. A 90-degree basis
+            rotation exchanges ``exx`` and ``eyy`` and reverses ``exy`` without
+            moving scan pixels or changing the fitted local rotation.
+            Determine this angle from the acquisition's coordinate frames;
+            it is not inferred from the strain map. This manual correction
+            applies only to ``output_frame='reciprocal'``. A nonzero value
+            with real-frame output raises an error to prevent two corrections.
+        output_frame : {'reciprocal', 'real'}, keyword-only, optional
+            Reporting directions for the strain tensor. The default
+            ``'reciprocal'`` retains the existing detector-basis calculation
+            and ignores stored R/Q calibration. ``'real'`` requires
+            ``self.rq_calibration`` and automatically uses its rotation and
+            optional reflection. R/Q directions are Cartesian (x right,
+            y up); pixel peaks (y down) and calibrated peaks (ky up) are
+            converted accordingly. Real-frame components form ``I - U``;
+            ``erot`` is positive counterclockwise and reflections are handled
+            through the full basis matrix. Map pixels and peak-fit diagnostics
+            remain in their original coordinates. Recorded acquisition scan
+            rotation is not used as a substitute for R/Q calibration.
         g_vector : optional
             Retained for compatibility with older calls. The least-squares
             implementation uses all matched peaks rather than selecting a
@@ -11350,10 +8744,11 @@ class HyperData:
         ewpc : bool, optional
             If True, invert the fitted reciprocal-space transform before
             extracting strain.
-        match_peaks : {'auto', 'ordered', 'nearest'}, optional
+        match_peaks : {'auto', 'ordered', 'nearest', 'hungarian'}, optional
             ``'auto'`` (the default) and ``'nearest'`` use one-to-one spatial
-            assignment regardless of peak count or input order. This assumes
-            the peak sets are approximately aligned before strain fitting.
+            neighborhood-gated assignment regardless of count or input order.
+            Initial guesses can align candidate coordinates before matching.
+            'hungarian' is unrestricted unless match_radius is supplied.
             Use ``'ordered'`` only when corresponding peaks are already at
             matching indices in both inputs, including after intensity
             filtering.
@@ -11372,7 +8767,8 @@ class HyperData:
         center : array-like of shape (2,) or None, optional
             Reciprocal-space origin ``(ky, kx)`` about which peak displacements
             are measured before fitting strain. If None, this defaults to
-            ``self.center_beam_metadata['mean_fit_center_px']`` when available.
+            current ``center_beam_metadata['center_px']`` when available,
+            falling back to mean-fit or calibrated-center metadata.
             If that metadata is unavailable, it falls back to the finite mean
             coordinate of ``ref_centers`` when a reference is supplied, or to
             the finite absolute mean coordinate of all peaks in ``centers``
@@ -11434,7 +8830,11 @@ class HyperData:
         -------
         StrainResult
             Named strain and rotation maps, fit-quality maps, optional
-            diagnostics, and real-space scan calibration. Strains are
+            diagnostics, real-space scan calibration, and reporting-frame
+            metadata. ``result.rq_calibration`` is the calibration used for
+            real output, and ``result.output_basis_matrix`` records the basis
+            transform. Diagnostic transforms and translations remain in the
+            supplied peak-coordinate frame. Strains are
             dimensionless; rotation is in radians. The result also supports
             four-value unpacking and indexed access used by older notebooks.
 
@@ -11444,7 +8844,38 @@ class HyperData:
         >>> exx_image = result.as_real_space('exx')
         >>> fit_error = result.relative_fit_rmse
         >>> exx, eyy, exy, erot = result
+        >>> real_result = data.get_strains(
+        ...     centers=measured, ref_centers=reference, output_frame='real',
+        ... )  # Requires data.set_rq_calibration(...) first.
         """
+        if not isinstance(output_frame, str):
+            raise ValueError("output_frame must be 'reciprocal' or 'real'.")
+        output_frame = output_frame.strip().lower()
+        if output_frame not in ('reciprocal', 'real'):
+            raise ValueError("output_frame must be 'reciprocal' or 'real'.")
+        if isinstance(ang, (bool, np.bool_)) or not np.isscalar(ang):
+            raise ValueError('ang must be a finite scalar angle in degrees.')
+        try:
+            ang = float(ang)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('ang must be a finite scalar angle in degrees.') from exc
+        if not np.isfinite(ang):
+            raise ValueError('ang must be a finite scalar angle in degrees.')
+        used_rq_calibration = None
+        if output_frame == 'real':
+            if ang != 0:
+                raise ValueError(
+                    "output_frame='real' uses rq_calibration; leave ang=0. "
+                    "Use output_frame='reciprocal' for a manual basis angle."
+                )
+            used_rq_calibration = self.rq_calibration
+            if used_rq_calibration is None:
+                raise ValueError(
+                    "output_frame='real' requires stored rq_calibration. "
+                    "Use set_rq_calibration(...) or apply a compare_rq(...) "
+                    "calibration before calculating real-frame strain."
+                )
+
         def _is_sequence_of_sequences(value):
             return (
                 isinstance(value, list)
@@ -11579,12 +9010,10 @@ class HyperData:
 
         def _metadata_strain_center():
             metadata = self.center_beam_metadata
-            if not isinstance(metadata, dict) or 'mean_fit_center_px' not in metadata:
+            if not isinstance(metadata, dict) or not any(metadata.get(key) is not None for key in ('center_px', 'mean_fit_center_px', 'center_calibrated')):
                 return None
             try:
-                center_px = _validate_strain_center(
-                    metadata['mean_fit_center_px']
-                )
+                center_px, _ = _beam_center_pixels(self.k_shape, metadata, self.reciprocal_conv_factor)
                 if peak_units == 'calibrated':
                     return np.asarray(_center_to_calibrated(
                         center_px, self.k_shape, self.reciprocal_conv_factor,
@@ -11592,8 +9021,7 @@ class HyperData:
                 return center_px
             except ValueError as exc:
                 raise ValueError(
-                    "center_beam_metadata['mean_fit_center_px'] must be a "
-                    "finite coordinate pair (ky, kx)."
+                    'center_beam_metadata must contain a valid current beam center.'
                 ) from exc
 
         def _weights_for_valid_measured(weights, meas_valid_idx, raw_count):
@@ -11632,13 +9060,17 @@ class HyperData:
 
             raise ValueError("intensity_clip must be 'both', 'lower', or 'upper'.")
 
-        def _match_peak_sets(reference, measured, weights=None):
+        def _match_peak_sets(reference, measured, weights=None, rotation=None,
+                             transform=None, translation=None):
             raw_measured_count = np.asarray(measured).reshape(-1, 2).shape[0]
             reference, ref_valid_idx = _clean_peak_set(reference)
             measured, meas_valid_idx = _clean_peak_set(measured)
             measured_weights = _weights_for_valid_measured(
                 weights, meas_valid_idx, raw_measured_count,
             )
+            available_ref_idx = ref_valid_idx.copy()
+            available_meas_idx = meas_valid_idx.copy()
+            intensity_filtered_idx = np.array([], dtype=int)
 
             if intensity_percentile is not None:
                 if measured_weights is None:
@@ -11648,30 +9080,42 @@ class HyperData:
                     )
                 keep = _intensity_keep_mask(measured_weights)
                 if not np.any(keep):
-                    return None, None, None, None, None
+                    return None, None, None, None, None, {'status': 'intensity_filtered'}
 
                 measured = measured[keep]
+                intensity_filtered_idx = meas_valid_idx[~keep]
                 meas_valid_idx = meas_valid_idx[keep]
                 measured_weights = measured_weights[keep]
 
+            if match_peaks.lower() == 'ordered':
+                # Ordered correspondence refers to original row identities,
+                # not compressed row numbers after NaN/intensity filtering.
+                common = np.intersect1d(ref_valid_idx, meas_valid_idx)
+                ref_selection = np.searchsorted(ref_valid_idx, common)
+                meas_selection = np.searchsorted(meas_valid_idx, common)
+                reference, measured = reference[ref_selection], measured[meas_selection]
+                ref_valid_idx = ref_valid_idx[ref_selection]
+                meas_valid_idx = meas_valid_idx[meas_selection]
+                if measured_weights is not None:
+                    measured_weights = measured_weights[meas_selection]
+
             if reference.shape[0] < min_peak_pairs or measured.shape[0] < min_peak_pairs:
-                return None, None, None, None, None
+                return None, None, None, None, None, {'status': 'insufficient_peaks'}
 
-            match_mode = match_peaks.lower()
-            if match_mode == 'auto':
-                match_mode = 'nearest'
-
-            if match_mode == 'ordered':
-                n_pairs = min(reference.shape[0], measured.shape[0])
-                ref_idx = np.arange(n_pairs)
-                meas_idx = np.arange(n_pairs)
-            elif match_mode in ('nearest', 'hungarian'):
-                ref_centered = reference - np.mean(reference, axis=0)
-                measured_centered = measured - np.mean(measured, axis=0)
-                distances = cdist(ref_centered, measured_centered)
-                ref_idx, meas_idx = linear_sum_assignment(distances)
-            else:
-                raise ValueError("match_peaks must be 'auto', 'ordered', or 'nearest'.")
+            ref_idx, meas_idx, information = _match_peak_candidates(
+                reference, measured, center, mode=match_peaks.lower(),
+                radius=match_radius, rotation=rotation, transform=transform,
+                translation=translation, fit_translation=fit_translation,
+                peak_units=peak_units, ambiguity_ratio=ambiguity_ratio,
+            )
+            for key in ('matched_reference_indices', 'unmatched_reference_indices'):
+                information[key] = ref_valid_idx[information[key]]
+            for key in ('matched_measured_indices', 'unmatched_measured_indices'):
+                information[key] = meas_valid_idx[information[key]]
+            information['unmatched_reference_indices'] = np.setdiff1d(available_ref_idx, information['matched_reference_indices'])
+            information['unmatched_measured_indices'] = np.setdiff1d(available_meas_idx, information['matched_measured_indices'])
+            information['intensity_filtered_indices'] = intensity_filtered_idx
+            information['invalid_measured_indices'] = np.setdiff1d(np.arange(raw_measured_count), available_meas_idx)
 
             matched_weights = None
             if measured_weights is not None:
@@ -11683,358 +9127,9 @@ class HyperData:
                 matched_weights,
                 ref_valid_idx[ref_idx],
                 meas_valid_idx[meas_idx],
+                information,
             )
 
-        def _fit_peak_transform(reference, measured, strain_center, weights=None):
-            reference = reference - strain_center
-            measured = measured - strain_center
-
-            if weights is not None:
-                weights = np.asarray(weights, dtype=float)
-                weights = np.where(np.isfinite(weights), weights, 0)
-                weights = np.clip(weights, 0, None)
-                if np.sum(weights) <= 0:
-                    weights = None
-
-            if fit_translation:
-                if weights is None:
-                    ref_origin = np.mean(reference, axis=0)
-                    measured_origin = np.mean(measured, axis=0)
-                else:
-                    ref_origin = np.average(reference, axis=0, weights=weights)
-                    measured_origin = np.average(measured, axis=0, weights=weights)
-                X = reference - ref_origin
-                Y = measured - measured_origin
-            else:
-                ref_origin = np.zeros(2)
-                measured_origin = np.zeros(2)
-                X = reference
-                Y = measured
-
-            if weights is None:
-                X_fit = X
-                Y_fit = Y
-            else:
-                sqrt_weights = np.sqrt(weights)[:, np.newaxis]
-                X_fit = X * sqrt_weights
-                Y_fit = Y * sqrt_weights
-
-            coeffs, _, rank, singular_values = np.linalg.lstsq(
-                X_fit, Y_fit, rcond=None,
-            )
-            if (
-                rank < 2 or singular_values[-1] <= 0
-                or singular_values[0] / singular_values[-1] > max_condition_number
-            ):
-                raise np.linalg.LinAlgError(
-                    "Matched reference peaks are collinear or too ill-conditioned "
-                    "for a reliable 2D strain fit."
-                )
-            transform_matrix = coeffs.T
-            translation = measured_origin - ref_origin @ coeffs
-            return transform_matrix, translation
-
-        def _robust_zscore(values):
-            values = np.asarray(values, dtype=float)
-            z = np.full(values.shape, np.inf, dtype=float)
-            finite = np.isfinite(values)
-            if not np.any(finite):
-                return z
-
-            finite_values = values[finite]
-            median = np.median(finite_values)
-            deviation = np.abs(finite_values - median)
-            scale = 1.4826 * np.median(deviation)
-            if scale <= np.finfo(float).eps:
-                z[finite] = 0.0
-                z[np.flatnonzero(finite)[deviation > np.finfo(float).eps]] = np.inf
-                return z
-
-            z[finite] = np.abs(values[finite] - median) / scale
-            return z
-
-        def _peak_residual_vectors(reference, measured, transform_matrix,
-                                   translation, strain_center):
-            reference_centered = reference - strain_center
-            measured_centered = measured - strain_center
-            predicted = reference_centered @ transform_matrix.T + translation
-            return measured_centered - predicted
-
-        def _peak_residual_distances(reference, measured, transform_matrix,
-                                     translation, strain_center):
-            residual = _peak_residual_vectors(
-                reference,
-                measured,
-                transform_matrix,
-                translation,
-                strain_center,
-            )
-            return np.linalg.norm(residual, axis=1)
-
-        def _fit_residual_quality(reference, measured, transform_matrix,
-                                  translation, strain_center, weights):
-            residual = _peak_residual_vectors(
-                reference, measured, transform_matrix, translation, strain_center,
-            )
-            residual_sq = np.einsum('ij,ij->i', residual, residual)
-            reference_centered = reference - strain_center
-            reference_radius_sq = np.einsum(
-                'ij,ij->i', reference_centered, reference_centered,
-            )
-            if weights is not None:
-                weights = np.asarray(weights, dtype=float)
-                weights = np.where(np.isfinite(weights), weights, 0.0)
-                weights = np.clip(weights, 0.0, None)
-                if np.sum(weights) <= 0:
-                    weights = None
-
-            if weights is None:
-                mean_residual_sq = np.mean(residual_sq)
-                mean_reference_radius_sq = np.mean(reference_radius_sq)
-            else:
-                mean_residual_sq = np.average(residual_sq, weights=weights)
-                mean_reference_radius_sq = np.average(
-                    reference_radius_sq, weights=weights,
-                )
-
-            rmse = float(np.sqrt(mean_residual_sq))
-            reference_rms_radius = float(np.sqrt(mean_reference_radius_sq))
-            relative_rmse = (
-                rmse / reference_rms_radius
-                if reference_rms_radius > np.finfo(float).eps
-                else np.nan
-            )
-            return rmse, relative_rmse
-
-        def _peak_outlier_scores(reference, measured, transform_matrix,
-                                 translation, strain_center):
-            reference_centered = reference - strain_center
-            residual = _peak_residual_vectors(
-                reference,
-                measured,
-                transform_matrix,
-                translation,
-                strain_center,
-            )
-
-            if outlier_space == 'radial_angular':
-                radii = np.linalg.norm(reference_centered, axis=1)
-                safe_radii = np.where(radii > np.finfo(float).eps, radii, 1.0)
-                radial_unit = np.divide(
-                    reference_centered,
-                    safe_radii[:, np.newaxis],
-                    out=np.zeros_like(reference_centered, dtype=float),
-                    where=safe_radii[:, np.newaxis] > 0,
-                )
-                tangential_unit = np.column_stack(
-                    (-radial_unit[:, 1], radial_unit[:, 0])
-                )
-                radial_residual = np.sum(residual * radial_unit, axis=1) / safe_radii
-                angular_residual = np.sum(residual * tangential_unit, axis=1) / safe_radii
-                radial_z = _robust_zscore(radial_residual)
-                angular_z = _robust_zscore(angular_residual)
-                score = np.hypot(radial_z, angular_z)
-            elif outlier_space == 'cartesian':
-                y_z = _robust_zscore(residual[:, 0])
-                x_z = _robust_zscore(residual[:, 1])
-                score = np.hypot(y_z, x_z)
-            elif outlier_space == 'distance':
-                score = _robust_zscore(np.linalg.norm(residual, axis=1))
-            else:
-                raise ValueError(
-                    "outlier_space must be 'radial_angular', 'cartesian', "
-                    "or 'distance'."
-                )
-
-            return score
-
-        def _auto_mixture_outlier_mask(reference, measured, transform_matrix,
-                                       translation, strain_center):
-            residual_distances = _peak_residual_distances(
-                reference,
-                measured,
-                transform_matrix,
-                translation,
-                strain_center,
-            )
-            probabilities = np.full(residual_distances.shape, np.nan, dtype=float)
-            model_info = {
-                'method': 'auto_mixture',
-                'accepted_two_component_model': False,
-                'bic_one_component': np.nan,
-                'bic_two_component': np.nan,
-                'low_residual_log_mean': np.nan,
-                'high_residual_log_mean': np.nan,
-            }
-            reject = np.zeros(residual_distances.shape, dtype=bool)
-
-            finite = np.isfinite(residual_distances)
-            if np.count_nonzero(finite) < 2:
-                return reject, residual_distances, probabilities, model_info
-
-            finite_distances = residual_distances[finite]
-            if np.ptp(finite_distances) <= np.finfo(float).eps:
-                return reject, residual_distances, probabilities, model_info
-
-            eps = max(np.finfo(float).eps, np.nanmedian(finite_distances) * 1e-12)
-            log_distances = np.log10(np.maximum(finite_distances, eps))
-            if np.unique(log_distances).size < 2:
-                return reject, residual_distances, probabilities, model_info
-
-            values = log_distances.reshape(-1, 1)
-            low_start, high_start = np.percentile(log_distances, [25, 90])
-            if high_start <= low_start:
-                low_start, high_start = np.min(log_distances), np.max(log_distances)
-
-            one_component = GaussianMixture(
-                n_components=1,
-                covariance_type='full',
-                reg_covar=1e-9,
-                random_state=0,
-                init_params='random',
-                n_init=1,
-            )
-            two_component = GaussianMixture(
-                n_components=2,
-                covariance_type='full',
-                reg_covar=1e-9,
-                random_state=0,
-                init_params='random',
-                means_init=np.array([[low_start], [high_start]]),
-                weights_init=np.array([0.8, 0.2]),
-                n_init=1,
-            )
-            try:
-                one_component.fit(values)
-                two_component.fit(values)
-            except ValueError:
-                return reject, residual_distances, probabilities, model_info
-
-            bic_one = one_component.bic(values)
-            bic_two = two_component.bic(values)
-            model_info['bic_one_component'] = float(bic_one)
-            model_info['bic_two_component'] = float(bic_two)
-            if not np.isfinite(bic_one) or not np.isfinite(bic_two):
-                return reject, residual_distances, probabilities, model_info
-            if bic_two + outlier_bic_delta >= bic_one:
-                return reject, residual_distances, probabilities, model_info
-
-            means = two_component.means_.reshape(-1)
-            high_component = int(np.argmax(means))
-            low_component = int(np.argmin(means))
-            model_info['low_residual_log_mean'] = float(means[low_component])
-            model_info['high_residual_log_mean'] = float(means[high_component])
-
-            labels = two_component.predict(values)
-            high_probabilities = two_component.predict_proba(values)[:, high_component]
-            finite_indices = np.flatnonzero(finite)
-            probabilities[finite_indices] = high_probabilities
-            reject[finite_indices] = labels == high_component
-            model_info['accepted_two_component_model'] = bool(np.any(reject))
-            return reject, residual_distances, probabilities, model_info
-
-        def _resolve_outlier_min_peak_pairs(reference_peak_count):
-            if outlier_min_peak_fraction is None:
-                return outlier_min_peak_pairs
-            return max(
-                2,
-                int(np.ceil(float(reference_peak_count) * outlier_min_peak_fraction)),
-            )
-
-        def _reject_peak_outliers(reference, measured, weights, strain_center,
-                                  local_outlier_min_peak_pairs):
-            keep = np.ones(reference.shape[0], dtype=bool)
-            residual_distances = np.full(reference.shape[0], np.nan, dtype=float)
-            probabilities = np.full(reference.shape[0], np.nan, dtype=float)
-            model_info = {
-                'method': outlier_method,
-                'accepted_two_component_model': False,
-                'bic_one_component': np.nan,
-                'bic_two_component': np.nan,
-            }
-            if (
-                not reject_peak_outliers
-                or reference.shape[0] < local_outlier_min_peak_pairs
-                or outlier_max_iterations <= 0
-            ):
-                return keep, residual_distances, probabilities, model_info
-
-            min_remaining = max(min_peak_pairs, local_outlier_min_peak_pairs)
-            for _ in range(outlier_max_iterations):
-                if np.count_nonzero(keep) < min_remaining:
-                    break
-
-                current_weights = weights[keep] if weights is not None else None
-                transform_matrix, translation = _fit_peak_transform(
-                    reference[keep],
-                    measured[keep],
-                    strain_center,
-                    weights=current_weights,
-                )
-                kept_indices = np.flatnonzero(keep)
-                if outlier_method == 'auto_mixture':
-                    (
-                        local_reject,
-                        local_residual_distances,
-                        local_probabilities,
-                        local_model_info,
-                    ) = _auto_mixture_outlier_mask(
-                        reference[keep],
-                        measured[keep],
-                        transform_matrix,
-                        translation,
-                        strain_center,
-                    )
-                    residual_distances[kept_indices] = local_residual_distances
-                    probabilities[kept_indices] = local_probabilities
-                    model_info = local_model_info
-                else:
-                    scores = _peak_outlier_scores(
-                        reference[keep],
-                        measured[keep],
-                        transform_matrix,
-                        translation,
-                        strain_center,
-                    )
-                    local_residual_distances = _peak_residual_distances(
-                        reference[keep],
-                        measured[keep],
-                        transform_matrix,
-                        translation,
-                        strain_center,
-                    )
-                    residual_distances[kept_indices] = local_residual_distances
-                    local_reject = (~np.isfinite(scores)) | (scores > outlier_threshold)
-
-                if not np.any(local_reject):
-                    break
-
-                available_rejections = np.count_nonzero(keep) - min_remaining
-                if available_rejections <= 0:
-                    break
-
-                reject_candidates = np.flatnonzero(local_reject)
-                if reject_candidates.size > available_rejections:
-                    if outlier_method == 'auto_mixture':
-                        candidate_scores = local_residual_distances[reject_candidates]
-                    else:
-                        candidate_scores = scores[reject_candidates]
-                    candidate_scores = np.where(
-                        np.isfinite(candidate_scores),
-                        candidate_scores,
-                        np.inf,
-                    )
-                    reject_candidates = reject_candidates[
-                        np.argsort(candidate_scores)[-available_rejections:]
-                    ]
-
-                candidate_keep = keep.copy()
-                candidate_keep[np.flatnonzero(keep)[reject_candidates]] = False
-                if np.array_equal(candidate_keep, keep):
-                    break
-                keep = candidate_keep
-
-            return keep, residual_distances, probabilities, model_info
 
         ref_centers_was_none = ref_centers is None
         if ref_centers is None and centers is None:
@@ -12148,6 +9243,22 @@ class HyperData:
                 "outlier_space must be 'radial_angular', 'cartesian', or 'distance'."
             )
 
+        fitter = _StrainFitEngine(
+            fit_translation=fit_translation, max_condition_number=max_condition_number,
+            min_peak_pairs=min_peak_pairs, reject_peak_outliers=reject_peak_outliers,
+            outlier_threshold=outlier_threshold, outlier_min_peak_pairs=outlier_min_peak_pairs,
+            outlier_min_peak_fraction=outlier_min_peak_fraction,
+            outlier_max_iterations=outlier_max_iterations, outlier_space=outlier_space,
+            outlier_method=outlier_method, outlier_bic_delta=outlier_bic_delta,
+        )
+        if not isinstance(match_peaks, str) or match_peaks.lower() not in ('auto', 'nearest', 'hungarian', 'ordered'):
+            raise ValueError("match_peaks must be 'auto', 'nearest', 'hungarian', or 'ordered'.")
+        match_radius, ambiguity_ratio = _validate_matching_parameters(match_radius, ambiguity_ratio)
+        if initial_rotation is not None and initial_transform is not None:
+            raise ValueError('Specify initial_rotation or initial_transform, not both.')
+        if initial_translation is not None and not fit_translation:
+            raise ValueError('initial_translation requires fit_translation=True.')
+
         if centers is None:
             centers = self.get_centers(
                 r=r_CoM,
@@ -12172,7 +9283,8 @@ class HyperData:
         if center is None:
             center = _metadata_strain_center()
             if center is not None:
-                center_source = 'center_beam_metadata.mean_fit_center_px'
+                _, center_key = _beam_center_pixels(self.k_shape, self.center_beam_metadata, self.reciprocal_conv_factor)
+                center_source = f'center_beam_metadata.{center_key}'
             else:
                 center_source = 'centers' if ref_centers_was_none else 'ref_centers'
                 center_data = centers if ref_centers_was_none else ref_centers
@@ -12206,9 +9318,37 @@ class HyperData:
             ref_centers = np.mean(centers[reference_mask], axis=0)
 
         output_shape = (ydim,) if squeezed_scan else (ydim, xdim)
-        ang_rad = np.radians(ang)
-        R1 = np.array([[np.cos(ang_rad), np.sin(ang_rad)],
-                       [-np.sin(ang_rad), np.cos(ang_rad)]])
+
+        def _prepare_hint(value, trailing_shape, name):
+            if value is None:
+                return None
+            array = np.asarray(value, dtype=float)
+            if array.shape not in (trailing_shape, output_shape + trailing_shape) or not np.isfinite(array).all():
+                raise ValueError(f'{name} must be finite with shape {trailing_shape} or {output_shape + trailing_shape}.')
+            if name == 'initial_transform' and np.any(np.abs(np.linalg.det(array)) < 1e-12):
+                raise ValueError('initial_transform must be nonsingular.')
+            return array
+
+        initial_rotation = _prepare_hint(initial_rotation, (), 'initial_rotation')
+        initial_transform = _prepare_hint(initial_transform, (2, 2), 'initial_transform')
+        initial_translation = _prepare_hint(initial_translation, (2,), 'initial_translation')
+
+        def _local_hint(value, out_index, trailing_ndim):
+            return value if value is None or value.ndim == trailing_ndim else value[out_index]
+
+        if output_frame == 'real':
+            # R/Q matrices use Cartesian xy; input pixel rows point downward.
+            peak_to_cartesian = np.array([
+                [0.0, 1.0],
+                [-1.0 if peak_units == 'pixels' else 1.0, 0.0],
+            ])
+            output_basis = used_rq_calibration.inverse_matrix @ peak_to_cartesian
+        else:
+            ang_rad = np.radians(ang)
+            output_basis = np.array([
+                [np.cos(ang_rad), np.sin(ang_rad)],
+                [-np.sin(ang_rad), np.cos(ang_rad)],
+            ])
 
         exx = np.full(output_shape, np.nan)
         eyy = np.full(output_shape, np.nan)
@@ -12222,6 +9362,11 @@ class HyperData:
         initial_match_counts = np.zeros(output_shape, dtype=int)
         outlier_counts = np.zeros(output_shape, dtype=int)
         resolved_outlier_min_peak_counts = np.zeros(output_shape, dtype=int)
+        fit_status = np.full(output_shape, 'masked', dtype='U32')
+        condition_numbers = np.full(output_shape, np.nan)
+        matching_information = np.empty(output_shape, dtype=object) if return_transform else None
+        if matching_information is not None:
+            matching_information.fill(None)
         peak_outlier_masks = None
         outlier_ref_indices = None
         outlier_measured_indices = None
@@ -12247,20 +9392,33 @@ class HyperData:
                 if real_mask is not None and not real_mask[i, j]:
                     continue
 
+                out_idx = i if squeezed_scan else (i, j)
+                fit_status[out_idx] = 'insufficient_peaks'
+
                 ref_ij = _local_peaks(ref_centers, i, j, squeezed_scan)
                 centers_ij = _local_peaks(centers, i, j, squeezed_scan)
                 weights_ij = _local_weights(intensity_array, i, j, squeezed_scan)
                 reference_peak_count = _clean_peak_set(ref_ij)[0].shape[0]
-                local_outlier_min_peak_pairs = _resolve_outlier_min_peak_pairs(
+                local_outlier_min_peak_pairs = fitter._resolve_outlier_min_peak_pairs(
                     reference_peak_count
                 )
 
-                matched = _match_peak_sets(ref_ij, centers_ij, weights_ij)
-                matched_ref, matched_centers, weights, ref_idx, meas_idx = matched
+                matched = _match_peak_sets(
+                    ref_ij, centers_ij, weights_ij,
+                    _local_hint(initial_rotation, out_idx, 0),
+                    _local_hint(initial_transform, out_idx, 2),
+                    _local_hint(initial_translation, out_idx, 1),
+                )
+                matched_ref, matched_centers, weights, ref_idx, meas_idx, matching_info = matched
+                if matching_information is not None:
+                    matching_information[out_idx] = matching_info
+                fit_status[out_idx] = matching_info['status']
+                initial_match_counts[out_idx] = 0 if matched_ref is None else matched_ref.shape[0]
                 if matched_ref is None or matched_ref.shape[0] < min_peak_pairs:
+                    if fit_status[out_idx] == 'matched':
+                        fit_status[out_idx] = 'insufficient_matches'
                     continue
 
-                out_idx = i if squeezed_scan else (i, j)
                 initial_match_counts[out_idx] = matched_ref.shape[0]
                 resolved_outlier_min_peak_counts[out_idx] = (
                     local_outlier_min_peak_pairs
@@ -12272,7 +9430,7 @@ class HyperData:
                         residual_distances,
                         outlier_probability,
                         local_outlier_model_info,
-                    ) = _reject_peak_outliers(
+                    ) = fitter._reject_peak_outliers(
                         matched_ref,
                         matched_centers,
                         weights,
@@ -12280,13 +9438,25 @@ class HyperData:
                         local_outlier_min_peak_pairs,
                     )
                     if np.count_nonzero(peak_keep) < min_peak_pairs:
+                        fit_status[out_idx] = 'insufficient_inliers'
                         continue
 
                     fit_ref = matched_ref[peak_keep]
                     fit_centers = matched_centers[peak_keep]
                     fit_weights = weights[peak_keep] if weights is not None else None
 
-                    transform_matrix, translation = _fit_peak_transform(
+                    design = fit_ref - center
+                    if fit_translation:
+                        safe_weights = None if fit_weights is None else np.maximum(0, np.nan_to_num(fit_weights, nan=0, posinf=0, neginf=0))
+                        if safe_weights is not None and safe_weights.sum() == 0:
+                            safe_weights = None
+                        design = design - np.average(design, axis=0, weights=safe_weights)
+                    if fit_weights is not None:
+                        positive_weights = np.maximum(0, np.nan_to_num(fit_weights, nan=0, posinf=0, neginf=0))
+                        if positive_weights.sum() > 0:
+                            design = design * np.sqrt(positive_weights[:, None])
+                    condition_numbers[out_idx] = np.linalg.cond(design)
+                    transform_matrix, translation = fitter._fit_peak_transform(
                         fit_ref,
                         fit_centers,
                         center,
@@ -12298,20 +9468,26 @@ class HyperData:
                     else:
                         transform_for_strain = transform_matrix
 
-                    T = R1 @ transform_for_strain @ np.linalg.inv(R1)
+                    T = output_basis @ transform_for_strain @ output_basis.T
                     R, U = polar(T)
-                    rmse, relative_rmse = _fit_residual_quality(
+                    rmse, relative_rmse = fitter._fit_residual_quality(
                         fit_ref, fit_centers, transform_matrix, translation,
                         center, fit_weights,
                     )
-                except np.linalg.LinAlgError:
+                except np.linalg.LinAlgError as exc:
+                    fit_status[out_idx] = 'singular_transform' if 'singular' in str(exc).lower() else 'ill_conditioned'
                     continue
 
                 rejected_mask = ~peak_keep
                 rejected_count = int(np.count_nonzero(rejected_mask))
-                eyy[out_idx] = 1 - U[0, 0]
-                exx[out_idx] = 1 - U[1, 1]
-                exy[out_idx] = U[1, 0]
+                if output_frame == 'real':
+                    exx[out_idx] = 1 - U[0, 0]
+                    eyy[out_idx] = 1 - U[1, 1]
+                    exy[out_idx] = -U[0, 1]
+                else:
+                    eyy[out_idx] = 1 - U[0, 0]
+                    exx[out_idx] = 1 - U[1, 1]
+                    exy[out_idx] = U[1, 0]
                 erot[out_idx] = np.arctan2(R[1, 0], R[0, 0])
                 fit_rmse[out_idx] = rmse
                 relative_fit_rmse[out_idx] = relative_rmse
@@ -12319,6 +9495,7 @@ class HyperData:
                 translations[out_idx] = translation
                 match_counts[out_idx] = fit_ref.shape[0]
                 outlier_counts[out_idx] = rejected_count
+                fit_status[out_idx] = 'success'
                 if reject_peak_outliers:
                     peak_outlier_masks[out_idx] = rejected_mask
                     outlier_ref_indices[out_idx] = ref_idx[rejected_mask]
@@ -12339,6 +9516,14 @@ class HyperData:
                 'fit_rmse': fit_rmse,
                 'relative_fit_rmse': relative_fit_rmse,
                 'match_peaks': match_peaks,
+                'matching_information': matching_information,
+                'fit_status': fit_status,
+                'condition_numbers': condition_numbers,
+                'match_radius': match_radius,
+                'initial_rotation': initial_rotation,
+                'initial_transform': initial_transform,
+                'initial_translation': initial_translation,
+                'ambiguity_ratio': ambiguity_ratio,
                 'fit_translation': fit_translation,
                 'center': np.array(center, copy=True),
                 'center_source': center_source,
@@ -12369,6 +9554,13 @@ class HyperData:
                     else None
                 ),
                 'g_vector': g_vector,
+                'output_frame': output_frame,
+                'basis_angle_deg': ang,
+                'output_basis_matrix': output_basis.copy(),
+                'rq_calibration': (
+                    used_rq_calibration.to_dict()
+                    if used_rq_calibration is not None else None
+                ),
             }
 
         calibrated_scan = self.real_shape == output_shape
@@ -12397,6 +9589,11 @@ class HyperData:
                 self.real_origin if calibrated_scan else (0.0, 0.0)
             ),
             diagnostics=diagnostics,
+            output_frame=output_frame,
+            rq_calibration=used_rq_calibration,
+            output_basis_matrix=output_basis.copy(),
+            fit_status=fit_status,
+            condition_numbers=condition_numbers,
         )
         
         
@@ -13239,6 +10436,8 @@ class HyperData:
             New object with shape ``(B, n_r, n_theta)`` for 3D data or
             ``(Ry, Rx, n_r, n_theta)`` for 4D data.
         """
+        if self.is_polar or self.is_cepstral:
+            raise ValueError('to_polar requires Cartesian diffraction data.')
         arr = self.array
         shp = arr.shape
 
@@ -13253,36 +10452,9 @@ class HyperData:
         else:
             raise ValueError("HyperData must be 3D (B×C×D) or 4D (A×B×C×D).")
 
-        # Default center at image midpoint
-        cy = (height - 1) / 2.0
-        cx = (width  - 1) / 2.0
-        if center is not None:
-            cy, cx = center
-            cy = float(cy)
-            cx = float(cx)
-
-        if not (0 <= cy <= height - 1 and 0 <= cx <= width - 1):
-            raise ValueError(
-                "center must lie inside the diffraction pattern bounds."
-            )
-
-        if r_max is None:
-            r_max_used = min(cy, cx, height - 1 - cy, width - 1 - cx)
-        else:
-            r_max_used = float(r_max)
-        if not np.isfinite(r_max_used) or r_max_used <= 0:
-            raise ValueError("r_max must be a positive finite value.")
-
-        # 2) Determine output_shape = (n_r, n_theta)
-        if output_shape is None:
-            n_r = max(1, int(np.ceil(r_max_used)))
-            n_theta = max(4, int(np.ceil(2 * np.pi * r_max_used)))
-        else:
-            n_r, n_theta = output_shape
-            n_r = int(n_r)
-            n_theta = int(n_theta)
-        if n_r <= 0 or n_theta <= 0:
-            raise ValueError("output_shape must contain positive integers.")
+        (cy, cx), r_max_used, (n_r, n_theta) = _polar_spec(
+            (height, width), center, r_max, output_shape,
+        )
 
         # 3) Precompute the polar→Cartesian mapping grid
         #    Radial values from 0 to r_max_used in n_r steps
@@ -13388,6 +10560,7 @@ class HyperData:
             'axis_order': ('radius', 'theta'),
             'radius_range': (0.0, r_max_used),
             'radius_range_pixels': (0.0, r_max_used),
+            'radius_support_range_pixels': (0.0, r_max_used),
             'radius_display_range': (
                 0.0,
                 r_max_used * radius_unit_scale,
@@ -13399,6 +10572,7 @@ class HyperData:
             'radius_sample_step_pixels': radius_sample_step_pixels,
             'radius_sample_step': radius_sample_step_pixels * radius_unit_scale,
             'theta_range': (0.0, 360.0),
+            'theta_sample_start': 0.0,
             'theta_units': 'deg',
             'theta_step': 360.0 / n_theta,
             'order': order,
@@ -13419,7 +10593,9 @@ class HyperData:
 
         This is an inverse resampling operation, not an exact undo of
         :meth:`to_polar`. Any Cartesian pixels outside the sampled polar
-        ``r_max`` are filled with ``fill_value``.
+        support are filled with ``fill_value``. After cropping, this includes
+        missing inner radii and angular sectors. Stored sample origins and
+        steps are used; a cropped sector is never treated as a full circle.
 
         Parameters
         ----------
@@ -13473,6 +10649,11 @@ class HyperData:
             )
 
         metadata = self.polar_metadata or {}
+        radius, radial_support, theta_support, radial_step, theta_start, theta_step = _polar_grid(
+            metadata, (n_r, n_theta),
+        )
+        if isinstance(order, (bool, np.bool_)) or not isinstance(order, (int, np.integer)) or not 0 <= order <= 5:
+            raise ValueError('order must be an integer from 0 to 5.')
         use_original_canvas = False
         if output_shape is None:
             output_shape = (2 * n_r, 2 * n_r)
@@ -13486,11 +10667,7 @@ class HyperData:
                     "contain 'cartesian_shape'."
                 )
             use_original_canvas = True
-        height, width = output_shape
-        height = int(height)
-        width = int(width)
-        if height <= 0 or width <= 0:
-            raise ValueError("output_shape must contain positive integers.")
+        height, width = _reciprocal_crop_shape((0, n_r), (0, n_theta), output_shape)
 
         if center is None:
             if use_original_canvas:
@@ -13506,13 +10683,10 @@ class HyperData:
         cy, cx = center
         cy = float(cy)
         cx = float(cx)
+        if not np.all(np.isfinite((cy, cx))):
+            raise ValueError('center must contain finite (y, x) coordinates.')
 
-        r_max = float(
-            metadata.get(
-                'r_max',
-                metadata.get('radius_range_pixels', (0, n_r - 1))[1],
-            )
-        )
+        r_max = float(radial_support[1])
         if not np.isfinite(r_max) or r_max <= 0:
             raise ValueError("polar_metadata must define a positive finite r_max.")
 
@@ -13527,24 +10701,28 @@ class HyperData:
         dy = y_grid - cy
         dx = x_grid - cx
         radius_grid = np.sqrt(dx**2 + dy**2)
-        theta_grid = np.mod(np.arctan2(dy, dx), 2 * np.pi)
-
-        if n_r > 1:
-            radius_coord = radius_grid * (n_r - 1) / output_radius_pixels
-        else:
-            radius_coord = np.zeros_like(radius_grid)
-        theta_coord = theta_grid * n_theta / (2 * np.pi)
-        theta_coord = np.mod(theta_coord, n_theta)
-
-        # Add one wrapped theta column so angular interpolation is continuous
-        # at 0/360 without wrapping the radial axis.
-        theta_coord_padded = theta_coord.copy()
-        theta_coord_padded[theta_coord_padded >= n_theta] -= n_theta
+        source_radius = radius_grid * r_max / output_radius_pixels
+        radius_coord = (
+            (source_radius - radius[0]) / radial_step if radial_step > 0
+            else np.zeros_like(radius_grid)
+        )
+        theta_degrees = np.degrees(np.arctan2(dy, dx))
+        theta_unwrapped = theta_support[0] + np.mod(theta_degrees - theta_support[0], 360.0)
+        theta_coord = (theta_unwrapped - theta_start) / theta_step
+        periodic = np.isclose(theta_support[1] - theta_support[0], 360.0)
+        if periodic:
+            theta_coord %= n_theta
+        # Only theta wraps. Radial edge samples extend to their declared
+        # support after averaging, but missing annuli/sectors stay filled.
+        angular_pad = max(1, order + 1)
         coords = np.vstack((
             radius_coord.ravel(),
-            theta_coord_padded.ravel(),
+            theta_coord.ravel() + angular_pad,
         ))
-        outside_support = radius_grid.ravel() > output_radius_pixels
+        outside_support = (source_radius < radial_support[0]) | (source_radius > radial_support[1])
+        if not periodic:
+            outside_support |= theta_unwrapped >= theta_support[1]
+        outside_support = outside_support.ravel()
 
         output_dtype = arr.dtype if order == 0 else np.result_type(arr.dtype, np.float32)
         if A is not None:
@@ -13562,16 +10740,15 @@ class HyperData:
                 )
             for i, j in iterator:
                 polar_img = arr[i, j].astype(output_dtype, copy=False)
-                polar_for_interp = np.concatenate(
-                    (polar_img, polar_img[:, :1]),
-                    axis=1,
+                polar_for_interp = np.pad(
+                    polar_img, ((0, 0), (angular_pad, angular_pad)),
+                    mode='wrap' if periodic else 'edge',
                 )
                 cart_flat = map_coordinates(
                     polar_for_interp,
                     coords,
                     order=order,
-                    mode='constant',
-                    cval=fill_value,
+                    mode='nearest',
                 )
                 cart_img = cart_flat.reshape((height, width))
                 if clip:
@@ -13586,16 +10763,15 @@ class HyperData:
             )
             for j in iterator:
                 polar_img = arr[j].astype(output_dtype, copy=False)
-                polar_for_interp = np.concatenate(
-                    (polar_img, polar_img[:, :1]),
-                    axis=1,
+                polar_for_interp = np.pad(
+                    polar_img, ((0, 0), (angular_pad, angular_pad)),
+                    mode='wrap' if periodic else 'edge',
                 )
                 cart_flat = map_coordinates(
                     polar_for_interp,
                     coords,
                     order=order,
-                    mode='constant',
-                    cval=fill_value,
+                    mode='nearest',
                 )
                 cart_img = cart_flat.reshape((height, width))
                 if clip:
@@ -13603,16 +10779,18 @@ class HyperData:
                 cart_img.ravel()[outside_support] = fill_value
                 out_arr[j] = cart_img
 
-        radius_display_range = metadata.get(
-            'radius_display_range',
-            (0.0, r_max),
-        )
-        radius_display_max = float(radius_display_range[1])
+        radius_factor = metadata.get('radius_conv_factor')
+        if radius_factor is None:
+            radius_factor = metadata.get('cartesian_reciprocal_conv_factor')
+        if radius_factor is None:
+            radius_factor = metadata.get('radius_display_range', (0.0, r_max))[1] / r_max
+        if not np.isscalar(radius_factor) or not np.isfinite(radius_factor) or radius_factor <= 0:
+            raise ValueError('Polar radial conversion factor must be positive and finite.')
         reciprocal_units = metadata.get(
             'radius_units',
             metadata.get('cartesian_reciprocal_units'),
         )
-        reciprocal_conv_factor = radius_display_max / output_radius_pixels
+        reciprocal_conv_factor = r_max * radius_factor / output_radius_pixels
         if reciprocal_units is None:
             reciprocal_units = 'pixels'
 
@@ -13849,7 +11027,8 @@ class ReciprocalSpace:
 
     def __init__(self, data, units: str = None, conv_factor: float = None,
                  polar_metadata: dict = None,
-                 center_beam_metadata: dict = None):
+                 center_beam_metadata: dict = None,
+                 cepstral_metadata: dict = None):
         """Store the image and copy optional polar and direct-beam metadata."""
         self.array = data
         self.shape = data.shape
@@ -13857,6 +11036,9 @@ class ReciprocalSpace:
         self.units = None
         self.conv_factor = None
         self.polar_metadata = deepcopy(polar_metadata) if polar_metadata is not None else None
+        self.cepstral_metadata = deepcopy(cepstral_metadata) if cepstral_metadata is not None else None
+        if self.polar_metadata is not None and self.cepstral_metadata is not None:
+            raise ValueError('Cepstral and polar coordinate metadata cannot be combined.')
         self.center_beam_metadata = (
             deepcopy(center_beam_metadata)
             if center_beam_metadata is not None
@@ -13870,6 +11052,11 @@ class ReciprocalSpace:
     def is_polar(self):
         """Return True when this 2D image is in polar ``(kr, ktheta)`` space."""
         return self.polar_metadata is not None
+
+    @property
+    def is_cepstral(self):
+        """Return True for EWPC/Fourier-conjugate pattern axes."""
+        return self.cepstral_metadata is not None
 
     def set_scale(self, units: str, conv_factor: float):
         """
@@ -13942,10 +11129,18 @@ class ReciprocalSpace:
         """
         ky, kx = self.shape
         scale = 1.0 if conv_factor is None else conv_factor
-        half_y = ky / 2.0
-        half_x = kx / 2.0
+        center_y, center_x = self._display_center()
         # With imshow's upper origin, array row 0 belongs at positive ky.
-        return (-half_x * scale, half_x * scale, -half_y * scale, half_y * scale)
+        return (
+            (-center_x - 0.5) * scale, (kx - center_x - 0.5) * scale,
+            (center_y - ky + 0.5) * scale, (center_y + 0.5) * scale,
+        )
+
+    def _display_center(self):
+        """Return the FFT zero for cepstral data, otherwise the image midpoint."""
+        if self.is_cepstral:
+            return tuple(self.cepstral_metadata['center_px'])
+        return tuple((size - 1) / 2 for size in self.shape)
 
     def _polar_axis_info(self, axis_units='auto'):
         """Return imshow extent and labels for polar ``(kr, ktheta)`` data."""
@@ -14002,12 +11197,18 @@ class ReciprocalSpace:
 
         radius_unit_text = self._format_unit_text(radius_units)
         theta_unit_text = self._format_unit_text(theta_units)
+        radius_sample_start = radius_min
+        if radius_min == radius_max:
+            support = metadata.get('radius_support_range_pixels', (radius_min, radius_max))
+            display_scale = source_factor if mode != 'pixels' and source_factor is not None else 1.0
+            radius_min, radius_max = np.asarray(support) * display_scale
         extent = (theta_min, theta_max, radius_max, radius_min)
-        return extent, theta_unit_text, radius_unit_text, radius_min, radius_sample_step
+        return extent, theta_unit_text, radius_unit_text, radius_sample_start, radius_sample_step
 
     def _spawn(self, data, units=_SCALE_UNSET, conv_factor=_SCALE_UNSET,
                polar_metadata=_SCALE_UNSET,
-               center_beam_metadata=_SCALE_UNSET):
+               center_beam_metadata=_SCALE_UNSET,
+               cepstral_metadata=_SCALE_UNSET):
         """Create a new ReciprocalSpace object while preserving calibration."""
         if units is _SCALE_UNSET:
             units = self.units
@@ -14017,11 +11218,14 @@ class ReciprocalSpace:
             polar_metadata = self.polar_metadata
         if center_beam_metadata is _SCALE_UNSET:
             center_beam_metadata = self.center_beam_metadata
+        if cepstral_metadata is _SCALE_UNSET:
+            cepstral_metadata = self.cepstral_metadata if tuple(data.shape) == tuple(self.shape) else None
         return ReciprocalSpace(
             data,
             units=units,
             conv_factor=conv_factor,
             polar_metadata=deepcopy(polar_metadata) if polar_metadata is not None else None,
+            cepstral_metadata=cepstral_metadata,
             center_beam_metadata=(
                 deepcopy(center_beam_metadata)
                 if center_beam_metadata is not None
@@ -14197,6 +11401,8 @@ class ReciprocalSpace:
             reciprocal-space calibration when available and otherwise falls
             back to pixels. For polar data, calibrated display uses ``kr`` in
             the source reciprocal units and ``ktheta`` in degrees.
+            EWPC data uses cepstral ``cy/cx`` pixel axes and the recorded FFT
+            zero, not diffraction units or the geometric image midpoint.
         mode : {'cartesian', 'polar'}, optional
             ``'cartesian'`` preserves the current rectangular display,
             including an angle-versus-radius view for stored polar data.
@@ -14245,6 +11451,8 @@ class ReciprocalSpace:
             )
         if mode not in ('cartesian', 'polar'):
             raise ValueError("mode must be 'cartesian' or 'polar'.")
+        if self.is_cepstral and title == 'Diffraction Pattern':
+            title = 'EWPC'
         if mode == 'polar' and grid_ticks is not None:
             raise ValueError("grid_ticks applies only to rectangular mode.")
         if mode == 'cartesian' and (radial_ticks is not None or angular_ticks is not None):
@@ -14342,8 +11550,8 @@ class ReciprocalSpace:
                 radius_max = float(extent[2])
             else:
                 ky, kx = self.shape
-                center_y, center_x = (ky - 1) / 2.0, (kx - 1) / 2.0
-                radius_max_pixels = min(center_y, center_x)
+                center_y, center_x = self._display_center()
+                radius_max_pixels = min(center_y, center_x, ky - 1 - center_y, kx - 1 - center_x)
                 if radius_max_pixels <= 0:
                     raise ValueError("A circular view requires at least a 2x2 image.")
                 n_radius = max(2, int(np.ceil(radius_max_pixels)) + 1)
@@ -14419,15 +11627,14 @@ class ReciprocalSpace:
             if self.is_polar:
                 metadata = self.polar_metadata or {}
                 theta_step = metadata.get('theta_step', 360.0 / self.shape[1])
-                theta_min = metadata.get('theta_range', (0.0, 360.0))[0]
+                theta_min = metadata.get('theta_sample_start', metadata.get('theta_range', (0.0, 360.0))[0])
                 angle_coords = theta_min + coords[:, 1] * theta_step
                 radius_coords = radius_axis_start + coords[:, 0] * radius_sample_step
                 x_coords = np.deg2rad(angle_coords) if mode == 'polar' else angle_coords
                 y_coords = radius_coords
             else:
                 plot_scale = 1.0 if conv_factor is None else conv_factor
-                center_y = (self.shape[0] - 1) / 2.0
-                center_x = (self.shape[1] - 1) / 2.0
+                center_y, center_x = self._display_center()
                 delta_y = coords[:, 0] - center_y
                 delta_x = coords[:, 1] - center_x
                 if mode == 'polar':
@@ -14466,6 +11673,7 @@ class ReciprocalSpace:
                         color=grid_color, alpha=grid_alpha, linewidth=0.8, zorder=2.5,
                     )
             if axes:
+                radial_symbol = 'c_r' if self.is_cepstral else 'k_r'
                 ax.set_rlabel_position(145)
                 for tick_label in ax.get_yticklabels():
                     tick_label.set_color('white')
@@ -14474,7 +11682,7 @@ class ReciprocalSpace:
                         path_effects.Normal(),
                     ])
                 ax.set_title(
-                    f"{title}  ($k_r$: {radius_unit_text})",
+                    f"{title}  (${radial_symbol}$: {radius_unit_text})",
                     fontsize=16, pad=28,
                 )
             else:
@@ -14501,6 +11709,9 @@ class ReciprocalSpace:
                 if self.is_polar:
                     ax.set_xlabel(rf"$k_\theta$ ({theta_unit_text})", fontsize=14)
                     ax.set_ylabel(rf"$k_r$ ({radius_unit_text})", fontsize=14)
+                elif self.is_cepstral:
+                    ax.set_xlabel(rf"$c_x$ ({axis_unit_text})", fontsize=14)
+                    ax.set_ylabel(rf"$c_y$ ({axis_unit_text})", fontsize=14)
                 else:
                     ax.set_xlabel(rf"$k_x$ ({axis_unit_text})", fontsize=14)
                     ax.set_ylabel(rf"$k_y$ ({axis_unit_text})", fontsize=14)
@@ -14638,14 +11849,23 @@ class ReciprocalSpace:
         Parameters
         ----------
         kylim : int, float, or tuple, optional
-            Vertical reciprocal-space limits. Can be float for subpixel cropping.
+            Vertical half-open limits in pixel units. Floating-point bounds
+            retain their actual subpixel offsets. A scalar selects a
+            one-pixel-wide window starting at that coordinate.
         kxlim : int, float, or tuple, optional
-            Horizontal reciprocal-space limits. Can be float for subpixel cropping.
+            Horizontal half-open limits in pixel units, with the same
+            coordinate convention as ``kylim``.
         kshape : tuple of (int, int), optional
             Output shape (A, B) for resizing the cropped pattern.
-            If not provided, inferred from crop size.
+            Defaults to the rounded requested extent on each axis, with a
+            minimum of one pixel. Output pixel j samples
+            ``start + (j + 0.5) * (stop - start) / output_size - 0.5``.
+            A four-pixel window (1.2, 5.2) therefore samples
+            1.2, 2.2, 3.2, 4.2. Downsampling is anti-aliased.
             Interpolating integer data returns floating-point output. A crop
             that needs no interpolation retains the original dtype.
+            Polar crops update their sampled radii/angles and support. Partial
+            angular sectors cannot be periodically rotated as full circles.
     
         Returns
         -------
@@ -14653,82 +11873,46 @@ class ReciprocalSpace:
             New object containing the cropped (and optionally resized) diffraction pattern.
         """
     
-        def parse_limits(limits, max_length):
-            if limits is None:
-                return (0, max_length)
-            elif isinstance(limits, (int, float)):
-                if limits < 0 or limits > max_length:
-                    raise ValueError("Index out of bounds")
-                return (limits, limits + 1)
-            elif isinstance(limits, tuple):
-                start, end = limits
-                if start < 0 or end > max_length:
-                    raise ValueError("Invalid range or out of bounds")
-                return (start, end)
-            else:
-                raise ValueError("Limits must be int, float, tuple, or None")
-    
         # --- Parse reciprocal-space limits ---
         ky, kx = self.shape
-        kylim_range = parse_limits(kylim, ky)
-        kxlim_range = parse_limits(kxlim, kx)
+        kylim_range = _parse_reciprocal_crop_limits(
+            kylim, ky, name='kylim', allow_fractional_index=True,
+        )
+        kxlim_range = _parse_reciprocal_crop_limits(
+            kxlim, kx, name='kxlim', axis=1, allow_fractional_index=True,
+        )
     
         # Integer boundaries for extraction
         y0, y1 = int(np.floor(kylim_range[0])), int(np.ceil(kylim_range[1]))
         x0, x1 = int(np.floor(kxlim_range[0])), int(np.ceil(kxlim_range[1]))
     
         # Detect if subpixel cropping is requested
-        subpixel = not all(isinstance(v, int) for v in kylim_range + kxlim_range)
+        subpixel = not all(
+            float(value).is_integer() for value in kylim_range + kxlim_range
+        )
     
         # Default output shape
-        if kshape is None:
-            A = int(round(kylim_range[1] - kylim_range[0]))
-            B = int(round(kxlim_range[1] - kxlim_range[0]))
-            kshape = (A, B)
+        kshape = _reciprocal_crop_shape(kylim_range, kxlim_range, kshape)
     
         if kshape[0] != kshape[1]:
             print(f"Warning: Non-square output shape {kshape}. Proceeding anyway.")
     
-        # --- Extract raw region ---
-        cropped = self.array[y0:y1, x0:x1]
-    
-        new_conv_factor = self.conv_factor
-
-        # --- Handle subpixel or resize ---
-        if subpixel or kshape != cropped.shape:
-            if self.conv_factor is not None:
-                y_scale = (kylim_range[1] - kylim_range[0]) / kshape[0]
-                x_scale = (kxlim_range[1] - kxlim_range[0]) / kshape[1]
-
-                if np.isclose(y_scale, x_scale):
-                    new_conv_factor = self.conv_factor * x_scale
-                else:
-                    print("Warning: anisotropic resizing cleared the stored reciprocal-space calibration.")
-                    new_conv_factor = None
-
-            resize_dtype = np.result_type(cropped.dtype, np.float32)
-            cropped = transform.resize(
-                cropped.astype(resize_dtype, copy=False), kshape,
-                order=1, mode='reflect', anti_aliasing=True,
-                preserve_range=True,
-            )
-
-        new_units = self.units if new_conv_factor is not None else None
-        geometry_changed = (y0, y1, x0, x1) != (0, ky, 0, kx) or (
-            subpixel or kshape != (ky, kx)
+        cropped = _resample_reciprocal_crop(
+            self.array, kylim_range, kxlim_range, kshape,
         )
-        beam_metadata = self.center_beam_metadata
-        if geometry_changed:
-            beam_metadata = None if subpixel or self.polar_metadata is not None else (
-                _resampled_center_beam_metadata(
-                    self.center_beam_metadata, (ky, kx), cropped.shape,
-                    crop_origin=(y0, x0), crop_shape=(y1 - y0, x1 - x0),
-                    units=new_units, conv_factor=new_conv_factor,
-                )
-            )
+        geometry = _transform_geometry(
+            {'reciprocal_units': self.units, 'reciprocal_conv_factor': self.conv_factor,
+             'polar_metadata': self.polar_metadata, 'cepstral_metadata': self.cepstral_metadata,
+             'center_beam_metadata': self.center_beam_metadata},
+            self.shape, cropped.shape, 'crop',
+            reciprocal_bounds=(kylim_range, kxlim_range),
+        )
         return self._spawn(
-            cropped, units=new_units, conv_factor=new_conv_factor,
-            center_beam_metadata=beam_metadata,
+            cropped, units=geometry['reciprocal_units'],
+            conv_factor=geometry['reciprocal_conv_factor'],
+            center_beam_metadata=geometry['center_beam_metadata'],
+            polar_metadata=geometry['polar_metadata'],
+            cepstral_metadata=geometry['cepstral_metadata'],
         )
     
     def get_spotCenter(self, ky, kx, r, method='CoM', plotSpot=False,):
@@ -14831,6 +12015,7 @@ class ReciprocalSpace:
                         method='CoM',
                         compute_resBg=False,
                         residual_frac=0.9,
+                        *, _array=None,
                         **resBg_kwargs):
         """
         Integrate Bragg intensities in circular windows around peak centers.
@@ -14839,14 +12024,23 @@ class ReciprocalSpace:
         to the detector boundaries; no pixels wrap around an image edge. When
         subtracting residual background, the correction uses the number of
         pixels actually included in each integration window.
+        The private _array fast path requires supplied centers and does not
+        support residual-background inference; it never changes this object's
+        array, calibration or detector state.
         """
     
+        array = self.array if _array is None else np.asarray(_array)
+        if _array is not None:
+            if array.shape != self.shape or array.ndim != 2 or array.dtype.kind not in 'biuf':
+                raise ValueError('_array must be a real-valued pattern matching the detector shape.')
+            if centers is None or compute_resBg:
+                raise ValueError('_array requires explicit centers and compute_resBg=False.')
         if centers is None:
             centers = self.get_centers(r, ref_coords=ref_coords, method=method)
     
         if compute_resBg:
             ints, pixel_counts = _peak_intensities_from_array(
-                self.array, r, centers, return_pixel_counts=True
+                array, r, centers, return_pixel_counts=True
             )
             res_bg = self.get_residualBg(centers=centers, **resBg_kwargs)
             correction = np.zeros_like(ints)
@@ -14855,7 +12049,7 @@ class ReciprocalSpace:
             )
             ints -= correction * residual_frac
         else:
-            ints = _peak_intensities_from_array(self.array, r, centers)
+            ints = _peak_intensities_from_array(array, r, centers)
                 
         return ints
     
@@ -15169,106 +12363,33 @@ class ReciprocalSpace:
         July 2025
         """
 
-        def _finite_scalar(value, name, *, positive=False, nonnegative=False):
-            if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
-                raise ValueError(f"{name} must be a finite scalar.")
-            try:
-                value = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a finite scalar.") from exc
-            if not np.isfinite(value):
-                raise ValueError(f"{name} must be a finite scalar.")
-            if positive and value <= 0:
-                raise ValueError(f"{name} must be positive.")
-            if nonnegative and value < 0:
-                raise ValueError(f"{name} must be non-negative.")
-            return value
-
         if self.is_polar:
             raise ValueError(
                 "get_peaks requires a Cartesian diffraction pattern; "
                 "convert polar data to Cartesian coordinates first."
             )
         dp = np.asarray(self.array if _array is None else _array)
-        if dp.ndim != 2 or not (
-            np.issubdtype(dp.dtype, np.number)
-            or np.issubdtype(dp.dtype, np.bool_)
-        ) or np.iscomplexobj(dp):
+        if dp.ndim != 2 or dp.dtype.kind not in 'biuf' or np.iscomplexobj(dp):
             raise TypeError("get_peaks requires a real-valued 2D numeric pattern.")
         if dp.shape != self.shape:
             raise ValueError("Peak detector pattern shape differs from its search geometry.")
-        if not isinstance(return_details, (bool, np.bool_)):
-            raise ValueError("return_details must be a Boolean value.")
-
-        radius = _finite_scalar(radius, 'radius', positive=True)
-        trench_width = _finite_scalar(
-            trench_width, 'trench_width', positive=True,
+        parameters = _validate_peak_options(
+            radius, min_distance, trench_width, kernel_amp, trench_amp,
+            threshold_abs, threshold_rel, r_range, n_fold, sym_mode,
+            sym_tolerance_px, center_tolerance_px, orbit_min_fraction,
+            reorder, return_details,
         )
-        kernel_amp = _finite_scalar(kernel_amp, 'kernel_amp')
-        trench_amp = _finite_scalar(trench_amp, 'trench_amp')
-        if kernel_amp <= trench_amp:
-            raise ValueError("kernel_amp must exceed trench_amp.")
-        if isinstance(min_distance, (bool, np.bool_)) or not isinstance(
-            min_distance, (Integral, np.integer)
-        ) or min_distance < 1:
-            raise ValueError("min_distance must be a positive integer.")
-        min_distance = int(min_distance)
-
-        if threshold_abs is not None:
-            threshold_abs = _finite_scalar(threshold_abs, 'threshold_abs')
-        if threshold_rel is not None:
-            threshold_rel = _finite_scalar(
-                threshold_rel, 'threshold_rel', nonnegative=True,
-            )
-            if threshold_rel > 1:
-                raise ValueError("threshold_rel must be between 0 and 1.")
-
+        radius = parameters['radius']
+        min_distance = parameters['min_distance']
+        trench_width = parameters['trench_width']
+        kernel_amp, trench_amp = parameters['kernel_amp'], parameters['trench_amp']
+        threshold_abs, threshold_rel = parameters['threshold_abs'], parameters['threshold_rel']
+        r_range, n_fold = parameters['r_range'], parameters['n_fold']
+        sym_tolerance_px = parameters['sym_tolerance_px']
+        center_tolerance_px = parameters['center_tolerance_px']
+        orbit_min_fraction = parameters['orbit_min_fraction']
         if r_range is not None:
-            try:
-                limits = np.asarray(r_range, dtype=float)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "r_range must be a finite (r_min, r_max) pair."
-                ) from exc
-            if (
-                limits.shape != (2,) or not np.all(np.isfinite(limits))
-                or limits[0] < 0 or limits[0] >= limits[1]
-            ):
-                raise ValueError(
-                    "r_range must satisfy 0 <= r_min < r_max."
-                )
-            r_min, r_max = map(float, limits)
-
-        if n_fold is not None and (
-            isinstance(n_fold, (bool, np.bool_))
-            or not isinstance(n_fold, (Integral, np.integer))
-            or n_fold < 1
-        ):
-            raise ValueError("n_fold must be a positive integer or None.")
-        if not isinstance(sym_mode, str) or sym_mode not in (
-            'none', 'repair', 'prune', 'both'
-        ):
-            raise ValueError(
-                "sym_mode must be 'none', 'repair', 'prune', or 'both'."
-            )
-        if sym_mode != 'none' and (n_fold is None or n_fold < 2):
-            raise ValueError("sym_mode requires n_fold >= 2.")
-        if not isinstance(reorder, (bool, np.bool_)):
-            raise ValueError("reorder must be a Boolean value.")
-        if reorder and (n_fold is None or n_fold < 2):
-            raise ValueError("reorder=True requires n_fold >= 2.")
-        sym_tolerance_px = _finite_scalar(
-            sym_tolerance_px, 'sym_tolerance_px', positive=True,
-        )
-        center_tolerance_px = _finite_scalar(
-            center_tolerance_px, 'center_tolerance_px', nonnegative=True,
-        )
-        orbit_min_fraction = _finite_scalar(
-            orbit_min_fraction, 'orbit_min_fraction', positive=True,
-        )
-        if orbit_min_fraction > 1:
-            raise ValueError("orbit_min_fraction must be in (0, 1].")
-
+            r_min, r_max = r_range
         Cy, Cx = self._peak_search_center(center)
 
         def _enforce_nfold_symmetry(coords, is_valid):
@@ -16155,12 +13276,15 @@ class RealSpace:
         )
         return self._spawn(self.array[y0:y1, x0:x1], origin=new_origin)
 
-    def resize(self, shape, method='area'):
+    def resize(self, shape, method='area', *, working_memory_mb=None):
         """Resize the image and update pixel spacing and pixel-center origin.
 
         ``method='area'`` computes area-weighted downsampling. ``'linear'``
         and ``'nearest'`` also support upsampling. Pixel values are preserved
         in their original range; integer data may become floating point.
+        Floating output retains its dtype. ``working_memory_mb`` budgets
+        temporary buffers (default 256 MiB), excluding the source and full
+        returned output. The same numerical engine is used by HyperData.
         """
         values = np.asarray(shape, dtype=object)
         if values.shape != (2,) or any(
@@ -16172,25 +13296,10 @@ class RealSpace:
         output_shape = tuple(int(value) for value in values)
         if method not in ('area', 'linear', 'nearest'):
             raise ValueError("method must be 'area', 'linear', or 'nearest'.")
-        if method == 'area':
-            if any(new > old for new, old in zip(output_shape, self.shape)):
-                raise ValueError("method='area' supports downsampling only.")
-            resized = HyperData._resize_area(
-                self.array, output_shape, axes=(0, 1),
-            )
-        else:
-            order = 1 if method == 'linear' else 0
-            resized = transform.resize(
-                self.array.astype(float) if order == 1 and self.array.dtype == bool
-                else self.array,
-                output_shape, order=order, mode='reflect',
-                anti_aliasing=(order > 0 and any(
-                    new < old for new, old in zip(output_shape, self.shape)
-                )),
-                preserve_range=True,
-            )
-            if order == 0:
-                resized = resized.astype(self.array.dtype, copy=False)
+        resized = _resize_array(
+            self.array, output_shape, (0, 1), method,
+            working_memory_mb=working_memory_mb,
+        )
 
         factors = tuple(old / new for old, new in zip(self.shape, output_shape))
         sy, sx = _real_spacing_pair(self.conv_factor)
@@ -17832,13 +14941,18 @@ class _DenoisingMethods:
             Random seed or state to initialize the random number generator.
         
         return_errors : bool, optional, default is False
-            If True, return a list of all errors.
+            If True, return the per-iteration relative reconstruction errors
+            reported by TensorLy's callback. TensorLy 0.10 may estimate these
+            from sampled tensor entries; they are not necessarily exact errors.
         
         verbose : int, optional, default is 0
             Level of verbosity.
         
         callback : callable, optional
-            Function to call at the end of each iteration.
+            Called with the initial decomposition alone, then with the
+            decomposition and relative error after each iteration. Returning
+            True from an iteration callback stops the fit. Error collection
+            preserves these calls and the callback's stopping decision.
         
         implementation : str, optional, default is 'tensorly'
             Implementation to use for the decomposition.
@@ -17855,8 +14969,12 @@ class _DenoisingMethods:
         
         Returns
         -------
-        factors : ndarray list
-            List of positive factors of the CP decomposition. Element i is of shape (tensor.shape[i], rank).
+        ndarray or tuple or list
+            Dense reconstruction by default, or ``(reconstruction, errors)``
+            when ``return_errors=True``. With ``return_decomposition=True``,
+            return ``[weights, factors, reconstruction]``, appending the error
+            history when requested. The initialization callback contributes
+            no entry to that history because it supplies no error.
         
         Notes
         -----
@@ -17875,8 +14993,22 @@ class _DenoisingMethods:
         
         # Conditional implementation
         if implementation == 'tensorly':
-            # Randomised CP decomposition
-            result = rand_parafac(
+            errors = [] if return_errors else None
+            if return_errors:
+                def collect_error(decomposition, relative_error=None):
+                    # Initialization supplies only the decomposition in both
+                    # TensorLy 0.9 and 0.10.
+                    if relative_error is not None:
+                        errors.append(float(relative_error))
+                    if callback is not None:
+                        if relative_error is None:
+                            return callback(decomposition)
+                        return callback(decomposition, relative_error)
+                    return None
+            else:
+                collect_error = callback
+
+            cp_tensor = rand_parafac(
                 tensor,
                 rank=rank,
                 n_samples=n_samples,
@@ -17885,12 +15017,10 @@ class _DenoisingMethods:
                 svd=svd,
                 tol=tol,
                 max_stagnation=max_stagnation,
-                return_errors=return_errors,
                 random_state=random_state,
                 verbose=verbose,
-                callback=callback,
+                callback=collect_error,
             )
-            cp_tensor, errors = self._split_cp_result(result, return_errors)
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         

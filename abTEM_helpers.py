@@ -362,13 +362,30 @@ def add_poisson_noise(array, counts, rng=None):
     return generator.poisson(signal * (counts / total))
     
 
-def show_atoms_top_and_side(atom_model, 
-                              figsize: tuple = (12,4), 
-                              show_cell: bool = True, 
-                              title1: str ='Top View', 
+def show_atoms_top_and_side(atom_model,
+                              figsize: tuple = (12,4),
+                              show_cell: bool = True,
+                              title1: str ='Top View',
                               title2: str ='Side View',
                               ):
-    
+    """Draw top (xy) and side (xz) views of an atomic model.
+
+    Parameters
+    ----------
+    atom_model : ase.Atoms
+        Atomic structure passed to abTEM's ``show_atoms``.
+    figsize : tuple of float, optional
+        Width and height of the two-panel Matplotlib figure in inches.
+    show_cell : bool, optional
+        Draw the unit cell in both views.
+    title1, title2 : str, optional
+        Titles for the top and side panels, respectively.
+
+    Notes
+    -----
+    This function creates a figure as a side effect and does not return it.
+    """
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
     show_atoms(atom_model, ax=ax1, plane='xy', title=title1,show_cell=show_cell)
     show_atoms(atom_model, ax=ax2, plane='xz', title=title2,show_cell=show_cell)
@@ -467,13 +484,68 @@ def simDP(atom_model,
           max_frequency=None,
           rotZ=None,
           title='Simulated Diffraction Pattern'):
+    """Simulate one diffraction pattern and optionally display it.
 
-    cbed_pattern = simulate_diff(atom_model, 
+    Parameters
+    ----------
+    atom_model : ase.Atoms
+        Atomic structure supplied to :func:`simulate_diff`.
+    theta_tilt, phi_rot : float, optional
+        Model tilt and azimuth in degrees, following the default units of
+        :func:`simulate_diff`.
+    plot : bool, optional
+        Display the simulated pattern using :func:`plotDP`.
+    vmin, vmax : float, optional
+        Display limits for the plot; they do not change the returned data.
+    r : int or None, optional
+        Half-width of the centered plot crop and, when ``crop=True``, of the
+        returned array crop. Required if ``crop=True``.
+    crop : bool, optional
+        Crop the returned array around its center after simulation.
+    resize_dim : tuple or None, optional
+        Currently unused; this function does not resize its output.
+    gpts : int, optional
+        Grid points passed to :func:`simulate_diff`.
+    energy : float, optional
+        Electron energy in eV.
+    semiangle_cutoff : float, optional
+        Probe convergence semiangle in mrad.
+    sampling_potential, slice_thickness, sampling_probe : float, optional
+        Simulation sampling and slice parameters in angstroms.
+    device : str, optional
+        Computation device passed to :func:`simulate_diff`.
+    max_angle : float or None, optional
+        Maximum scattering angle passed to :func:`simulate_diff`.
+    max_frequency : None, optional
+        Unsupported. Passing a value raises ``ValueError``; use
+        ``max_angle`` to constrain the simulated angular range.
+    rotZ : float or None, optional
+        In-plane model rotation in degrees; ``None`` means no rotation.
+    log01 : bool, optional
+        Display the logarithm of intensity when plotting.
+    cmap : str, optional
+        Matplotlib colormap for the plot.
+    title : str, optional
+        Plot title.
+
+    Returns
+    -------
+    numpy.ndarray
+        Simulated diffraction intensity array, transposed relative to the
+        abTEM measurement. It is cropped only when ``crop=True``.
+    """
+
+    if max_frequency is not None:
+        raise ValueError("max_frequency is not supported; use max_angle instead.")
+    if crop and r is None:
+        raise ValueError("r must be provided when crop=True.")
+
+    cbed_pattern = simulate_diff(atom_model,
                                  theta_tilt=theta_tilt, phi_rot=phi_rot, 
                                  energy=energy, semiangle_cutoff=semiangle_cutoff, 
                                  sampling_potential=sampling_potential,slice_thickness=slice_thickness,
                                  sampling_probe=sampling_probe,gpts=gpts,device=device,
-                                 max_angle=max_angle, max_frequency=max_frequency,rotZ=rotZ)
+                                 max_angle=max_angle, rotZ=0 if rotZ is None else rotZ)
     
     # ky, kx = cbed_pattern.array.shape
     # (cbed_pattern**0.15).show()
@@ -504,202 +576,140 @@ def simDP(atom_model,
     return diff_image
 
 def make_mask(center, r, mask_dim=(128,128)):
-    """
-    Create a mask at a defined radius from a point (center of spot)
-    """
-    
-    mask = np.zeros(mask_dim)
-    y, x = center
-    for i in range(mask_dim[0]):
-        for j in range(mask_dim[1]):
-            if (i-y)**2 + (j-x)**2 <= r**2:
-                mask[i][j] = 1
+    """Return the main circular mask, retaining the simulation helper's float dtype."""
+    from fourdenoise import make_mask as main_make_mask
 
-    return mask
+    coordinates, radii = _select_peak_inputs([center], r, None, name='center')
+    if (
+        not isinstance(mask_dim, (tuple, list, np.ndarray))
+        or np.ndim(mask_dim) != 1
+        or len(mask_dim) != 2
+    ):
+        raise ValueError("mask_dim must be a positive integer (height, width) pair.")
+    dimensions = tuple(_positive_peak_count(value, 'mask_dim') for value in mask_dim)
+    return main_make_mask(coordinates[0], radii[0], mask_dim=dimensions).astype(float)
 
-def extract_spot_features(dp, min_sigma=0.85, 
-                          max_sigma=2.5, 
-                          num_sigma=100, 
-                          threshold=85,
-                          bg_frac=0.99,
-                          mask_radial_frac=0.9,
-                          min_distance_factor=0.8,
-                          max_distance_factor=1.5,
-                          search_radius_factor=2.5, # When refining centers of mass
-                          iterations=5,
-                          n_estimators = 60, learning_rate = 0.1, max_depth = 50, # Predictor model parameters
-                          radii_multiplier=1.5, radii_slope=1.38,
-                          vmin=5,vmax=16, get_bg = True,
-                          plotAxes=False,plotInput=False,plotCenters=True,plotBg=False,plotResult=True,):
-    
-    A, B = dp.shape
-    # mask = make_mask((A//2,B//2), r=(A+B)//4*mask_radial_frac, mask_dim=(A,B)) # Define region where spots are to be found
-    
-    # Extract centers and radii automatically
-    # blobs_log = feature.blob_log(dp*mask, min_sigma=min_sigma, 
-    blobs_log = feature.blob_log(dp, min_sigma=min_sigma, 
-                                 max_sigma=max_sigma, 
-                                 num_sigma=num_sigma, 
-                                 threshold=threshold,overlap=0)
-    # Unpack values
-    r_vals = blobs_log[:,2]
-    blobs_array = np.array(blobs_log[:, :2])
-    
-    # Calculate pairwise distances between blobs. The result is a square matrix.
-    distances = cdist(blobs_array, blobs_array)
-    
-    # Set diagonal to np.inf to ignore self-comparison.
-    np.fill_diagonal(distances, np.inf)
-    # Find the distance to the nearest neighbor for each blob.
-    nearest_neighbor_dist = distances.min(axis=1)
 
-    # Define your distance thresholds.
-    min_threshold = np.mean(np.min(distances,axis=0))*min_distance_factor  # Minimum acceptable distance to the nearest neighbor.
-    max_threshold = np.mean(np.min(distances,axis=0))*max_distance_factor  # Maximum acceptable distance to the nearest neighbor.
+def _positive_peak_count(value, name):
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer.")
+    return int(value)
 
-    # Filter blobs. Keep a blob if its nearest neighbor is neither too close nor too far.
-    filtered_indices = np.where((nearest_neighbor_dist >= min_threshold) 
-                                & (nearest_neighbor_dist <= max_threshold)
-                                & (((blobs_array[:,0]-A//2)**2+(blobs_array[:,1]-B//2)**2)**.5 <= (A+B)//4*mask_radial_frac*(8/9)))[0]
 
-    # Apply filter
-    blobs_log = np.zeros((len(filtered_indices), 3))
-    blobs_log[:, :2] = blobs_array[filtered_indices]
-    blobs_log[:, 2] = r_vals[filtered_indices]
-    
-        
-    # Refine peak centers using CoM
-    peak_centers = getCenters(dp,r=blobs_log[:,2]*search_radius_factor,
-                              coords=blobs_log[:,:2], iterations=iterations)
-    
-    if plotCenters:
-    
-        plt.figure(figsize=(10, 10))
-        plt.imshow(np.log(dp), cmap='turbo',vmin=vmin,vmax=vmax)
-        plt.axis('off')
-    
-        # Circle around each blob
-        for idx, blob in enumerate(blobs_log):
-            y, x, r = blob
-            y , x = peak_centers[idx]
-            c = plt.Circle((x, y), r, color='red', linewidth=2, fill=False)
-            plt.gca().add_patch(c)
-    
-        plt.show()
-    
-    distance_to_center = np.linalg.norm(peak_centers-(A+B)//4,axis=1)
-    radii = blobs_log[:,2]*radii_multiplier + radii_slope*(1 - distance_to_center/np.max(distance_to_center))
-    
-    if get_bg:
-        # Masks sizes are based on computed radius of spot and distance to center (center spots with greater radius than far spots)
-        dp_bg = predict_values(dp,centers=peak_centers,radius=radii,
-                               n_estimators=n_estimators,learning_rate=learning_rate, max_depth=max_depth)
+def _reciprocal_pattern(data, name):
+    from fourdenoise import ReciprocalSpace
 
-    if plotInput:
-        plotDP(dp, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
-    
-    if plotBg and get_bg:
-        plotDP(dp_bg, vmin=vmin,vmax=vmax,plotAxes=plotAxes)
+    try:
+        array = np.asarray(data)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a nonempty real-valued 2D diffraction pattern.") from exc
+    if array.ndim != 2 or 0 in array.shape or array.dtype.kind not in 'biuf':
+        raise ValueError(f"{name} must be a nonempty real-valued 2D diffraction pattern.")
+    return ReciprocalSpace(array)
 
-    if plotResult:
-        plotDP(rem_negs(dp-bg_frac*dp_bg), vmin=vmin,vmax=vmax,plotAxes=plotAxes,
-               title=f'ne={n_estimators},learning_rate={learning_rate}, max_depth={max_depth}')
-    
-    if get_bg:
-        return peak_centers, radii, dp_bg
-    else:
-        return peak_centers, radii
 
-def getCenters(dp_data, spots_order=None, r=6, coords=None, num_spots_per_order=6, 
-               plotSpots=False, iterations=1):
-    """
-    Generate an array spot centers for any DP
-    """
-    
-    assert len(dp_data.shape) == 2, "'dp_data' must be of 2-dimensional"
-    
+def _select_peak_inputs(coords, r, spots_order, num_spots_per_order=6,
+                        *, name='coords', allow_selected=False):
+    """Adapt simulation order selections to the main peak-analysis inputs."""
+    from fourdenoise import _peak_radii
+
+    try:
+        coordinates = np.asarray(coords)
+        if np.iscomplexobj(coordinates):
+            raise ValueError("Coordinates must be real.")
+        coordinates = np.asarray(coordinates, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must have shape (N, 2) with finite (ky, kx) coordinates.") from exc
+    if (
+        coordinates.ndim != 2
+        or coordinates.shape[1] != 2
+        or not np.all(np.isfinite(coordinates))
+    ):
+        raise ValueError(f"{name} must have shape (N, 2) with finite (ky, kx) coordinates.")
+
+    count = _positive_peak_count(num_spots_per_order, 'num_spots_per_order')
+    selection = slice(None)
+    selected_count = len(coordinates)
     if spots_order is not None:
-        
-        # Define spot indeces to extract
-        spot_adder = (spots_order - 1)*num_spots_per_order
-    
-        order_centers = np.zeros((num_spots_per_order, 2))
-        for j in range(num_spots_per_order):
-            order_centers[j] = getSpotCenter(coords[j + spot_adder][0],
-                                             coords[j + spot_adder][1],
-                                             r, dp_data, plotSpots,iterations=iterations)
-            
+        order = _positive_peak_count(spots_order, 'spots_order')
+        if order > 4:
+            raise ValueError("spots_order must be 1, 2, 3, 4 (all three orders), or None.")
+        start, stop = (0, 3 * count) if order == 4 else ((order - 1) * count, order * count)
+        selected_count = stop - start
+        if not (allow_selected and len(coordinates) == selected_count):
+            if len(coordinates) < stop:
+                raise ValueError(f"{name} must contain at least {stop} peaks for spots_order={order}.")
+            selection = slice(start, stop)
+
+    try:
+        radii = np.asarray(r)
+        if np.iscomplexobj(radii):
+            raise ValueError("Radii must be real.")
+        radii = np.asarray(radii, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("r must be a scalar or contain one finite non-negative radius per peak.") from exc
+    if not np.all(np.isfinite(radii)) or np.any(radii < 0):
+        raise ValueError("r must contain only finite non-negative radii.")
+    if radii.ndim == 1 and radii.shape == (len(coordinates),):
+        radii = _peak_radii(radii, len(coordinates))[selection]
     else:
-        
-        order_centers = np.zeros((len(coords), 2))
-        
-        for j in range(len(coords)):
-            order_centers[j] = getSpotCenter(coords[j][0],
-                                             coords[j][1],
-                                             r[j], dp_data, plotSpots,iterations=iterations)
-        
-    return order_centers
+        radii = _peak_radii(radii, selected_count)
+    return coordinates[selection], radii
+
+def getCenters(dp_data, spots_order=None, r=6, coords=None, num_spots_per_order=6,
+               plotSpots=False, iterations=1):
+    """Refine simulation peaks using :meth:`fourdenoise.ReciprocalSpace.get_centers`.
+
+    ``coords`` contains ``(ky, kx)`` pairs. Orders 1-3 select consecutive
+    ``num_spots_per_order`` groups; order 4 selects all three groups, and
+    ``None`` selects every coordinate. ``r`` is a scalar (default 6) or one
+    radius per input or selected peak. Each iteration refines the previous
+    centers using the main helper's center-of-mass and plotting semantics.
+    """
+    pattern = _reciprocal_pattern(dp_data, 'dp_data')
+    iterations = _positive_peak_count(iterations, 'iterations')
+    centers, radii = _select_peak_inputs(coords, r, spots_order, num_spots_per_order)
+    for _ in range(iterations):
+        centers = pattern.get_centers(radii, ref_coords=centers, show=plotSpots)
+    return centers
 
 
 def getSpotCenter(ky, kx, r, diff_data, plotSpot=False, iterations=1):
-    """
-    Find the center of mass (of pixel intensities) of a diffraction spot, 
-    allowing for non-integer radii.
-    """
-    
-    # Pad and round up to ensure the entire radius is accommodated
-    pad_width = int(np.ceil(r))
-    padded_data = np.pad(diff_data, pad_width=pad_width, mode='constant')
+    """Refine one ``(ky, kx)`` peak with the main local-window CoM helper.
 
-    # Adjustment of padding coordinates
-    ky_padded, kx_padded = ky + pad_width, kx + pad_width
-    
-    # Determine the size of the area to extract based on r, ensuring it matches the mask's dimensions
-    area_size = int(np.ceil(r * 2))
-    if area_size % 2 == 0:
-        area_size += 1  # Ensure the area size is odd to match an odd-sized mask
-        
-    for i in range(iterations):
-        # Generate the circular mask with the correct dimensions
-        mask = circular_mask(area_size // 2, area_size // 2, r)
-        
-        # Extract the region of interest from the padded data
-        ymin, ymax = int(ky_padded - (area_size // 2)), int(ky_padded + (area_size // 2))
-        xmin, xmax = int(kx_padded - (area_size // 2)), int(kx_padded + (area_size // 2))
-        spot_data = padded_data[ymin:ymax + 1, xmin:xmax + 1]
-    
-        # Check if shapes match, otherwise adjust
-        if spot_data.shape != mask.shape:
-            min_dim = min(spot_data.shape[0], mask.shape[0], spot_data.shape[1], mask.shape[1])
-            spot_data = spot_data[:min_dim, :min_dim]
-            mask = mask[:min_dim, :min_dim]
-    
-        # Apply mask and calculate its CoM
-        masked_spot_data = spot_data * mask
-        com_y, com_x = center_of_mass(masked_spot_data)
-        
-        if plotSpot:
-            # Create turbo colormap with 0-values white
-            base_cmap = plt.cm.turbo
-            custom_cmap = ListedColormap(np.concatenate(([np.array([1, 1, 1, 1])], 
-                                                         base_cmap(np.linspace(0, 1, 2**12))[1:]), axis=0))
-            plt.imshow(masked_spot_data, cmap=custom_cmap)
-            plt.colorbar()
-            plt.show()
-        
-        ky_padded = com_y + ymin
-        kx_padded = com_x + xmin
-            
-    # Adjust the CoM to account for padding
-    ky_CoM = ky_padded - pad_width
-    kx_CoM = kx_padded - pad_width
-
-    return ky_CoM, kx_CoM
+    ``r`` may be fractional. ``iterations`` repeats the refinement, and
+    ``plotSpot`` is forwarded to the main helper on every iteration.
+    """
+    pattern = _reciprocal_pattern(diff_data, 'diff_data')
+    iterations = _positive_peak_count(iterations, 'iterations')
+    coordinates, radii = _select_peak_inputs([[ky, kx]], r, None)
+    ky, kx = coordinates[0]
+    for _ in range(iterations):
+        ky, kx = pattern.get_spotCenter(ky, kx, radii[0], plotSpot=plotSpot)
+    return ky, kx
 
 def circular_mask(center_y, center_x, radius):
-    y, x = np.ogrid[-center_y:radius*2-center_y, -center_x:radius*2-center_x]
-    mask = x**2 + y**2 <= radius**2
-    return mask
+    """Return a Boolean disk mask on a ``2*radius`` square grid.
+
+    Parameters
+    ----------
+    center_y, center_x : int
+        Disk center in the generated mask's row and column coordinates.
+    radius : int
+        Disk radius in pixels; the grid extends from zero to twice this size.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        Pixels at distance at most ``radius`` from the specified center.
+    """
+    from fourdenoise import circular_mask as main_circular_mask
+
+    return main_circular_mask(center_y, center_x, radius)
 
 def rem_negs(data):
     """
@@ -711,33 +721,20 @@ def rem_negs(data):
     return data
 
 def getIntensities(data, spots_order=None, center=None, r=6, coords=None):
-    """
-    Extract intensities from a single DP
-    """
+    """Integrate simulation peaks using the main clipped circular windows.
 
-    # Determine how many intensities are to be extracted
-    if type(spots_order) == int:
-        if spots_order == 4:
-            ints = np.zeros(18)
-        elif spots_order < 4:
-            ints = np.zeros(6)
-    
-        if center is None:
-            center = getCenters(data, spots_order, r, coords)
-    
-        for int_idx, intensity in enumerate(ints):
-    
-            masked_data = data*make_mask(center[int_idx], r, mask_dim=(data.shape))
-            ints[int_idx] = np.sum(masked_data[int(center[int_idx][0]-(r+1)):int(center[int_idx][0]+(r+1)),
-                                               int(center[int_idx][1]-(r+1)):int(center[int_idx][1]+(r+1))])
-
-    elif spots_order is None:
-        
-        num_ints = len(coords)
-        ints = np.zeros(num_ints)
-        
-        for int_idx in range(num_ints):
-            masked_data = data*make_mask(center[int_idx], r[int_idx], mask_dim=(data.shape))
-            ints[int_idx] = np.sum(masked_data)
-    
-    return ints
+    ``spots_order`` selects six-spot groups 1-3, or all eighteen spots for
+    order 4. ``None`` selects every peak. ``center`` supplies refined
+    ``(ky, kx)`` pairs, either all peaks or an already selected group; when
+    supplied, ``coords`` is unused. Otherwise ``coords`` is refined by the
+    main helper before integration. ``r`` is a scalar or one radius per
+    input or selected peak.
+    """
+    pattern = _reciprocal_pattern(data, 'data')
+    coordinates, radii = _select_peak_inputs(
+        coords if center is None else center, r, spots_order,
+        name='coords' if center is None else 'center', allow_selected=center is not None,
+    )
+    if center is None:
+        return pattern.get_intensities(radii, ref_coords=coordinates)
+    return pattern.get_intensities(radii, centers=coordinates)

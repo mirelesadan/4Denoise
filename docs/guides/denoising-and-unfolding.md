@@ -1,5 +1,11 @@
 # Denoising and Unfolding
 
+For a runnable comparison, use [Tutorial 4](../tutorials/denoising-and-unfolding.md).
+It defaults to synthetic hexagonal data but accepts experimental/simulation
+files, arrays, or existing objects before the common denoising workflow.
+See [using your own data](../tutorials/using-your-own-data.md) before selecting
+a clean reference or transferring the illustrative filter settings.
+
 The [DEMO notebook](https://github.com/mirelesadan/4Denoise/blob/main/DEMO_exp_4dstem_ripple_processing.ipynb) applies
 a median filter to diffraction coordinates on a 4D scan. For denoisers that
 need a 3D tensor, `HyperData.denoise(..., unfold_domain="real", ...)`

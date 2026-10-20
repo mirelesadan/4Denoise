@@ -18,7 +18,7 @@ except PackageNotFoundError:
 version = release
 
 extensions = [
-    "myst_parser",
+    "myst_nb",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
@@ -27,6 +27,12 @@ root_doc = "index"
 exclude_patterns = ["README.md", "_build"]
 myst_heading_anchors = 3
 myst_enable_extensions = ["colon_fence"]
+nb_execution_mode = "off"
+nb_merge_streams = True
+nb_output_stderr = "show"
+nb_render_image_options = {"alt": "Figure from the synthetic tutorial"}
+html_static_path = ["_static"]
+html_css_files = ["tutorials.css"]
 autodoc_typehints = "description"
 autodoc_member_order = "bysource"
 napoleon_numpy_docstring = True
@@ -68,7 +74,20 @@ def _require_verified_external_links(app, exception):
             app.statuscode = 1
 
 
+def _prepare_tutorial_pages(app):
+    """Build derived notebook sources without starting a kernel in Sphinx."""
+    from sphinx.errors import SphinxError
+    from scripts.render_tutorials import prepare_tutorials
+
+    try:
+        prepare_tutorials(Path(app.confdir).resolve().parent,
+                          require_executed=app.builder.name != 'linkcheck')
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise SphinxError(f'Tutorial rendering failed: {exc}') from exc
+
+
 def setup(app):
+    app.connect("builder-inited", _prepare_tutorial_pages)
     app.connect("linkcheck-process-uri", _github_file_check_uri)
     app.connect("build-finished", _require_verified_external_links)
 

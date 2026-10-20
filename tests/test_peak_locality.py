@@ -79,6 +79,14 @@ class LocalPeakWindowTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(actual, [5.0, 11.0])
 
+    def test_integer_radius_includes_the_positive_circle_boundary(self):
+        image = np.ones((33, 39), dtype=float)
+        for center in ((16, 19), (17, 20), (16, 20), (17, 19)):
+            mask = fd.make_mask(center, 2.0, image.shape)
+            result = fd.ReciprocalSpace(image).get_intensities(2, centers=[center])
+            np.testing.assert_array_equal(result, [mask.sum()])
+            self.assertEqual(result[0], 13)
+
 
 if __name__ == "__main__":
     unittest.main()

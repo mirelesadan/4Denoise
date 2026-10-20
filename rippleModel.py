@@ -134,7 +134,21 @@ def ripple(t=3.5, n=25., k=4.6, m=3, p=4.2, res=1,
     return ripple
 
 def complete_ripple(ripple_bottom_right):
-    
+    """Mirror one quadrant into a symmetric full ripple surface.
+
+    Parameters
+    ----------
+    ripple_bottom_right : numpy.ndarray
+        Two-dimensional bottom-right quadrant with shape ``(Ny, Nx)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Full surface of shape ``(2*Ny, 2*Nx)``. The input occupies its
+        bottom-right quadrant; the other quadrants are left-right and
+        up-down reflections of it. Edge samples are duplicated at the seams.
+    """
+
     # Create the top half by mirroring the quarter horizontally
     top_half = np.concatenate((np.fliplr(ripple_bottom_right), ripple_bottom_right), axis=1)
     
