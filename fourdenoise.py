@@ -14941,13 +14941,18 @@ class _DenoisingMethods:
             Random seed or state to initialize the random number generator.
         
         return_errors : bool, optional, default is False
-            If True, return a list of all errors.
+            If True, return the per-iteration relative reconstruction errors
+            reported by TensorLy's callback. TensorLy 0.10 may estimate these
+            from sampled tensor entries; they are not necessarily exact errors.
         
         verbose : int, optional, default is 0
             Level of verbosity.
         
         callback : callable, optional
-            Function to call at the end of each iteration.
+            Called with the initial decomposition alone, then with the
+            decomposition and relative error after each iteration. Returning
+            True from an iteration callback stops the fit. Error collection
+            preserves these calls and the callback's stopping decision.
         
         implementation : str, optional, default is 'tensorly'
             Implementation to use for the decomposition.
@@ -14964,8 +14969,12 @@ class _DenoisingMethods:
         
         Returns
         -------
-        factors : ndarray list
-            List of positive factors of the CP decomposition. Element i is of shape (tensor.shape[i], rank).
+        ndarray or tuple or list
+            Dense reconstruction by default, or ``(reconstruction, errors)``
+            when ``return_errors=True``. With ``return_decomposition=True``,
+            return ``[weights, factors, reconstruction]``, appending the error
+            history when requested. The initialization callback contributes
+            no entry to that history because it supplies no error.
         
         Notes
         -----
@@ -14984,8 +14993,22 @@ class _DenoisingMethods:
         
         # Conditional implementation
         if implementation == 'tensorly':
-            # Randomised CP decomposition
-            result = rand_parafac(
+            errors = [] if return_errors else None
+            if return_errors:
+                def collect_error(decomposition, relative_error=None):
+                    # Initialization supplies only the decomposition in both
+                    # TensorLy 0.9 and 0.10.
+                    if relative_error is not None:
+                        errors.append(float(relative_error))
+                    if callback is not None:
+                        if relative_error is None:
+                            return callback(decomposition)
+                        return callback(decomposition, relative_error)
+                    return None
+            else:
+                collect_error = callback
+
+            cp_tensor = rand_parafac(
                 tensor,
                 rank=rank,
                 n_samples=n_samples,
@@ -14994,12 +15017,10 @@ class _DenoisingMethods:
                 svd=svd,
                 tol=tol,
                 max_stagnation=max_stagnation,
-                return_errors=return_errors,
                 random_state=random_state,
                 verbose=verbose,
-                callback=callback,
+                callback=collect_error,
             )
-            cp_tensor, errors = self._split_cp_result(result, return_errors)
         else:
             raise ValueError(f"Unknown implementation: {implementation}")
         

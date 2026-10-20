@@ -50,9 +50,12 @@ def _module_node_names(module):
 
 
 def _free_globals(table):
+    # Python 3.12 inlines module-level comprehensions: their assigned loop
+    # variables are both local and global, but are not free global references.
     names = {
         symbol.get_name() for symbol in table.get_symbols()
         if symbol.is_referenced() and symbol.is_global()
+        and not (symbol.is_local() and symbol.is_assigned())
     }
     for child in table.get_children():
         names.update(_free_globals(child))
@@ -60,6 +63,20 @@ def _free_globals(table):
 
 
 class ModuleBoundaryTests(unittest.TestCase):
+    def test_free_globals_distinguishes_comprehension_bindings_and_dependencies(self):
+        source = (
+            'mapping = {tuple(coord): idx for idx, coord in enumerate(points)}\n'
+            'values = [transform(idx) for idx in values_in]\n'
+            'nested = [[combine(idx, coord) for coord in row] for idx, row in rows]\n'
+            'def unresolved():\n'
+            '    return idx + missing\n'
+        )
+        self.assertEqual(
+            _free_globals(symtable.symtable(source, '<comprehensions>', 'exec')),
+            {'tuple', 'enumerate', 'points', 'transform', 'values_in',
+             'combine', 'rows', 'idx', 'missing'},
+        )
+
     def test_no_duplicate_implementations_and_direct_parent_reexports(self):
         parent = importlib.import_module('fourdenoise')
         tree = ast.parse((ROOT / 'fourdenoise.py').read_text(encoding='utf-8'))

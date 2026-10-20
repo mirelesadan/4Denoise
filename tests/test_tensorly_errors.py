@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import matplotlib
 matplotlib.use('Agg')
@@ -45,6 +46,91 @@ class TensorLyErrorResultTests(unittest.TestCase):
         for method, kwargs in methods:
             with self.subTest(method=method):
                 self.assert_reconstruction_and_errors(method, kwargs)
+
+    def test_randomised_parafac_default_uses_one_fit_without_error_collection(self):
+        data = fd.HyperData(self.tensor)
+        with patch.object(fd, 'rand_parafac', wraps=fd.rand_parafac) as fit:
+            denoised = data.denoise(
+                'randomised_parafac', rank=1, n_samples=12,
+                n_iter_max=3, random_state=0,
+            )
+        self.assertIsInstance(denoised, fd.HyperData)
+        self.assertEqual(denoised.shape, data.shape)
+        self.assertEqual(fit.call_count, 1)
+        self.assertNotIn('return_errors', fit.call_args.kwargs)
+        self.assertIsNone(fit.call_args.kwargs['callback'])
+
+    def test_randomised_parafac_callback_initialization_and_early_stop(self):
+        for return_errors in (False, True):
+            calls = []
+
+            def callback(*args):
+                calls.append(args)
+                if len(args) == 2:
+                    return True
+
+            with self.subTest(return_errors=return_errors):
+                result = fd.HyperData(self.tensor).denoise(
+                    'randomised_parafac', rank=1, n_samples=12,
+                    n_iter_max=5, random_state=0, return_errors=return_errors,
+                    callback=callback,
+                )
+                self.assertEqual([len(args) for args in calls], [1, 2])
+                if return_errors:
+                    denoised, errors = result
+                    np.testing.assert_allclose(errors, [calls[1][1]])
+                else:
+                    denoised = result
+                self.assertEqual(denoised.shape, self.tensor.shape)
+
+    def test_randomised_parafac_errors_without_stopping_criteria(self):
+        _, errors = fd.HyperData(self.tensor).denoise(
+            'randomised_parafac', rank=1, n_samples=12,
+            n_iter_max=3, random_state=0, tol=0, max_stagnation=0,
+            return_errors=True,
+        )
+        self.assertEqual(len(errors), 3)
+        self.assertTrue(np.all(np.isfinite(errors)))
+
+    def test_randomised_parafac_decomposition_payload(self):
+        for return_errors in (False, True):
+            with self.subTest(return_errors=return_errors):
+                result = fd.HyperData(self.tensor).denoise(
+                    'randomised_parafac', rank=1, n_samples=12,
+                    n_iter_max=3, random_state=0,
+                    return_decomposition=True, return_errors=return_errors,
+                )
+                self.assertIsInstance(result, list)
+                self.assertEqual(len(result), 4 if return_errors else 3)
+                self.assertEqual(result[2].shape, self.tensor.shape)
+                if return_errors:
+                    self.assertGreaterEqual(len(result[3]), 1)
+
+    def test_randomised_parafac_plot_refolds_and_preserves_calibration(self):
+        original = np.random.default_rng(11).random((2, 3, 4, 5)) + 0.1
+        data = fd.HyperData(
+            original, real_units='nm', real_conv_factor=2,
+            reciprocal_units='mrad', reciprocal_conv_factor=0.2,
+        )
+        fig, ax = plt.subplots()
+        self.addCleanup(plt.close, fig)
+        with patch.object(fd, 'rand_parafac', wraps=fd.rand_parafac) as fit:
+            denoised, errors = data.denoise(
+                'randomised_parafac', rank=1, n_samples=12,
+                n_iter_max=3, random_state=0, unfold_domain='real',
+                unfold_method='serpentine', return_errors=True,
+                convergence_plot=True, convergence_ax=ax, convergence_show=False,
+            )
+        self.assertEqual(fit.call_count, 1)
+        self.assertEqual(denoised.shape, original.shape)
+        self.assertEqual(denoised.real_units, 'nm')
+        self.assertEqual(denoised.real_conv_factor, 2)
+        self.assertEqual(denoised.reciprocal_units, 'mrad')
+        self.assertEqual(denoised.reciprocal_conv_factor, 0.2)
+        np.testing.assert_array_equal(ax.lines[0].get_ydata(), errors)
+        np.testing.assert_array_equal(
+            ax.lines[0].get_xdata(), np.arange(1, len(errors) + 1),
+        )
 
     def test_tucker_methods(self):
         methods = (

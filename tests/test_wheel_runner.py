@@ -124,8 +124,9 @@ class WheelRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly one"):
             runner.resolve_wheel(self.root)
         _, wheel = self.make_fixture()
-        self.assertEqual(runner.resolve_wheel(self.root), wheel)
-        self.assertEqual(runner.resolve_wheel(wheel), wheel)
+        # Windows temporary paths may use an 8.3 alias for the user directory.
+        self.assertEqual(runner.resolve_wheel(self.root), wheel.resolve())
+        self.assertEqual(runner.resolve_wheel(wheel), wheel.resolve())
         shutil.copy2(wheel, self.root / "another.whl")
         with self.assertRaisesRegex(ValueError, "exactly one"):
             runner.resolve_wheel(self.root)
