@@ -120,3 +120,18 @@ File-output operations are atomic by default and replacement is explicit.
 Atomicity applies to each output file, not a transaction across several
 workflow steps. Reserve disk space for temporary output and, when replacing,
 the existing destination. See the [streaming tutorial](../getting-started/streaming.md).
+
+## Implementation Boundaries
+
+Continue to import the public objects from `fourdenoise`; the implementation
+is split into supporting modules without changing notebook imports.
+`HyperData` owns calibration, unfolding orchestration, and result metadata.
+The private `fourdenoise_denoising` module separates numerical algorithms
+from method lookup, validation, and dimensional routing. It receives an
+object factory when it needs to construct a `HyperData`, rather than importing
+the main module.
+
+`RealSpace.show()` and `ReciprocalSpace.show()` keep their public signatures
+and delegate rendering to `fourdenoise_views`. Plotting does not own or replace
+the underlying data. These supporting modules are implementation details,
+not alternative user-facing APIs.

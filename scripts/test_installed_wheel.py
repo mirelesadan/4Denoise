@@ -22,6 +22,8 @@ import unittest
 # Keep this list in sync with tool.setuptools.py-modules in pyproject.toml.
 MODULE_NAMES = (
     "fourdenoise",
+    "fourdenoise_denoising",
+    "fourdenoise_views",
     "fourdenoise_geometry",
     "fourdenoise_metadata",
     "fourdenoise_rq",
