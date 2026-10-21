@@ -14,6 +14,7 @@ import numpy as np
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 import fourdenoise as fd
+import fourdenoise_denoising as denoising
 
 
 class TensorLyErrorResultTests(unittest.TestCase):
@@ -49,7 +50,7 @@ class TensorLyErrorResultTests(unittest.TestCase):
 
     def test_randomised_parafac_default_uses_one_fit_without_error_collection(self):
         data = fd.HyperData(self.tensor)
-        with patch.object(fd, 'rand_parafac', wraps=fd.rand_parafac) as fit:
+        with patch.object(denoising, 'rand_parafac', wraps=denoising.rand_parafac) as fit:
             denoised = data.denoise(
                 'randomised_parafac', rank=1, n_samples=12,
                 n_iter_max=3, random_state=0,
@@ -114,7 +115,7 @@ class TensorLyErrorResultTests(unittest.TestCase):
         )
         fig, ax = plt.subplots()
         self.addCleanup(plt.close, fig)
-        with patch.object(fd, 'rand_parafac', wraps=fd.rand_parafac) as fit:
+        with patch.object(denoising, 'rand_parafac', wraps=denoising.rand_parafac) as fit:
             denoised, errors = data.denoise(
                 'randomised_parafac', rank=1, n_samples=12,
                 n_iter_max=3, random_state=0, unfold_domain='real',
